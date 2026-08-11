@@ -3,6 +3,7 @@ package proxy
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 )
 
 // TransformToOpenAI converts an Anthropic request to OpenAI format
@@ -27,12 +28,12 @@ func TransformToOpenAI(anthropicReq AnthropicRequest, targetModel string) (OpenA
 	if anthropicReq.System != nil {
 		switch s := anthropicReq.System.(type) {
 		case string:
-			oaiReq.Messages = append([]OpenAIMessage{{Role: "system", Content: s}}, oaiReq.Messages...)
+			oaiReq.Messages = append([]OpenAIMessage{{Role: "system", Content: textContent(s)}}, oaiReq.Messages...)
 		case []interface{}:
 			// System is an array of content blocks
 			text := extractTextFromBlocks(s)
 			if text != "" {
-				oaiReq.Messages = append([]OpenAIMessage{{Role: "system", Content: text}}, oaiReq.Messages...)
+				oaiReq.Messages = append([]OpenAIMessage{{Role: "system", Content: textContent(text)}}, oaiReq.Messages...)
 			}
 		}
 	}
@@ -65,10 +66,10 @@ func TransformFromOpenAI(oaiResp OpenAIResponse, model string) AnthropicResponse
 
 	// Convert content
 	choice := oaiResp.Choices[0]
-	if choice.Message.Content != "" {
+	if choice.Message.Content.Text() != "" {
 		resp.Content = []ContentBlock{{
 			Type: "text",
-			Text: choice.Message.Content,
+			Text: choice.Message.Content.Text(),
 		}}
 	}
 
@@ -95,7 +96,7 @@ func convertMessage(msg Message) (OpenAIMessage, error) {
 
 	switch c := msg.Content.(type) {
 	case string:
-		oaiMsg.Content = c
+		oaiMsg.Content = textContent(c)
 	case []interface{}:
 		// Array of content blocks
 		text := ""
@@ -117,7 +118,7 @@ func convertMessage(msg Message) (OpenAIMessage, error) {
 				}
 			}
 		}
-		oaiMsg.Content = text
+		oaiMsg.Content = textContent(text)
 	default:
 		return oaiMsg, fmt.Errorf("unknown content type: %T", msg.Content)
 	}
@@ -191,9 +192,86 @@ type OpenAIStreamOptions struct {
 
 type OpenAIMessage struct {
 	Role       string           `json:"role"`
-	Content    string           `json:"content,omitempty"`
+	Content    OpenAIContent    `json:"content"`
 	ToolCalls  []OpenAIToolCall `json:"tool_calls,omitempty"`
 	ToolCallID string           `json:"tool_call_id,omitempty"`
+}
+
+// OpenAIContent represents the OpenAI "content" field, which per spec is either a
+// plain string or an array of content parts. NEXUS only supports the "text" part
+// type — any other part type (image_url, input_audio, ...) is rejected during
+// unmarshal rather than silently dropped.
+//
+// When the source was an array, the original parts are kept (not just the joined
+// text) so callers that route to an Anthropic-format provider can forward the
+// same block structure instead of collapsing it into one string — see Anthropic().
+type OpenAIContent struct {
+	text  string
+	parts []OpenAIContentPart // non-nil only if the JSON source was an array
+}
+
+type OpenAIContentPart struct {
+	Type string `json:"type"`
+	Text string `json:"text"`
+}
+
+// textContent builds an OpenAIContent from a Go string, for call sites that
+// already have flattened text (outbound requests to OpenAI-compatible providers,
+// which always use the plain-string form).
+func textContent(s string) OpenAIContent {
+	return OpenAIContent{text: s}
+}
+
+func (c *OpenAIContent) UnmarshalJSON(data []byte) error {
+	if len(data) == 0 || string(data) == "null" {
+		return nil
+	}
+	var s string
+	if err := json.Unmarshal(data, &s); err == nil {
+		c.text = s
+		c.parts = nil
+		return nil
+	}
+	var parts []OpenAIContentPart
+	if err := json.Unmarshal(data, &parts); err != nil {
+		return fmt.Errorf("content: expected a string or an array of content parts")
+	}
+	var sb strings.Builder
+	for _, p := range parts {
+		if p.Type != "text" {
+			return fmt.Errorf("content: unsupported content part type %q (only \"text\" is supported)", p.Type)
+		}
+		sb.WriteString(p.Text)
+	}
+	c.text = sb.String()
+	c.parts = parts
+	return nil
+}
+
+// MarshalJSON always emits the flattened string form. OpenAIMessage is only ever
+// marshaled for the outbound-to-OpenAI-provider direction, where a plain string is
+// universally accepted and is what NEXUS already constructs (see convertMessage).
+func (c OpenAIContent) MarshalJSON() ([]byte, error) {
+	return json.Marshal(c.text)
+}
+
+// Text returns the flattened text, regardless of whether the source JSON was a
+// string or an array of text parts.
+func (c OpenAIContent) Text() string { return c.text }
+
+// Anthropic returns the value to embed in an Anthropic-format Message.Content
+// field: the original array of text blocks when the source was an array
+// (preserving structure, since Anthropic accepts the same block shape natively),
+// or the plain string otherwise.
+func (c OpenAIContent) Anthropic() interface{} {
+	if c.parts == nil {
+		return c.text
+	}
+	blocks := make([]map[string]interface{}, len(c.parts))
+	for i, p := range c.parts {
+		blocks[i] = map[string]interface{}{"type": "text", "text": p.Text}
+	}
+	return blocks
 }
 
 type OpenAITool struct {

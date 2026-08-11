@@ -68,6 +68,92 @@ func TestGateway_OpenAIPassthrough(t *testing.T) {
 	}
 }
 
+// TestGateway_ArrayContentPassthrough reproduces the bug reported by opencode /
+// pi.dev clients: they send message.content as an array of text parts
+// ([{"type":"text","text":"..."}]) instead of a plain string, which used to fail
+// json.Unmarshal (OpenAIMessage.Content was a bare string) and return a 400 for a
+// perfectly valid OpenAI-format request.
+func TestGateway_ArrayContentPassthrough(t *testing.T) {
+	var gotBody map[string]interface{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&gotBody)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"id": "x", "object": "chat.completion", "model": "llama-x",
+			"choices": []interface{}{map[string]interface{}{"index": 0, "finish_reason": "stop",
+				"message": map[string]interface{}{"role": "assistant", "content": "ok"}}},
+			"usage": map[string]interface{}{"prompt_tokens": 1, "completion_tokens": 1},
+		})
+	}))
+	defer srv.Close()
+	h := buildTestHandler(t, []testProv{{"groqish", "free", srv.URL}})
+
+	body := `{"model":"glm-5.2","messages":[
+		{"role":"system","content":"be brief"},
+		{"role":"user","content":[{"type":"text","text":"part1 "},{"type":"text","text":"part2"}]}
+	]}`
+	rec := chatCompletions(h, body)
+
+	if rec.Code != 200 {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	msgs, _ := gotBody["messages"].([]interface{})
+	if len(msgs) == 0 {
+		t.Fatalf("upstream never received messages: %+v", gotBody)
+	}
+	// Pass-through preserves the client's original body verbatim (rawMap), so the
+	// array form must reach the upstream provider unchanged.
+	last := msgs[len(msgs)-1].(map[string]interface{})
+	parts, _ := last["content"].([]interface{})
+	if len(parts) != 2 {
+		t.Fatalf("expected the original 2-part content array to pass through, got %+v", last["content"])
+	}
+}
+
+// TestGateway_RejectsUnsupportedContentPart ensures a non-text part type (e.g. an
+// image) produces a clear 400 rather than a generic/cryptic parse error.
+func TestGateway_RejectsUnsupportedContentPart(t *testing.T) {
+	h := buildTestHandler(t, nil)
+	body := `{"model":"gpt-4o","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"x"}}]}]}`
+	rec := chatCompletions(h, body)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "image_url") {
+		t.Errorf("error should name the unsupported part type, got: %s", rec.Body.String())
+	}
+}
+
+// TestTransformOpenAIToAnthropic_PreservesContentArray asserts the "do not
+// flatten" contract: when a client sends content as an array of text parts,
+// converting to the Anthropic-format request must forward the same array of
+// blocks (Anthropic accepts that shape natively), not a joined string.
+func TestTransformOpenAIToAnthropic_PreservesContentArray(t *testing.T) {
+	o := OpenAIRequest{
+		Model: "gpt-4o",
+		Messages: []OpenAIMessage{
+			{Role: "user", Content: mustArrayContent(t, `[{"type":"text","text":"part1 "},{"type":"text","text":"part2"}]`)},
+		},
+	}
+	a := TransformOpenAIToAnthropic(o)
+	blocks, ok := a.Messages[0].Content.([]map[string]interface{})
+	if !ok {
+		t.Fatalf("expected content to stay an array of blocks, got %T: %+v", a.Messages[0].Content, a.Messages[0].Content)
+	}
+	if len(blocks) != 2 || blocks[0]["text"] != "part1 " || blocks[1]["text"] != "part2" {
+		t.Errorf("blocks = %+v", blocks)
+	}
+}
+
+func mustArrayContent(t *testing.T, jsonArray string) OpenAIContent {
+	t.Helper()
+	var c OpenAIContent
+	if err := json.Unmarshal([]byte(jsonArray), &c); err != nil {
+		t.Fatalf("unmarshal content: %v", err)
+	}
+	return c
+}
+
 func TestGateway_StreamPassthrough(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -136,8 +222,8 @@ func TestTransformOpenAIToAnthropic(t *testing.T) {
 	o := OpenAIRequest{
 		Model: "gpt-4o",
 		Messages: []OpenAIMessage{
-			{Role: "system", Content: "be brief"},
-			{Role: "user", Content: "hi"},
+			{Role: "system", Content: textContent("be brief")},
+			{Role: "user", Content: textContent("hi")},
 		},
 	}
 	a := TransformOpenAIToAnthropic(o)

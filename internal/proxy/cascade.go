@@ -97,7 +97,7 @@ func verifyResponse(name string, raw []byte) bool {
 			return false
 		}
 		msg := r.Choices[0].Message
-		if strings.TrimSpace(msg.Content) != "" {
+		if strings.TrimSpace(msg.Content.Text()) != "" {
 			return true
 		}
 		for _, tc := range msg.ToolCalls {

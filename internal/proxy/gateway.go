@@ -82,7 +82,7 @@ func (h *Handler) HandleChatCompletions(w http.ResponseWriter, r *http.Request) 
 	var oreq OpenAIRequest
 	if err := json.Unmarshal(body, &oreq); err != nil {
 		log.Error().Err(err).Str("body", capForLog(body)).Msg("Failed to parse request body as JSON")
-		h.writeOpenAIError(w, http.StatusBadRequest, "invalid JSON in request body")
+		h.writeOpenAIError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
 		return
 	}
 	// Raw map preserves every field (temperature, top_p, …) for high-fidelity
@@ -355,10 +355,13 @@ func TransformOpenAIToAnthropic(o OpenAIRequest) AnthropicRequest {
 	var sys string
 	for _, m := range o.Messages {
 		if m.Role == "system" {
-			sys += m.Content
+			sys += m.Content.Text()
 			continue
 		}
-		ar.Messages = append(ar.Messages, Message{Role: m.Role, Content: m.Content})
+		// Anthropic().Content preserves the original array-of-text-blocks structure
+		// when the client sent content as an array, instead of joining it into one
+		// string — Anthropic-format providers accept the same block shape natively.
+		ar.Messages = append(ar.Messages, Message{Role: m.Role, Content: m.Content.Anthropic()})
 	}
 	if sys != "" {
 		ar.System = sys
