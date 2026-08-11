@@ -81,6 +81,7 @@ func (h *Handler) HandleChatCompletions(w http.ResponseWriter, r *http.Request) 
 
 	var oreq OpenAIRequest
 	if err := json.Unmarshal(body, &oreq); err != nil {
+		log.Error().Err(err).Str("body", capForLog(body)).Msg("Failed to parse request body as JSON")
 		h.writeOpenAIError(w, http.StatusBadRequest, "invalid JSON in request body")
 		return
 	}

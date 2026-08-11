@@ -99,6 +99,15 @@ func capText(s string) string {
 	return s
 }
 
+// capForLog caps a raw request body for inclusion in an error log line.
+func capForLog(b []byte) string {
+	const max = 2 * 1024
+	if len(b) > max {
+		return string(b[:max]) + "…[truncated]"
+	}
+	return string(b)
+}
+
 // NewHandler builds the provider set + router from config and wires in the
 // shared storage and (optional) event broker.
 func NewHandler(cfg *Config, db *storage.DB, broker EventPublisher) (*Handler, error) {
@@ -346,6 +355,7 @@ func (h *Handler) HandleMessages(w http.ResponseWriter, r *http.Request) {
 
 	var req AnthropicRequest
 	if err := json.Unmarshal(body, &req); err != nil {
+		log.Error().Err(err).Str("body", capForLog(body)).Msg("Failed to parse request body as JSON")
 		h.writeError(w, http.StatusBadRequest, "invalid JSON in request body")
 		return
 	}
