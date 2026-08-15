@@ -1,62 +1,62 @@
 # NEXUS — Claude Code Working Memory
 
-## Wat is NEXUS?
-Een open-source **single-binary proxy + live dashboard** voor Claude Code.
-Stuurt Claude Code requests intelligent door naar goedkopere/gratis LLM providers.
-Doel: viral GitHub project (target: 10k+ stars).
+## What is NEXUS?
+An open-source **single-binary proxy + live dashboard** for Claude Code.
+Intelligently routes Claude Code requests to cheaper/free LLM providers.
+Goal: viral GitHub project (target: 10k+ stars).
 
-## Core Filosofie
-- **Zero config** — `nexus start` werkt direct, geen setup vereist
-- **Single binary** — één Go binary, geen dependencies, geen Docker nodig
-- **Claude Code-first** — gebouwd specifiek voor Claude Code workflow
-- **Beautiful by default** — dashboard dat mensen willen screenshotten
+## Core Philosophy
+- **Zero config** — `nexus start` works immediately, no setup required
+- **Single binary** — one Go binary, no dependencies, no Docker needed
+- **Claude Code-first** — built specifically for the Claude Code workflow
+- **Beautiful by default** — a dashboard people want to screenshot
 
 ---
 
 ## Tech Stack
 
-| Layer | Keuze | Reden |
+| Layer | Choice | Reason |
 |---|---|---|
-| Proxy core | **Go** | Single binary, cross-platform, snel |
-| Dashboard UI | **Svelte + Vite** | Licht, embedded in binary |
-| Storage | **SQLite (modernc)** | Pure Go, geen cgo |
-| Realtime | **SSE (Server-Sent Events)** | Simpel, geen WS overhead |
-| Config | **TOML** | Leesbaar, simpel |
+| Proxy core | **Go** | Single binary, cross-platform, fast |
+| Dashboard UI | **Svelte + Vite** | Lightweight, embedded in binary |
+| Storage | **SQLite (modernc)** | Pure Go, no cgo |
+| Realtime | **SSE (Server-Sent Events)** | Simple, no WS overhead |
+| Config | **TOML** | Readable, simple |
 | Build | **Makefile** | Cross-platform builds |
 
 ---
 
-## Mappenstructuur
+## Directory Structure
 
 ```
 nexus/
-├── CLAUDE.md                    ← dit bestand
-├── MEMORY.md                    ← project memory / beslissingen log
+├── CLAUDE.md                    ← this file
+├── MEMORY.md                    ← project memory / decisions log
 ├── README.md                    ← GitHub README (viral-ready)
 ├── go.mod
 ├── go.sum
 ├── Makefile
-├── .goreleaser.yml              ← voor GitHub releases (binaries)
+├── .goreleaser.yml              ← for GitHub releases (binaries)
 ├── cmd/
 │   └── nexus/
 │       └── main.go              ← CLI entrypoint (cobra)
 ├── internal/
 │   ├── proxy/
-│   │   ├── server.go            ← HTTP proxy server (poort 3000)
+│   │   ├── server.go            ← HTTP proxy server (port 3000)
 │   │   ├── handler.go           ← request interceptor
-│   │   ├── transformer.go       ← Anthropic ↔ OpenAI formaat conversie
+│   │   ├── transformer.go       ← Anthropic ↔ OpenAI format conversion
 │   │   └── stream.go            ← streaming response handler
 │   ├── router/
-│   │   ├── router.go            ← intelligente model router
+│   │   ├── router.go            ← intelligent model router
 │   │   ├── classifier.go        ← task complexity classifier
 │   │   └── rules.go             ← routing rules engine
 │   ├── dashboard/
-│   │   ├── server.go            ← dashboard HTTP server (poort 2222)
-│   │   ├── sse.go               ← Server-Sent Events voor live updates
+│   │   ├── server.go            ← dashboard HTTP server (port 2222)
+│   │   ├── sse.go               ← Server-Sent Events for live updates
 │   │   └── embed.go             ← embedded Svelte build
 │   ├── storage/
 │   │   ├── db.go                ← SQLite setup
-│   │   ├── requests.go          ← request log opslag
+│   │   ├── requests.go          ← request log storage
 │   │   └── stats.go             ← aggregated stats queries
 │   └── providers/
 │       ├── provider.go          ← Provider interface
@@ -64,7 +64,7 @@ nexus/
 │       ├── deepseek.go          ← DeepSeek provider
 │       ├── groq.go              ← Groq provider
 │       ├── gemini.go            ← Gemini provider
-│       └── ollama.go            ← Ollama (lokaal) provider
+│       └── ollama.go            ← Ollama (local) provider
 ├── web/                         ← Svelte dashboard source
 │   ├── package.json
 │   ├── vite.config.ts
@@ -73,10 +73,10 @@ nexus/
 │   │   ├── main.ts
 │   │   ├── components/
 │   │   │   ├── RequestFeed.svelte     ← live request stream
-│   │   │   ├── CostMeter.svelte       ← real-time kosten
-│   │   │   ├── ModelBadge.svelte      ← welk model werd gebruikt
+│   │   │   ├── CostMeter.svelte       ← real-time costs
+│   │   │   ├── ModelBadge.svelte      ← which model was used
 │   │   │   ├── ProviderStatus.svelte  ← provider health
-│   │   │   └── StatsBar.svelte        ← totaal tokens/kosten
+│   │   │   └── StatsBar.svelte        ← total tokens/costs
 │   │   ├── stores/
 │   │   │   ├── requests.ts            ← SSE store
 │   │   │   └── stats.ts               ← stats store
@@ -97,14 +97,14 @@ nexus/
 
 ```bash
 nexus start                         # start proxy + dashboard
-nexus start --port 3000 --ui 2222   # custom poorten
-nexus add deepseek sk-xxx           # provider toevoegen
+nexus start --port 3000 --ui 2222   # custom ports
+nexus add deepseek sk-xxx           # add provider
 nexus add groq gsk-xxx
 nexus add gemini AIza-xxx
-nexus add ollama                    # lokaal, geen key nodig
+nexus add ollama                    # local, no key needed
 nexus status                        # provider health check
-nexus logs                          # laatste N requests
-nexus cost                          # kosten overzicht
+nexus logs                          # last N requests
+nexus cost                          # cost overview
 nexus config                        # open config in editor
 ```
 
@@ -112,50 +112,50 @@ nexus config                        # open config in editor
 
 ## Proxy Endpoints (port 3000)
 
-| Endpoint | Beschrijving |
+| Endpoint | Description |
 |---|---|
-| `POST /v1/messages` | Anthropic messages API (Claude Code gebruikt dit) |
+| `POST /v1/messages` | Anthropic messages API (used by Claude Code) |
 | `GET /health` | Health check |
 
 ---
 
 ## Dashboard Endpoints (port 2222)
 
-| Endpoint | Beschrijving |
+| Endpoint | Description |
 |---|---|
 | `GET /` | Svelte dashboard SPA |
 | `GET /api/stats` | Aggregated stats JSON |
 | `GET /api/requests` | Request history |
 | `GET /api/providers` | Provider status |
-| `GET /events` | SSE stream voor live updates |
+| `GET /events` | SSE stream for live updates |
 
 ---
 
 ## Intelligent Router Logic
 
 ```
-Binnenkomende request
+Incoming request
         ↓
    Classify task
         ↓
    ┌────────────────────────────────────┐
-   │ SIMPLE  (<200 tokens, geen tools)  │ → Groq Llama (gratis)
+   │ SIMPLE  (<200 tokens, no tools)    │ → Groq Llama (free)
    │ MEDIUM  (code, refactor, explain)  │ → DeepSeek V3 (~$0.001)
    │ COMPLEX (architect, debug, plan)   │ → Claude Sonnet
    │ CRITICAL(security, prod issues)    │ → Claude Opus
    └────────────────────────────────────┘
         ↓
-   Fallback chain als provider faalt
+   Fallback chain if provider fails
         ↓
-   Log naar SQLite + push naar SSE
+   Log to SQLite + push to SSE
 ```
 
 ### Classifier signals:
-- Token count van de prompt
-- Aanwezigheid van tool_use blocks
+- Token count of the prompt
+- Presence of tool_use blocks
 - Keywords: "architecture", "security", "production", "urgent"
-- Context length van conversation history
-- Aanwezigheid van code blocks
+- Context length of conversation history
+- Presence of code blocks
 
 ---
 
@@ -200,9 +200,9 @@ tier = "local"
 
 ## Model Mapping (Claude Code → Provider)
 
-Claude Code vraagt altijd om een Claude model. NEXUS mapt dit:
+Claude Code always requests a Claude model. NEXUS maps this:
 
-| Claude Code vraagt | Route naar | Tier |
+| Claude Code requests | Routes to | Tier |
 |---|---|---|
 | `claude-opus-4-5` | Anthropic Opus / DeepSeek V3 | complex |
 | `claude-sonnet-4-6` | DeepSeek / Gemini 2.0 | standard |
@@ -212,7 +212,7 @@ Claude Code vraagt altijd om een Claude model. NEXUS mapt dit:
 
 ## Cost Tracking
 
-Elke provider heeft token prijzen in `internal/providers/*.go`:
+Each provider has token prices in `internal/providers/*.go`:
 
 ```go
 type Pricing struct {
@@ -221,25 +221,25 @@ type Pricing struct {
 }
 ```
 
-Kosten worden berekend per request en opgeslagen in SQLite.
-Dashboard toont: per sessie, per dag, per provider, forecast voor de maand.
+Costs are calculated per request and stored in SQLite.
+Dashboard shows: per session, per day, per provider, forecast for the month.
 
 ---
 
 ## Dashboard Design Tokens
 
 ```
-Achtergrond:  #050816  (donker navy)
+Background:   #050816  (dark navy)
 Surface:      #0a0e1a
 Border:       #1a2035
-Accent:       #7c3aed  (paars)
+Accent:       #7c3aed  (purple)
 Accent2:      #06b6d4  (cyan)
-Success:      #10b981  (groen)
-Warning:      #f59e0b  (oranje)
-Danger:       #ef4444  (rood)
+Success:      #10b981  (green)
+Warning:      #f59e0b  (orange)
+Danger:       #ef4444  (red)
 Text:         #e2e8f0
 Muted:        #64748b
-Font:         'Geist Mono' voor data, 'Inter' voor tekst
+Font:         'Geist Mono' for data, 'Inter' for text
 ```
 
 ---
@@ -251,7 +251,7 @@ Font:         'Geist Mono' voor data, 'Inter' voor tekst
 make dev          # start Go proxy + Vite dev server
 
 # Production
-make build-web    # build Svelte naar web/dist/
+make build-web    # build Svelte to web/dist/
 make embed        # embed web/dist/ in Go binary
 make build        # compile nexus binary
 make release      # GoReleaser → GitHub Release
@@ -266,50 +266,51 @@ make release      # GoReleaser → GitHub Release
 
 ---
 
-## Versietags (CRUCIAAL)
+## Version Tags (CRUCIAL)
 
-**ALTIJD** actief voorstellen om een nieuwe `vX.Y.Z` tag te maken nadat een
-**significante hoeveelheid werk** is afgerond en gecommit. Niet wachten tot de
-gebruiker erom vraagt — dit is een proactieve suggestie, elke keer als het van
-toepassing is.
+**ALWAYS** actively suggest creating a new `vX.Y.Z` tag after a
+**significant amount of work** has been completed and committed. Don't wait
+for the user to ask — this is a proactive suggestion, every time it
+applies.
 
-Dit betekent **niet** dat elke commit een tag krijgt. Een tag hoort bij een
-reeks commits die *samen* een afgeronde eenheid werk vormen, bijvoorbeeld:
+This does **not** mean every commit gets a tag. A tag belongs to a series
+of commits that *together* form a completed unit of work, for example:
 
-- een nieuwe feature is volledig geïmplementeerd (en getest/geverifieerd)
-- een majeure bug is gefixt
-- een significante refactoring is afgerond
-- meerdere kleinere, samenhangende commits vormen samen zo'n eenheid
+- a new feature has been fully implemented (and tested/verified)
+- a major bug has been fixed
+- a significant refactoring has been completed
+- multiple smaller, related commits together form such a unit
 
-Telt **niet** als trigger: een losse tussentijdse commit, werk-in-uitvoering,
-of documentatie-only wijzigingen (behalve de changelog-promotie hieronder,
-die hoort juist bij het taggen zelf).
+Does **not** count as a trigger: a single intermediate commit, work in
+progress, or documentation-only changes (except the changelog promotion
+below, which is itself part of the tagging process).
 
-Volg het bestaande patroon in de git-historie (zie bv. v0.5.0 → v0.6.0):
+Follow the existing pattern in the git history (see e.g. v0.5.0 → v0.6.0):
 
-1. **Changelog eerst.** Zorg dat elke user-facing wijziging sinds de vorige
-   tag een bullet heeft onder `## Unreleased` in `CHANGELOG.md` (commits die
-   dat nog missen alsnog aanvullen).
-2. **Bepaal het semver-niveau**: patch = bugfix, minor = nieuwe feature/geen
-   breaking changes, major = breaking change.
-3. **Promoveer** `## Unreleased` → `## vX.Y.Z` in `CHANGELOG.md` (aparte
-   `release:`-commit, zoals eerder gedaan).
-4. **Annotated tag**: `git tag -a vX.Y.Z -m "..."` met een korte tagline +
-   bullet-samenvatting, in dezelfde stijl als bestaande tags
-   (`git tag -l -n99 <laatste-tag>` om de stijl te checken).
-5. **Vraag expliciet** naar welke remote(s) gepusht moeten worden
-   (`opi2` / `origin` / beide) — **nooit** ongevraagd naar `origin` pushen: dat
-   triggert een publieke GitHub release + Docker image publish naar ghcr.io.
+1. **Changelog first.** Make sure every user-facing change since the
+   previous tag has a bullet under `## Unreleased` in `CHANGELOG.md` (add
+   it retroactively for commits still missing one).
+2. **Determine the semver level**: patch = bugfix, minor = new
+   feature/no breaking changes, major = breaking change.
+3. **Promote** `## Unreleased` → `## vX.Y.Z` in `CHANGELOG.md` (separate
+   `release:` commit, as done before).
+4. **Annotated tag**: `git tag -a vX.Y.Z -m "..."` with a short tagline +
+   bullet summary, in the same style as existing tags
+   (`git tag -l -n99 <latest-tag>` to check the style).
+5. **Explicitly ask** which remote(s) to push to
+   (`opi2` / `origin` / both) — **never** push to `origin` without being
+   asked: that triggers a public GitHub release + Docker image publish to
+   ghcr.io.
 
 ---
 
 ## README Install Snippet (viral-ready)
 
 ```bash
-# macOS/Linux (één commando)
+# macOS/Linux (one command)
 curl -fsSL https://get.nexus.sh | sh
 
-# Of direct binary
+# Or direct binary
 brew install nexus-proxy/nexus
 
 # Start
@@ -317,7 +318,7 @@ nexus start
 # → Proxy: http://localhost:3000
 # → Dashboard: http://localhost:2222
 
-# Koppel Claude Code
+# Connect Claude Code
 export ANTHROPIC_BASE_URL=http://localhost:3000
 export ANTHROPIC_API_KEY=nexus-local
 claude
@@ -325,17 +326,17 @@ claude
 
 ---
 
-## Bouwen volgorde (sprints)
+## Build Order (sprints)
 
-### Sprint 1 — Core proxy werkend
-1. `go.mod` aanmaken
+### Sprint 1 — Core proxy working
+1. Create `go.mod`
 2. `cmd/nexus/main.go` — cobra CLI
-3. `internal/proxy/server.go` — basis HTTP server
-4. `internal/proxy/handler.go` — request doorsturen naar Anthropic
-5. `internal/proxy/transformer.go` — Anthropic ↔ OpenAI conversie
+3. `internal/proxy/server.go` — basic HTTP server
+4. `internal/proxy/handler.go` — forward request to Anthropic
+5. `internal/proxy/transformer.go` — Anthropic ↔ OpenAI conversion
 6. `internal/proxy/stream.go` — streaming support
-7. `internal/providers/` — alle providers
-8. Test: Claude Code werkt via proxy
+7. `internal/providers/` — all providers
+8. Test: Claude Code works via proxy
 
 ### Sprint 2 — Router
 1. `internal/storage/db.go` — SQLite setup
@@ -343,42 +344,42 @@ claude
 3. `internal/router/classifier.go` — complexity classifier
 4. `internal/router/router.go` — routing logic
 5. `internal/router/rules.go` — fallback chains
-6. Test: requests gaan naar juiste provider
+6. Test: requests go to the correct provider
 
 ### Sprint 3 — Dashboard
 1. `web/` setup — Svelte + Vite
 2. `internal/dashboard/sse.go` — SSE stream
 3. `internal/dashboard/server.go` — dashboard API
-4. Svelte components bouwen
+4. Build Svelte components
 5. `internal/dashboard/embed.go` — embed in binary
 6. Test: live updates in browser
 
 ### Sprint 4 — Polish & Release
 1. `Makefile` — build pipeline
 2. `.goreleaser.yml` — release config
-3. `README.md` — viral-ready met GIFs
-4. `docs/` — documentatie
+3. `README.md` — viral-ready with GIFs
+4. `docs/` — documentation
 5. GitHub Actions CI/CD
 6. `curl | sh` install script
 
 ---
 
-## Kritieke beslissingen (log hier)
+## Critical Decisions (log here)
 
-- **Go i.p.v. Node/Python** — single binary is de #1 viral feature
-- **SQLite modernc** — geen cgo, werkt in cross-compile
-- **SSE i.p.v. WebSockets** — simpeler, browser-native, minder overhead
-- **Svelte i.p.v. React** — kleiner bundle, sneller, embedded beter
-- **TOML config** — leesbaarder dan YAML voor eindgebruikers
-- **Poort 3000 proxy, 2222 dashboard** — 2222 is memorabel, geen conflicten
+- **Go instead of Node/Python** — single binary is the #1 viral feature
+- **SQLite modernc** — no cgo, works in cross-compile
+- **SSE instead of WebSockets** — simpler, browser-native, less overhead
+- **Svelte instead of React** — smaller bundle, faster, embeds better
+- **TOML config** — more readable than YAML for end users
+- **Port 3000 proxy, 2222 dashboard** — 2222 is memorable, no conflicts
 
 ---
 
-## Wat NOOIT te doen
+## What to NEVER Do
 
-- Geen Python dependency toevoegen
-- Geen Docker vereisen voor basis gebruik
-- Geen database server (alleen SQLite)
-- Geen cloud account vereisen
-- Geen telemetry zonder expliciete opt-in
-- Config altijd in `~/.nexus/` — nooit in project dir
+- Don't add a Python dependency
+- Don't require Docker for basic usage
+- No database server (SQLite only)
+- Don't require a cloud account
+- No telemetry without explicit opt-in
+- Config always in `~/.nexus/` — never in the project dir
