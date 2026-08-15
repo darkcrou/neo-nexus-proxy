@@ -3,8 +3,13 @@
 High-level summary of each release. Full, commit-level notes are on the
 [GitHub releases page](https://github.com/lynuxis2026-pixel/nexus-proxy/releases).
 
-## Unreleased
+## v0.6.0
 
+- **OpenAI array-form content:** the chat completions gateway now accepts
+  `message.content` as an array of text parts (as sent by opencode, pi.dev),
+  not just a plain string — previously every such request got a 400.
+- **Raw request body logged on JSON parse failure:** aids debugging malformed
+  client requests instead of a bare generic 400.
 - **Playground (chat UI):** a new "💬 Playground" overlay in the dashboard. Pick
   any model from any configured provider (Claude Opus, GPT-4o, DeepSeek, Groq,
   …), type a question, watch the answer stream back in real time. Every
