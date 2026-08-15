@@ -4,14 +4,21 @@ services:
     # image: ghcr.io/lynuxis2026-pixel/nexus-proxy:latest   # once a version is tagged
     container_name: nexus
     restart: unless-stopped
+    # Matches the container process to your host user so files under ./data
+    # (config.toml, nexus.db) are directly editable from the host without
+    # sudo. Defaults to the image's built-in nonroot user (65532:65532) if
+    # unset. Set NEXUS_UID/NEXUS_GID in .env — e.g. `id -u`/`id -g` — to edit
+    # as yourself. See docs/docker.md.
+    user: "${NEXUS_UID:-65532}:${NEXUS_GID:-65532}"
     ports:
       - "3000:3000"
       - "2222:2222"
     volumes:
-      - nexus-data:/home/nexus/.nexus
+      # Bind mount, not a named volume: ./data must exist on the host
+      # *before* the first `docker compose up` (Docker would otherwise
+      # auto-create it as root, which the nonroot process can't write to).
+      # See docs/docker.md.
+      - ${NEXUS_DATA_DIR:-./data}:/home/nexus/.nexus
     env_file:
-      - path: .env   # optional — GROQ_API_KEY=..., DEEPSEEK_API_KEY=..., etc.
+      - path: .env   # optional — GROQ_API_KEY=..., NEXUS_UID=..., etc.
         required: false
-
-volumes:
-  nexus-data:

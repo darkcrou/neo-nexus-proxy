@@ -20,6 +20,9 @@ web/dist/
 .env
 *.toml.local
 
+# Docker bind-mounted NEXUS data dir (config.toml + nexus.db — see docker-compose.yml)
+/data/
+
 # IDE
 .idea/
 .vscode/
