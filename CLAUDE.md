@@ -266,6 +266,43 @@ make release      # GoReleaser → GitHub Release
 
 ---
 
+## Versietags (CRUCIAAL)
+
+**ALTIJD** actief voorstellen om een nieuwe `vX.Y.Z` tag te maken nadat een
+**significante hoeveelheid werk** is afgerond en gecommit. Niet wachten tot de
+gebruiker erom vraagt — dit is een proactieve suggestie, elke keer als het van
+toepassing is.
+
+Dit betekent **niet** dat elke commit een tag krijgt. Een tag hoort bij een
+reeks commits die *samen* een afgeronde eenheid werk vormen, bijvoorbeeld:
+
+- een nieuwe feature is volledig geïmplementeerd (en getest/geverifieerd)
+- een majeure bug is gefixt
+- een significante refactoring is afgerond
+- meerdere kleinere, samenhangende commits vormen samen zo'n eenheid
+
+Telt **niet** als trigger: een losse tussentijdse commit, werk-in-uitvoering,
+of documentatie-only wijzigingen (behalve de changelog-promotie hieronder,
+die hoort juist bij het taggen zelf).
+
+Volg het bestaande patroon in de git-historie (zie bv. v0.5.0 → v0.6.0):
+
+1. **Changelog eerst.** Zorg dat elke user-facing wijziging sinds de vorige
+   tag een bullet heeft onder `## Unreleased` in `CHANGELOG.md` (commits die
+   dat nog missen alsnog aanvullen).
+2. **Bepaal het semver-niveau**: patch = bugfix, minor = nieuwe feature/geen
+   breaking changes, major = breaking change.
+3. **Promoveer** `## Unreleased` → `## vX.Y.Z` in `CHANGELOG.md` (aparte
+   `release:`-commit, zoals eerder gedaan).
+4. **Annotated tag**: `git tag -a vX.Y.Z -m "..."` met een korte tagline +
+   bullet-samenvatting, in dezelfde stijl als bestaande tags
+   (`git tag -l -n99 <laatste-tag>` om de stijl te checken).
+5. **Vraag expliciet** naar welke remote(s) gepusht moeten worden
+   (`opi2` / `origin` / beide) — **nooit** ongevraagd naar `origin` pushen: dat
+   triggert een publieke GitHub release + Docker image publish naar ghcr.io.
+
+---
+
 ## README Install Snippet (viral-ready)
 
 ```bash
