@@ -148,6 +148,17 @@ go build -o bin/nexus ./cmd/nexus
 ### Manual
 Download a prebuilt binary from [releases](https://github.com/lynuxis2026-pixel/nexus-proxy/releases).
 
+### Docker (optional)
+Not required for the single-binary install above — but if you'd rather run
+NEXUS as a container (e.g. `restart: unless-stopped` on a home server):
+```bash
+git clone https://github.com/lynuxis2026-pixel/nexus-proxy.git
+cd nexus-proxy
+docker compose up -d --build
+```
+See [docs/docker.md](docs/docker.md) for provider config, persistence, and
+prebuilt image details.
+
 ---
 
 ## Add providers

@@ -1,0 +1,17 @@
+services:
+  nexus:
+    build: .
+    # image: ghcr.io/lynuxis2026-pixel/nexus-proxy:latest   # once a version is tagged
+    container_name: nexus
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+      - "2222:2222"
+    volumes:
+      - nexus-data:/home/nexus/.nexus
+    env_file:
+      - path: .env   # optional — GROQ_API_KEY=..., DEEPSEEK_API_KEY=..., etc.
+        required: false
+
+volumes:
+  nexus-data:

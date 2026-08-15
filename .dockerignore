@@ -1,0 +1,12 @@
+.git
+.github
+.devcontainer
+bin/
+web/node_modules
+web/dist
+docs/*.gif
+docs/*.png
+*.md
+*.test
+coverage.out
+.DS_Store

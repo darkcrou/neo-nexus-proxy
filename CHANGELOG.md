@@ -31,6 +31,15 @@ High-level summary of each release. Full, commit-level notes are on the
   ready-to-drop BSL 1.1 template if the project ever wants newer versions to be
   source-available. Today every feature is unlocked; the seam is in place to
   gate later without touching call sites.
+- **Optional Docker deployment:** a multi-stage `Dockerfile` (real dashboard
+  build, distroless nonroot final image, multi-arch amd64/arm64) plus
+  `docker-compose.yml` with `restart: unless-stopped` for auto-start on host
+  reboot — useful for running NEXUS on a home server. Provider keys can be
+  passed as plain container env vars (same auto-discovery as the binary) or
+  via a one-off `docker run ... add` for custom endpoints. Tagged releases
+  publish a prebuilt image to `ghcr.io/lynuxis2026-pixel/nexus-proxy`. See
+  [`docs/docker.md`](docs/docker.md). Verified end-to-end: build, dashboard,
+  persistence across container recreation, restart policy.
 
 ## v0.5.0
 
