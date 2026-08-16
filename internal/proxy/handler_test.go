@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -155,6 +156,84 @@ func TestHandleMessages_Failover(t *testing.T) {
 	_ = json.Unmarshal(rec.Body.Bytes(), &resp)
 	if len(resp.Content) == 0 || resp.Content[0].Text != "from good" {
 		t.Errorf("content = %+v, want 'from good'", resp.Content)
+	}
+}
+
+// flakyServer returns a test server whose handler returns `failStatus` for
+// the first failCount requests, then 200 (via openAIServer's success body
+// shape) for every request after that. hits reports the total request count.
+func flakyServer(failStatus int, failCount int, content string) (*httptest.Server, *int32) {
+	var hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := atomic.AddInt32(&hits, 1)
+		if int(n) <= failCount {
+			w.WriteHeader(failStatus)
+			_, _ = w.Write([]byte(`{"error":{"message":"err"}}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"id": "x", "object": "chat.completion", "model": "m",
+			"choices": []interface{}{map[string]interface{}{
+				"index": 0, "finish_reason": "stop",
+				"message": map[string]interface{}{"role": "assistant", "content": content},
+			}},
+			"usage": map[string]interface{}{"prompt_tokens": 10, "completion_tokens": 5},
+		})
+	}))
+	return srv, &hits
+}
+
+// TestHandleMessages_RetryBeforeFailover: a provider that fails twice with a
+// non-429 retryable status (503) then succeeds on the third attempt must
+// serve the request itself — without the chain-walk ever advancing to the
+// next provider (P4's retry-then-pass-through, tried before failover).
+func TestHandleMessages_RetryBeforeFailover(t *testing.T) {
+	flaky, flakyHits := flakyServer(http.StatusServiceUnavailable, 2, "from flaky")
+	defer flaky.Close()
+	good := openAIServer(http.StatusOK, "from good")
+	defer good.Close()
+	h := buildTestHandler(t, []testProv{{"flaky", "free", flaky.URL}, {"good", "free", good.URL}})
+
+	rec := doMessages(h, `{"model":"claude-haiku-4-5","max_tokens":50,"messages":[{"role":"user","content":"hi"}]}`)
+
+	if rec.Code != 200 {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("X-Nexus-Provider"); got != "flaky" {
+		t.Errorf("X-Nexus-Provider = %q, want flaky (retry-before-failover, should not advance to good)", got)
+	}
+	if got := atomic.LoadInt32(flakyHits); got != 3 {
+		t.Errorf("flaky hits = %d, want 3 (2 failed attempts + 1 success)", got)
+	}
+	var resp AnthropicResponse
+	_ = json.Unmarshal(rec.Body.Bytes(), &resp)
+	if len(resp.Content) == 0 || resp.Content[0].Text != "from flaky" {
+		t.Errorf("content = %+v, want 'from flaky'", resp.Content)
+	}
+}
+
+// TestHandleMessages_RetryExhaustedStillFailsOver: a provider that fails all
+// 3 attempts with a non-429 retryable status must still fail over to the
+// next chain entry — proves the retry loop doesn't swallow the existing
+// next-provider fallback.
+func TestHandleMessages_RetryExhaustedStillFailsOver(t *testing.T) {
+	bad, badHits := flakyServer(http.StatusServiceUnavailable, 1<<30, "") // never recovers
+	defer bad.Close()
+	good := openAIServer(http.StatusOK, "from good")
+	defer good.Close()
+	h := buildTestHandler(t, []testProv{{"bad", "free", bad.URL}, {"good", "free", good.URL}})
+
+	rec := doMessages(h, `{"model":"claude-haiku-4-5","max_tokens":50,"messages":[{"role":"user","content":"hi"}]}`)
+
+	if rec.Code != 200 {
+		t.Fatalf("status = %d (expected eventual failover to good)", rec.Code)
+	}
+	if got := rec.Header().Get("X-Nexus-Provider"); got != "good" {
+		t.Errorf("X-Nexus-Provider = %q, want good (failover after retries exhausted)", got)
+	}
+	if got := atomic.LoadInt32(badHits); got != maxProviderAttempts {
+		t.Errorf("bad hits = %d, want %d (all retries exhausted before failover)", got, maxProviderAttempts)
 	}
 }
 

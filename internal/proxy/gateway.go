@@ -171,6 +171,10 @@ func (h *Handler) HandleModels(w http.ResponseWriter, r *http.Request) {
 // ─── upstream call (OpenAI pass-through) ────────────────────────────────────
 
 func (h *Handler) callOpenAIPassthrough(active *activeProvider, rawMap map[string]interface{}, stream bool) (*http.Response, error) {
+	key, _, ok := active.pickKey()
+	if !ok {
+		return nil, errProviderExhausted
+	}
 	m := make(map[string]interface{}, len(rawMap)+2)
 	for k, v := range rawMap {
 		m[k] = v
@@ -192,7 +196,6 @@ func (h *Handler) callOpenAIPassthrough(active *activeProvider, rawMap map[strin
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	key, _ := active.pickKey()
 	h.authorize(active, req, payload, key)
 	return h.httpClient.Do(req)
 }
