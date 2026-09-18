@@ -159,6 +159,73 @@ Incoming request
 
 ---
 
+## Provider & Key Cooldown (two-level, sticky)
+
+Implemented in `feat(proxy): two-level sticky provider/key cooldown`
+(commit `548f736`). All of this lives in `internal/proxy/handler.go` unless
+noted otherwise. Read this before touching provider selection, 429
+handling, or provider health — it replaced the old naive round-robin +
+generic health-ping design entirely.
+
+**The model:** two independent cooldown levels, where level 2 is *derived*
+from level 1, not an independent timer.
+
+- **Level 1 — key cooldown**, on `activeProvider` (a provider + its pool of
+  `api_keys`): `pickKey() (key, idx, ok)` is **sticky**, not round-robin —
+  it returns the same key on every call until that key 429s, only then
+  scanning forward to the next non-cooling key of the *same* provider.
+  `hasAvailableKey()` reports whether any key is usable right now. If
+  *every* key in the pool is cooling, `pickKey` returns `ok=false` and
+  `callUpstream` returns the sentinel `errProviderExhausted` instead of
+  trying a known-dead key.
+- **Level 2 — provider cooldown**, is **not** a separate timer. A provider
+  is available exactly when it has ≥1 non-cooling key. `coolKey`/
+  `recoverKey` keep `router.Provider.Healthy` (read by `RouteChain`)
+  in sync with real key state — `internal/router/router.go` itself was
+  **not modified**; it just gets fed a different, more accurate signal.
+- **Recovery is by active probe, not blind timer expiry.** `keyProbeLoop`
+  (background, replaces the old 30s generic `healthLoop`) periodically
+  calls `probeCoolingKeys()` → `probeKey()`, which fires one real minimal
+  chat-completion request (`MaxTokens: 1`, "ping") at a *specific cooling
+  key's actual endpoint* via `callUpstreamOnce` — not a cheap `/models`
+  ping, because a `/models` check can succeed while the chat-completions
+  endpoint that actually 429'd is still limited. A non-429 response clears
+  the key's cooldown immediately. Each key has its own exponential backoff
+  (`reschedule`: starts at 10s, doubles, capped at 5 min) so a key that's
+  out on a real daily-quota exhaustion isn't hammered for hours.
+  **`Provider.HealthCheck()`** (the interface method, generic `/models` or
+  reachability ping) still exists and is still used — but only for
+  one-off CLI/UI diagnostics (`nexus status`, `nexus doctor`, dashboard
+  onboarding in `internal/dashboard/setup.go`), never for routing-time
+  availability anymore.
+- **Sticky provider selection**, scoped **per requested Claude model**
+  (e.g. "claude-sonnet-4-6"), not global and not per-complexity:
+  `Handler.sticky map[string]string` + `stickyProvider()`/`setSticky()`,
+  and the pure helper `stickyReorder(chain, sticky)` which reprioritizes
+  `RouteChain`'s output without changing `RouteChain` itself. Updated only
+  on an actual successful response, from whichever provider produced it
+  (429-driven switch or 5xx-retry-exhaustion alike — one success-path
+  write site). Known, intentional nuance: under `StrategyAuto` (default),
+  `RouteChain` reorders by classified complexity, not by requested model —
+  so the same model string can occasionally land in a different chain
+  across requests, and the sticky pointer just won't be found that time.
+  This is graceful degradation, not a bug.
+- **Non-429 errors are a separate, unrelated mechanism**: 500/502/503/504/
+  transport errors get up to `maxProviderAttempts = 3` total attempts
+  against the *same* provider (no backoff, tight retry), then fall through
+  to the pre-existing next-provider chain-walk (`isRetryableStatus`)
+  exactly as before. This never touches cooldown state — cooldown is
+  strictly a 429/rate-limit concept.
+
+**Design precedent worth repeating:** the whole rework touched only
+`internal/proxy/handler.go` (+ one `pickKey` call site in `gateway.go`) and
+added zero changes to `internal/router/router.go` — existing plumbing
+(`Healthy`/`SetHealthy`/`RouteChain`) was reused by feeding it a better
+signal, rather than building a parallel mechanism. Prefer that shape again
+for similar changes.
+
+---
+
 ## Provider Config (~/.nexus/config.toml)
 
 ```toml
@@ -372,6 +439,11 @@ claude
 - **Svelte instead of React** — smaller bundle, faster, embeds better
 - **TOML config** — more readable than YAML for end users
 - **Port 3000 proxy, 2222 dashboard** — 2222 is memorable, no conflicts
+- **Two-level sticky cooldown (key, then provider) replaced round-robin +
+  generic health-ping** — pin to one provider+key until it 429s; provider
+  availability is derived from key state, not an independent timer;
+  recovery is by active probe against the real endpoint, not blind timer
+  expiry. See "Provider & Key Cooldown" section above.
 
 ---
 
