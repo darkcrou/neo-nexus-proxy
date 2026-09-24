@@ -5,6 +5,22 @@ High-level summary of each release. Full, commit-level notes are on the
 
 ## Unreleased
 
+- **Host-editable config in Docker:** swaps the named Docker volume for a
+  `./data` bind mount, so `config.toml` and `nexus.db` are plain files on
+  the host instead of hidden inside Docker's volume storage — edit
+  `config.toml` directly, no `docker exec` needed. Compose reads
+  `NEXUS_UID`/`NEXUS_GID` from `.env` to match the container process to
+  your own host user.
+- **Sticky provider/key cooldown:** replaces per-request key round-robin
+  with sticky routing — pins to one provider+key and keeps sending
+  requests there until it 429s, only then rotates to the next key, and
+  only advances providers once every key in the pool is cooling. Provider
+  health is now derived purely from key-pool state instead of a generic
+  30s `/models` ping; recovery is driven by an active background probe (a
+  real minimal chat-completion request, exponential backoff 10s-5min)
+  instead of a blind timer. Non-429 errors (5xx/timeout) get 2 retries
+  against the same provider before falling back to the existing chain
+  failover.
 - **Vision / image content support:** Anthropic `image` content blocks
   (base64 or URL-sourced, including ones nested inside a `tool_result`) are
   now converted to OpenAI `image_url` content parts when a request is
