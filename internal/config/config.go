@@ -69,9 +69,12 @@ type Provider struct {
 
 	// ModelMap optionally overrides which provider model a Claude model maps to,
 	// e.g. {"claude-sonnet-4-6" = "llama-3.3-70b"}. Use "default" as a catch-all.
-	ModelMap    map[string]string `toml:"model_map,omitempty"`
-	InputPer1M  float64           `toml:"input_per_1m,omitempty"`  // optional pricing override (USD/1M)
-	OutputPer1M float64           `toml:"output_per_1m,omitempty"` // optional pricing override (USD/1M)
+	ModelMap map[string]string `toml:"model_map,omitempty"`
+	// VisionModel optionally sets the provider model ID to use for image-bearing
+	// requests. Entirely operator-supplied — NEXUS does not guess this.
+	VisionModel string  `toml:"vision_model,omitempty"`
+	InputPer1M  float64 `toml:"input_per_1m,omitempty"`  // optional pricing override (USD/1M)
+	OutputPer1M float64 `toml:"output_per_1m,omitempty"` // optional pricing override (USD/1M)
 
 	// Optional off-peak pricing (e.g. DeepSeek discount window), UTC hours.
 	OffPeakInputPer1M  float64 `toml:"off_peak_input_per_1m,omitempty"`

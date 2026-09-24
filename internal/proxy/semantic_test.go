@@ -96,3 +96,67 @@ func TestSemanticCacheSkipsToolRequests(t *testing.T) {
 		t.Errorf("tool requests must never be served as a semantic match; upstream calls=%d (want 2)", calls)
 	}
 }
+
+// TestSemanticCacheSkipsImageRequests guards against the bug where the
+// semantic cache keyed purely on prompt text, so two requests with identical
+// text but different attached images could collide and serve the wrong
+// cached answer. Both requests below have identical text but different
+// base64 image data — they must never produce a semantic-cache hit against
+// each other.
+func TestSemanticCacheSkipsImageRequests(t *testing.T) {
+	var calls int
+	srv := semanticMock(&calls)
+	defer srv.Close()
+
+	h := buildTestHandler(t, []testProv{{"p", "free", srv.URL}})
+	h.cache = newResponseCache(time.Minute, 100, true, 0.5)
+
+	imgBlock := func(data string) string {
+		return `{"type":"image","source":{"type":"base64","media_type":"image/png","data":"` + data + `"}}`
+	}
+	a := `{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":[` +
+		imgBlock("aGVsbG8xMjM0NTY3ODkwYWJjZGVmZ2g=") + `,{"type":"text","text":"what is in this image?"}]}]}`
+	b := `{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":[` +
+		imgBlock("d29ybGQ5ODc2NTQzMjEwemyeHd2dXQ=") + `,{"type":"text","text":"what is in this image?"}]}]}`
+
+	rec1 := doMessages(h, a)
+	rec2 := doMessages(h, b)
+
+	if calls != 2 {
+		t.Errorf("image-bearing requests must never be served as a semantic match against each other; upstream calls=%d (want 2)", calls)
+	}
+	if rec1.Header().Get("X-Nexus-Cache") == "HIT" {
+		t.Error("first image request should be a MISS")
+	}
+	if rec2.Header().Get("X-Nexus-Cache") == "HIT" {
+		t.Error("second image request (different image, same text) must not be a semantic HIT")
+	}
+}
+
+// TestSemanticCacheHitViaHandleMessages is a regression check: pure-text
+// semantic caching through the Anthropic-native HandleMessages path (the
+// path the image-keying fix touches) must still work exactly as before.
+func TestSemanticCacheHitViaHandleMessages(t *testing.T) {
+	var calls int
+	srv := semanticMock(&calls)
+	defer srv.Close()
+
+	h := buildTestHandler(t, []testProv{{"p", "free", srv.URL}})
+	h.cache = newResponseCache(time.Minute, 100, true, 0.7)
+
+	first := `{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"how do I reverse a list in python"}]}`
+	reworded := `{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"How do I reverse a list in Python quickly?"}]}`
+
+	rec1 := doMessages(h, first)
+	rec2 := doMessages(h, reworded)
+
+	if calls != 1 {
+		t.Errorf("near-identical text-only prompt must still be served from the semantic cache; upstream calls=%d (want 1)", calls)
+	}
+	if rec1.Header().Get("X-Nexus-Cache") == "HIT" {
+		t.Error("first request should be a MISS")
+	}
+	if rec2.Header().Get("X-Nexus-Cache") != "HIT" {
+		t.Errorf("reworded text-only request should be a semantic HIT, got %q", rec2.Header().Get("X-Nexus-Cache"))
+	}
+}

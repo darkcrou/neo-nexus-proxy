@@ -15,6 +15,7 @@ type Spec struct {
 	Models      []string
 	Tier        string
 	ModelMap    map[string]string // Claude model → provider model ("default" = catch-all)
+	VisionModel string            // optional operator-supplied model ID for image-bearing requests
 	InputPer1M  float64
 	OutputPer1M float64
 	// Optional off-peak pricing window (UTC hours) + rates.
@@ -42,6 +43,17 @@ type Authorizer interface {
 type AnthropicNative interface {
 	MessagesURL(claudeModel string) string
 	PrepareBody(body []byte, claudeModel string) []byte
+}
+
+// VisionCapable is implemented by a provider that has an operator-configured
+// vision-model override. NEXUS does not maintain its own catalog of which
+// provider models support vision — that would require tracking every
+// provider's model catalog as it changes, which is exactly what this project
+// avoids. Absent this override, an image-bearing request is simply forwarded
+// using MapModel's normal result, and the provider's own response (success or
+// error) is relayed as-is.
+type VisionCapable interface {
+	VisionModel(claudeModel string) string
 }
 
 // IsGenericType reports whether a provider type denotes a generic,
@@ -81,7 +93,7 @@ func New(spec Spec) (Provider, error) {
 	if err != nil {
 		return nil, err
 	}
-	if len(spec.ModelMap) > 0 || spec.InputPer1M > 0 || spec.OutputPer1M > 0 || spec.Tier != "" || spec.hasOffPeak() {
+	if len(spec.ModelMap) > 0 || spec.InputPer1M > 0 || spec.OutputPer1M > 0 || spec.Tier != "" || spec.hasOffPeak() || spec.VisionModel != "" {
 		return &overridden{Provider: base, spec: spec}, nil
 	}
 	return base, nil
@@ -125,16 +137,22 @@ func (o *overridden) Tier() string {
 	return o.Provider.Tier()
 }
 
+// VisionModel returns the operator-configured vision-model override, if any.
+func (o *overridden) VisionModel(claudeModel string) string {
+	return o.spec.VisionModel
+}
+
 // ─── Generic: a fully config-driven OpenAI-compatible provider ──────────────
 
 type Generic struct {
-	name     string
-	baseURL  string
-	tier     string
-	apiKey   string
-	models   []string
-	modelMap map[string]string
-	pricing  PricingInfo
+	name        string
+	baseURL     string
+	tier        string
+	apiKey      string
+	models      []string
+	modelMap    map[string]string
+	visionModel string
+	pricing     PricingInfo
 }
 
 func newGeneric(spec Spec) *Generic {
@@ -143,12 +161,13 @@ func newGeneric(spec Spec) *Generic {
 		tier = TierStandard
 	}
 	return &Generic{
-		name:     spec.Name,
-		baseURL:  strings.TrimRight(spec.BaseURL, "/"),
-		tier:     tier,
-		apiKey:   spec.APIKey,
-		models:   spec.Models,
-		modelMap: spec.ModelMap,
+		name:        spec.Name,
+		baseURL:     strings.TrimRight(spec.BaseURL, "/"),
+		tier:        tier,
+		apiKey:      spec.APIKey,
+		models:      spec.Models,
+		modelMap:    spec.ModelMap,
+		visionModel: spec.VisionModel,
 		pricing: PricingInfo{
 			InputPer1M: spec.InputPer1M, OutputPer1M: spec.OutputPer1M,
 			OffPeakInputPer1M: spec.OffPeakInputPer1M, OffPeakOutputPer1M: spec.OffPeakOutputPer1M,
@@ -173,6 +192,9 @@ func (g *Generic) MapModel(claudeModel string) string {
 	}
 	return claudeModel
 }
+
+// VisionModel returns the operator-configured vision-model override, if any.
+func (g *Generic) VisionModel(claudeModel string) string { return g.visionModel }
 
 // orDefault returns v if non-empty, else def.
 func orDefault(v, def string) string {

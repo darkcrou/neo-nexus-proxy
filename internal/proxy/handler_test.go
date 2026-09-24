@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -384,5 +385,147 @@ func TestHandleMessages_VertexStreaming(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Errorf("synthesized SSE missing %q\n--- got ---\n%s", want, out)
 		}
+	}
+}
+
+// ─── V3: image detection + vision_model override lookup ───────────────────
+
+// imageRequestBody is an Anthropic-format request whose sole user message
+// carries an image content block alongside text.
+const imageRequestBody = `{"model":"claude-sonnet-4-6","max_tokens":50,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"aGVsbG8="}},{"type":"text","text":"what is this?"}]}]}`
+
+// captureModelServer returns a test server that decodes the incoming OpenAI
+// request and stashes its "model" field in *gotModel, then replies 200 OK.
+func captureModelServer(gotModel *string) *httptest.Server {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var m map[string]interface{}
+		_ = json.NewDecoder(r.Body).Decode(&m)
+		*gotModel, _ = m["model"].(string)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"id": "x", "object": "chat.completion", "model": *gotModel,
+			"choices": []interface{}{map[string]interface{}{"index": 0, "finish_reason": "stop",
+				"message": map[string]interface{}{"role": "assistant", "content": "described"}}},
+			"usage": map[string]interface{}{"prompt_tokens": 9, "completion_tokens": 4},
+		})
+	}))
+}
+
+// TestHandleMessages_ImageRequest_UsesVisionModelOverride confirms that an
+// image-bearing request against a provider with a configured vision_model
+// override is sent to that model, not MapModel's ordinary result.
+func TestHandleMessages_ImageRequest_UsesVisionModelOverride(t *testing.T) {
+	var gotModel string
+	srv := captureModelServer(&gotModel)
+	defer srv.Close()
+
+	impl, err := providers.New(providers.Spec{
+		Name: "visionprov", Type: "openai-compatible", BaseURL: srv.URL,
+		Models: []string{"llama-x"}, VisionModel: "llama-vision-90b",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rt := router.New(router.StrategyAuto)
+	rt.AddProvider(&router.Provider{Name: "visionprov", Tier: "free", Healthy: true})
+	h := &Handler{httpClient: &http.Client{Timeout: 10 * time.Second}, router: rt, providers: map[string]*activeProvider{"visionprov": {impl: impl, apiKey: "k"}}}
+
+	rec := doMessages(h, imageRequestBody)
+
+	if rec.Code != 200 {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if gotModel != "llama-vision-90b" {
+		t.Errorf("upstream model = %q, want the configured vision_model override %q", gotModel, "llama-vision-90b")
+	}
+}
+
+// TestHandleMessages_ImageRequest_NoOverrideUsesMapModel is the regression
+// check for the common case (Moonshot/Kimi, OpenAI, Gemini, xAI, ... with no
+// vision_model set): an image-bearing request against a provider with no
+// override must still use MapModel's ordinary result, unchanged.
+func TestHandleMessages_ImageRequest_NoOverrideUsesMapModel(t *testing.T) {
+	var gotModel string
+	srv := captureModelServer(&gotModel)
+	defer srv.Close()
+
+	impl, err := providers.New(providers.Spec{
+		Name: "novision", Type: "openai-compatible", BaseURL: srv.URL,
+		Models: []string{"llama-x"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rt := router.New(router.StrategyAuto)
+	rt.AddProvider(&router.Provider{Name: "novision", Tier: "free", Healthy: true})
+	h := &Handler{httpClient: &http.Client{Timeout: 10 * time.Second}, router: rt, providers: map[string]*activeProvider{"novision": {impl: impl, apiKey: "k"}}}
+
+	rec := doMessages(h, imageRequestBody)
+
+	if rec.Code != 200 {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if gotModel != "llama-x" {
+		t.Errorf("upstream model = %q, want MapModel's unchanged result %q", gotModel, "llama-x")
+	}
+}
+
+// TestHandleMessages_ImageRequest_NoChainFiltering confirms that having image
+// content does not exclude a non-vision-capable provider from the failover
+// chain. If a future change filtered the chain by vision capability, this
+// request would get a 502 (both chain entries excluded) instead of the 200
+// served by the second, non-vision provider.
+func TestHandleMessages_ImageRequest_NoChainFiltering(t *testing.T) {
+	bad := openAIServer(http.StatusServiceUnavailable, "")
+	defer bad.Close()
+	var gotModel string
+	good := captureModelServer(&gotModel)
+	defer good.Close()
+
+	// Neither provider has a vision_model override configured.
+	h := buildTestHandler(t, []testProv{{"bad", "free", bad.URL}, {"good", "free", good.URL}})
+
+	rec := doMessages(h, imageRequestBody)
+
+	if rec.Code != 200 {
+		t.Fatalf("status = %d (expected failover to 'good' despite image content), body = %s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("X-Nexus-Provider"); got != "good" {
+		t.Errorf("X-Nexus-Provider = %q, want good (chain must not skip non-vision providers)", got)
+	}
+}
+
+// TestRouteChain_ImagesDoNotAffectChain confirms that an image-bearing
+// request classifies to the same complexity as, and therefore produces
+// byte-for-byte the same routing chain as, the equivalent text-only request.
+// The routing/cooldown path stays entirely content-oblivious — V3
+// deliberately does not filter the chain by vision capability.
+func TestRouteChain_ImagesDoNotAffectChain(t *testing.T) {
+	rt := router.New(router.StrategyAuto)
+	rt.AddProvider(&router.Provider{Name: "a", Tier: "free", Healthy: true})
+	rt.AddProvider(&router.Provider{Name: "b", Tier: "standard", Healthy: true})
+	rt.AddProvider(&router.Provider{Name: "c", Tier: "premium", Healthy: true})
+
+	textOnly := []map[string]interface{}{
+		{"role": "user", "content": "what is this?"},
+	}
+	withImage := []map[string]interface{}{
+		{"role": "user", "content": []interface{}{
+			map[string]interface{}{"type": "image", "source": map[string]interface{}{"type": "base64", "media_type": "image/png", "data": "aGVsbG8="}},
+			map[string]interface{}{"type": "text", "text": "what is this?"},
+		}},
+	}
+
+	model := "claude-sonnet-4-6"
+	c1 := router.ClassifyRequest(model, textOnly, false)
+	c2 := router.ClassifyRequest(model, withImage, false)
+	if c1 != c2 {
+		t.Fatalf("complexity differs: text-only=%v, with-image=%v", c1, c2)
+	}
+
+	chain1 := rt.RouteChain(model, c1)
+	chain2 := rt.RouteChain(model, c2)
+	if !reflect.DeepEqual(chain1, chain2) {
+		t.Errorf("routing chain differs between text-only and image-bearing requests:\n text-only: %+v\n with-image: %+v", chain1, chain2)
 	}
 }

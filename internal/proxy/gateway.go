@@ -49,9 +49,9 @@ func (h *Handler) HandleChatCompletions(w http.ResponseWriter, r *http.Request) 
 		var vec sparseVec
 		hasTools := false
 		if h.cache.semantic {
-			if text, ht, ok := promptText(body); ok {
+			if text, ht, hi, ok := promptText(body); ok {
 				hasTools = ht
-				if !ht {
+				if !ht && !hi {
 					vec = embed(text)
 					if e, ok := h.cache.getSemantic(quickModel(body), vec); ok {
 						h.serveCached(w, e, startTime, user)

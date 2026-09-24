@@ -250,6 +250,7 @@ func NewHandler(cfg *Config, db *storage.DB, broker EventPublisher) (*Handler, e
 			Models:             pc.Models,
 			Tier:               pc.Tier,
 			ModelMap:           pc.ModelMap,
+			VisionModel:        pc.VisionModel,
 			InputPer1M:         pc.InputPer1M,
 			OutputPer1M:        pc.OutputPer1M,
 			OffPeakInputPer1M:  pc.OffPeakInputPer1M,
@@ -561,6 +562,31 @@ func stickyReorder(chain []*router.Provider, sticky string) []*router.Provider {
 	return out
 }
 
+// hasImageContent reports whether any message's content array contains an
+// image block. This is a shallow, top-level scan only — unlike the
+// transformer's full conversion logic, it does not recurse into tool_result
+// content — because it is used solely to decide whether to consult a
+// provider's configured vision-model override (providers.VisionCapable), not
+// to reproduce V1's transform-time image handling.
+func hasImageContent(messages []map[string]interface{}) bool {
+	for _, m := range messages {
+		content, ok := m["content"].([]interface{})
+		if !ok {
+			continue
+		}
+		for _, block := range content {
+			b, ok := block.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			if t, _ := b["type"].(string); t == "image" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // HandleMessages is the main handler for POST /v1/messages (Claude Code calls this).
 func (h *Handler) HandleMessages(w http.ResponseWriter, r *http.Request) {
 	startTime := time.Now()
@@ -594,9 +620,9 @@ func (h *Handler) HandleMessages(w http.ResponseWriter, r *http.Request) {
 		var vec sparseVec
 		hasTools := false
 		if h.cache.semantic {
-			if text, ht, ok := promptText(body); ok {
+			if text, ht, hi, ok := promptText(body); ok {
 				hasTools = ht
-				if !ht {
+				if !ht && !hi {
 					vec = embed(text)
 					if e, ok := h.cache.getSemantic(quickModel(body), vec); ok {
 						h.serveCached(w, e, startTime, user)
@@ -641,6 +667,7 @@ func (h *Handler) HandleMessages(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = json.Unmarshal(body, &raw)
 	hasTools := len(req.Tools) > 0
+	req.nexusImages = hasImageContent(raw.Messages)
 	complexity := router.ClassifyRequest(req.Model, raw.Messages, hasTools)
 
 	log.Debug().
@@ -673,7 +700,7 @@ func (h *Handler) HandleMessages(w http.ResponseWriter, r *http.Request) {
 	// Routing rules + cost guardrail need the prompt text.
 	var ptext string
 	if len(h.rules) > 0 || h.maxReqUSD > 0 {
-		ptext, _, _ = promptText(body)
+		ptext, _, _, _ = promptText(body)
 	}
 
 	// Explicit provider pin (header), then config rules (provider or tier).
@@ -880,7 +907,15 @@ func (h *Handler) callUpstream(active *activeProvider, req AnthropicRequest, bod
 // callUpstreamOnce performs a single upstream request with a specific API key.
 func (h *Handler) callUpstreamOnce(active *activeProvider, req AnthropicRequest, body []byte, origHeaders http.Header, key string) (*http.Response, error) {
 	if providers.IsOpenAICompatible(active.impl.Name()) {
-		oaiReq, err := TransformToOpenAI(req, active.impl.MapModel(req.Model))
+		targetModel := active.impl.MapModel(req.Model)
+		if req.nexusImages {
+			if vc, ok := active.impl.(providers.VisionCapable); ok {
+				if vm := vc.VisionModel(req.Model); vm != "" {
+					targetModel = vm
+				}
+			}
+		}
+		oaiReq, err := TransformToOpenAI(req, targetModel)
 		if err != nil {
 			return nil, fmt.Errorf("request transform failed: %w", err)
 		}
@@ -1391,6 +1426,7 @@ type AnthropicRequest struct {
 	Tools         []interface{} `json:"tools,omitempty"`
 	nexusUser     string        // team attribution; derived per request, never serialized
 	nexusRedacted int           // # secrets/PII the firewall masked; never serialized
+	nexusImages   bool          // has ≥1 image content block; derived per request, never serialized
 }
 
 // deriveUser attributes a request to a team member: the X-Nexus-User header, or

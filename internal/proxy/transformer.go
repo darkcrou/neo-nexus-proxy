@@ -98,32 +98,111 @@ func convertMessage(msg Message) (OpenAIMessage, error) {
 	case string:
 		oaiMsg.Content = textContent(c)
 	case []interface{}:
-		// Array of content blocks
-		text := ""
-		for _, block := range c {
-			if b, ok := block.(map[string]interface{}); ok {
-				switch b["type"] {
-				case "text":
-					if t, ok := b["text"].(string); ok {
-						text += t
-					}
-				case "tool_result":
-					// Handle tool results
-					if content, ok := b["content"].([]interface{}); ok {
-						text += extractTextFromBlocks(content)
-					}
-				case "tool_use":
-					// Tool use in user message (for tool results)
-					// Convert to tool call in OpenAI format
-				}
-			}
+		// Array of content blocks. Build an ordered array of OpenAI content
+		// parts first; if it turns out no image was present anywhere (including
+		// nested inside a tool_result), collapse back to the plain-string form
+		// so text-only messages marshal byte-identically to before.
+		parts := blocksToParts(c)
+		if hasImagePart(parts) {
+			oaiMsg.Content = partsContent(parts)
+		} else {
+			oaiMsg.Content = textContent(joinText(parts))
 		}
-		oaiMsg.Content = textContent(text)
 	default:
 		return oaiMsg, fmt.Errorf("unknown content type: %T", msg.Content)
 	}
 
 	return oaiMsg, nil
+}
+
+// blocksToParts converts an ordered list of Anthropic content blocks into an
+// ordered list of OpenAI content parts, preserving block order:
+//   - "text"        -> a {"type":"text"} part
+//   - "image"        -> a {"type":"image_url"} part (see imagePart)
+//   - "tool_result"  -> its own nested "content" array (when present and itself
+//     an array) is recursively converted via blocksToParts and spliced in
+//     place, so an image returned by a custom tool surfaces too
+//   - "tool_use"     -> skipped (unchanged from prior behavior: tool_use blocks
+//     in a user message aren't converted here)
+//   - anything else  -> skipped
+func blocksToParts(blocks []interface{}) []OpenAIContentPart {
+	var parts []OpenAIContentPart
+	for _, block := range blocks {
+		b, ok := block.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		switch b["type"] {
+		case "text":
+			if t, ok := b["text"].(string); ok {
+				parts = append(parts, OpenAIContentPart{Type: "text", Text: t})
+			}
+		case "image":
+			if p, ok := imagePart(b); ok {
+				parts = append(parts, p)
+			}
+		case "tool_result":
+			if content, ok := b["content"].([]interface{}); ok {
+				parts = append(parts, blocksToParts(content)...)
+			}
+		case "tool_use":
+			// Tool use in user message (for tool results)
+			// Convert to tool call in OpenAI format
+		}
+	}
+	return parts
+}
+
+// imagePart converts an Anthropic "image" block into an OpenAI image_url part.
+// A base64 source becomes a data: URI; a url source is passed through
+// verbatim. Returns ok=false (and the block is skipped by the caller) if the
+// source is missing or malformed.
+func imagePart(block map[string]interface{}) (OpenAIContentPart, bool) {
+	source, ok := block["source"].(map[string]interface{})
+	if !ok {
+		return OpenAIContentPart{}, false
+	}
+	switch source["type"] {
+	case "base64":
+		mediaType, ok1 := source["media_type"].(string)
+		data, ok2 := source["data"].(string)
+		if !ok1 || !ok2 {
+			return OpenAIContentPart{}, false
+		}
+		url := "data:" + mediaType + ";base64," + data
+		return OpenAIContentPart{Type: "image_url", ImageURL: &OpenAIImageURL{URL: url}}, true
+	case "url":
+		url, ok := source["url"].(string)
+		if !ok {
+			return OpenAIContentPart{}, false
+		}
+		return OpenAIContentPart{Type: "image_url", ImageURL: &OpenAIImageURL{URL: url}}, true
+	default:
+		return OpenAIContentPart{}, false
+	}
+}
+
+// hasImagePart reports whether any part in the slice is an image_url part.
+func hasImagePart(parts []OpenAIContentPart) bool {
+	for _, p := range parts {
+		if p.Type == "image_url" {
+			return true
+		}
+	}
+	return false
+}
+
+// joinText concatenates the text of every "text" part, in order, ignoring
+// other part types. Used to reconstruct the legacy flattened-string form when
+// a block array turns out to contain no images.
+func joinText(parts []OpenAIContentPart) string {
+	var sb strings.Builder
+	for _, p := range parts {
+		if p.Type == "text" {
+			sb.WriteString(p.Text)
+		}
+	}
+	return sb.String()
 }
 
 func convertTool(tool interface{}) (OpenAITool, error) {
@@ -206,13 +285,21 @@ type OpenAIMessage struct {
 // text) so callers that route to an Anthropic-format provider can forward the
 // same block structure instead of collapsing it into one string — see Anthropic().
 type OpenAIContent struct {
-	text  string
-	parts []OpenAIContentPart // non-nil only if the JSON source was an array
+	text    string
+	parts   []OpenAIContentPart // non-nil if the JSON source was an array, or if built via partsContent
+	asArray bool                // true only when built via partsContent: MarshalJSON emits parts, not text
 }
 
 type OpenAIContentPart struct {
-	Type string `json:"type"`
-	Text string `json:"text"`
+	Type     string          `json:"type"`
+	Text     string          `json:"text,omitempty"`
+	ImageURL *OpenAIImageURL `json:"image_url,omitempty"`
+}
+
+// OpenAIImageURL is the "image_url" part payload for an OpenAI vision content
+// part: {"type":"image_url","image_url":{"url":"..."}}.
+type OpenAIImageURL struct {
+	URL string `json:"url"`
 }
 
 // textContent builds an OpenAIContent from a Go string, for call sites that
@@ -220,6 +307,13 @@ type OpenAIContentPart struct {
 // which always use the plain-string form).
 func textContent(s string) OpenAIContent {
 	return OpenAIContent{text: s}
+}
+
+// partsContent builds an OpenAIContent that marshals as an array of content
+// parts (not a flattened string) — for outbound requests whose message
+// content includes at least one non-text part (currently: images).
+func partsContent(parts []OpenAIContentPart) OpenAIContent {
+	return OpenAIContent{parts: parts, asArray: true}
 }
 
 func (c *OpenAIContent) UnmarshalJSON(data []byte) error {
@@ -248,10 +342,15 @@ func (c *OpenAIContent) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-// MarshalJSON always emits the flattened string form. OpenAIMessage is only ever
-// marshaled for the outbound-to-OpenAI-provider direction, where a plain string is
-// universally accepted and is what NEXUS already constructs (see convertMessage).
+// MarshalJSON emits the parts array when the value was built via partsContent
+// (asArray), and the flattened string otherwise. OpenAIMessage is only ever
+// marshaled for the outbound-to-OpenAI-provider direction; a plain string is
+// what NEXUS constructs for text-only content (see convertMessage), and an
+// array of parts for content that includes images.
 func (c OpenAIContent) MarshalJSON() ([]byte, error) {
+	if c.asArray {
+		return json.Marshal(c.parts)
+	}
 	return json.Marshal(c.text)
 }
 

@@ -68,12 +68,13 @@ func hash64(s string) uint64 {
 	return h.Sum64()
 }
 
-// promptText extracts the concatenated system + message text and whether the
-// request declares tools, from either an Anthropic or OpenAI request body.
-func promptText(body []byte) (text string, hasTools bool, ok bool) {
+// promptText extracts the concatenated system + message text, whether the
+// request declares tools, and whether it contains any image content block,
+// from either an Anthropic or OpenAI request body.
+func promptText(body []byte) (text string, hasTools bool, hasImages bool, ok bool) {
 	var m map[string]interface{}
 	if json.Unmarshal(body, &m) != nil {
-		return "", false, false
+		return "", false, false, false
 	}
 	if t, exists := m["tools"]; exists {
 		if arr, isArr := t.([]interface{}); isArr && len(arr) > 0 {
@@ -82,15 +83,40 @@ func promptText(body []byte) (text string, hasTools bool, ok bool) {
 	}
 	var sb strings.Builder
 	collectText(m["system"], &sb)
+	if hasImageBlock(m["system"]) {
+		hasImages = true
+	}
 	if msgs, isArr := m["messages"].([]interface{}); isArr {
 		for _, mm := range msgs {
 			if mp, isMap := mm.(map[string]interface{}); isMap {
 				collectText(mp["content"], &sb)
+				if hasImageBlock(mp["content"]) {
+					hasImages = true
+				}
 			}
 		}
 	}
 	text = strings.TrimSpace(sb.String())
-	return text, hasTools, text != ""
+	return text, hasTools, hasImages, text != ""
+}
+
+// hasImageBlock reports whether v (a "system" field or a message's "content"
+// field) contains any content block whose "type" is "image". It walks the
+// same []interface{}-of-map[string]interface{} shape collectText already
+// walks, as a sibling scan rather than a second decode.
+func hasImageBlock(v interface{}) bool {
+	arr, ok := v.([]interface{})
+	if !ok {
+		return false
+	}
+	for _, b := range arr {
+		if bm, ok := b.(map[string]interface{}); ok {
+			if t, _ := bm["type"].(string); t == "image" {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func collectText(v interface{}, sb *strings.Builder) {
