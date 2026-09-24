@@ -226,6 +226,82 @@ for similar changes.
 
 ---
 
+## Vision / Image Content Support
+
+Read this before touching image content handling, vision-model config, or
+the semantic cache's request-skip logic. Spans
+`internal/proxy/transformer.go`, `internal/providers/generic.go`,
+`internal/config/config.go`, `internal/proxy/handler.go`,
+`internal/proxy/semantic.go`, and `internal/proxy/gateway.go`.
+
+- **Content conversion** (`transformer.go`): `convertMessage` builds an
+  ordered list of OpenAI content parts via `blocksToParts` — Anthropic
+  `"text"` blocks become `{"type":"text"}` parts, `"image"` blocks become
+  `{"type":"image_url"}` parts via `imagePart` (a `base64` source becomes a
+  `data:` URI, a `url` source passes through verbatim), and an image nested
+  inside a `tool_result`'s own `content` array is spliced in by recursing
+  into `blocksToParts`. `hasImagePart` then decides the final shape: if no
+  image is present anywhere, the parts collapse back to the legacy flat
+  string (`joinText`) so text-only requests still marshal byte-identically
+  to before this feature existed; only when an image is present does
+  `OpenAIContent` marshal as an array (`partsContent`/`asArray`). The
+  Anthropic-native passthrough path (anthropic, bedrock, vertex) forwards
+  raw request bytes unchanged and needed no change.
+- **Operator-supplied vision-model override, not a NEXUS-maintained
+  catalog** (`config.go`/`generic.go`): a new optional `vision_model` TOML
+  key on `Provider` flows into `providers.Spec.VisionModel`, read through
+  the optional `VisionCapable` interface (`VisionModel(claudeModel string)
+  string`) implemented identically by `*overridden` (a built-in provider
+  with config overrides applied) and `*Generic` (a fully config-driven
+  custom/OpenAI-compatible provider) — the same override mechanism already
+  used for `model_map`, pricing, and tier. An empty return means "no
+  override": NEXUS has no built-in notion of which model IDs support
+  vision for any provider.
+- **Handler wiring** (`handler.go`): `hasImageContent` — a shallow,
+  top-level-only scan over the raw parsed messages (it does not recurse
+  into `tool_result`, unlike the transformer's full conversion) — sets a
+  new unexported, per-request `AnthropicRequest.nexusImages` field (same
+  pattern as `nexusUser`/`nexusRedacted`: derived per request, never
+  serialized). In `callUpstreamOnce`, when `nexusImages` is true and the
+  active provider implements `VisionCapable` with a non-empty
+  `VisionModel(req.Model)`, that value replaces `MapModel(req.Model)` as
+  the `targetModel` passed to `TransformToOpenAI` — otherwise behavior is
+  completely unchanged from before this feature.
+- **No chain filtering, by design:** `nexusImages` never reaches
+  `RouteChain`, the sticky-provider logic, or the cooldown machinery — an
+  image-bearing request walks the exact same provider chain a text-only
+  request would. If the provider NEXUS picks can't actually handle the
+  image, its own error response is relayed to Claude Code as-is, identical
+  to how any other provider 4xx is already relayed today — an honest
+  failure, not a NEXUS-side guess.
+- **Semantic-cache exclusion** (`semantic.go`): `promptText` now also
+  returns `hasImages`, computed by a sibling scan `hasImageBlock` that
+  walks the same `system`/message-`content` shape `collectText` already
+  walks. Both call sites — `HandleMessages` (`handler.go`) and
+  `HandleChatCompletions` (`gateway.go`, the OpenAI-compatible
+  `/v1/chat/completions` gateway) — skip the semantic embed/lookup when
+  `hasImages` is true, mirroring the existing `hasTools` skip: the
+  embedding is a text-only hashed sparse vector, so an image-bearing
+  request has no business being embedded or matched against one.
+
+**Why there's no hardcoded vision-capable-model catalog.** The original
+plan for this feature required NEXUS to maintain a hardcoded, per-provider
+table of "current vision-capable model IDs," confirmed by live doc
+research. That attempt was abandoned mid-implementation: live research
+produced internally contradictory results for 3 of 4 target providers
+(only one came back consistent). The deeper problem it surfaced wasn't the
+research quality — it's that maintaining such a catalog fights what NEXUS
+actually is: a **sticky forwarder** over an operator-configured provider
+list (see "Provider & Key Cooldown" above), not a content-aware router
+that curates a model catalog on the operator's behalf. A shadow copy of
+"which model IDs currently support vision" in Go source goes stale the
+moment any provider ships a new model, and duplicates configuration the
+operator already owns. **Do not redo that research or reintroduce a
+built-in vision-model catalog** — if a future session is tempted to, this
+paragraph is why it was dropped, not an oversight to fix.
+
+---
+
 ## Provider Config (~/.nexus/config.toml)
 
 ```toml
@@ -444,6 +520,14 @@ claude
   availability is derived from key state, not an independent timer;
   recovery is by active probe against the real endpoint, not blind timer
   expiry. See "Provider & Key Cooldown" section above.
+- **No hardcoded vision-capable-model catalog; `vision_model` is a plain
+  operator override instead** — an initial per-provider vision-model table
+  (confirmed by live doc research) was abandoned after that research came
+  back internally contradictory for most target providers, and because a
+  Go-source shadow copy of provider model catalogs conflicts with NEXUS's
+  role as a sticky forwarder, not a content-aware router. There is no
+  vision-based filtering of the routing/cooldown chain. See "Vision / Image
+  Content Support" section above.
 
 ---
 

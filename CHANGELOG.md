@@ -3,6 +3,25 @@
 High-level summary of each release. Full, commit-level notes are on the
 [GitHub releases page](https://github.com/lynuxis2026-pixel/nexus-proxy/releases).
 
+## Unreleased
+
+- **Vision / image content support:** Anthropic `image` content blocks
+  (base64 or URL-sourced, including ones nested inside a `tool_result`) are
+  now converted to OpenAI `image_url` content parts when a request is
+  forwarded to an OpenAI-compatible provider — previously they were
+  silently dropped. An image-bearing request uses the provider's normal
+  mapped model unless the operator sets a one-line `vision_model` override
+  per provider in `config.toml` (the same override pattern as `model_map`,
+  pricing, and tier); NEXUS still doesn't maintain or infer which provider
+  models support vision, and there's no filtering of the routing/cooldown
+  chain by vision capability — an incompatible provider's own error is
+  relayed to Claude Code unchanged, same as any other 4xx.
+- **Semantic-cache fix for image-bearing requests:** the opt-in semantic
+  cache (`--semantic-cache`) now skips embedding/lookup for any request
+  containing image content, the same way it already skips tool-using
+  requests — previously an image-bearing request could be matched against
+  a cached entry keyed on an embedding that only ever saw its text.
+
 ## v0.6.0
 
 - **OpenAI array-form content:** the chat completions gateway now accepts
