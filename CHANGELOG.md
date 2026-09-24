@@ -3,7 +3,7 @@
 High-level summary of each release. Full, commit-level notes are on the
 [GitHub releases page](https://github.com/lynuxis2026-pixel/nexus-proxy/releases).
 
-## Unreleased
+## v0.7.0
 
 - **Host-editable config in Docker:** swaps the named Docker volume for a
   `./data` bind mount, so `config.toml` and `nexus.db` are plain files on
