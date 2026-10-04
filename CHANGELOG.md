@@ -5,6 +5,29 @@ High-level summary of each release. Full, commit-level notes are on the
 
 ## Unreleased
 
+- **Image support on the OpenAI gateway (`/v1/chat/completions`):**
+  requests with `image_url` content parts (an `http(s)` URL or a base64
+  `data:` URI) are now accepted instead of failing with a 400
+  (`unsupported content part type "image_url"`). This affects OpenAI-style
+  clients such as pi.dev, opencode and Cursor. OpenAI-compatible providers
+  receive the image as sent; when the request is routed to an Anthropic,
+  Bedrock or Vertex provider, the image is converted to an Anthropic image
+  block (previously it became an empty text block). Malformed `image_url`
+  parts and other unsupported part types still return a clear 400. NEXUS
+  does not fetch image URLs: they are forwarded as received, and URL support
+  and accepted formats depend on the provider (its own error is relayed
+  unchanged).
+- **Image fixes in the firewall, cache, vision override and inspector:**
+  the privacy firewall no longer scans or rewrites base64 image payloads
+  (a secret-shaped substring inside the base64 could previously corrupt the
+  image); the semantic cache now also skips OpenAI-shaped `image_url`
+  requests; image detection recurses into `tool_result` content, so the
+  `vision_model` override now applies to images Claude Code reads from disk
+  and to requests on the OpenAI gateway, and the logged `model_used` names
+  the model actually sent (the override applies to OpenAI-compatible
+  providers only; the `direct` strategy still forwards the requested model
+  verbatim); `--inspect` capture omits long base64 image data instead of
+  storing a truncated blob.
 - **`direct` routing strategy:** forwards the client's requested model id
   to OpenAI-compatible providers exactly as received, bypassing
   `model_map` and the `vision_model` override — for pointing NEXUS

@@ -232,11 +232,15 @@ for similar changes.
 
 ## Vision / Image Content Support
 
-Read this before touching image content handling, vision-model config, or
-the semantic cache's request-skip logic. Spans
-`internal/proxy/transformer.go`, `internal/providers/generic.go`,
-`internal/config/config.go`, `internal/proxy/handler.go`,
-`internal/proxy/semantic.go`, and `internal/proxy/gateway.go`.
+Read this before touching image content handling, vision-model config, the
+semantic cache's request-skip logic, the privacy firewall's treatment of
+image payloads, or inspector prompt capture. Spans
+`internal/proxy/transformer.go`, `internal/proxy/images.go`,
+`internal/providers/generic.go`, `internal/config/config.go`,
+`internal/proxy/handler.go`, `internal/proxy/semantic.go`,
+`internal/proxy/firewall.go`, and `internal/proxy/gateway.go`.
+Images are handled on both inbound paths: `/v1/messages` (Anthropic shape)
+and `/v1/chat/completions` (OpenAI shape, `gateway.go`).
 
 - **Content conversion** (`transformer.go`): `convertMessage` builds an
   ordered list of OpenAI content parts via `blocksToParts` — Anthropic
@@ -248,9 +252,10 @@ the semantic cache's request-skip logic. Spans
   image is present anywhere, the parts collapse back to the legacy flat
   string (`joinText`) so text-only requests still marshal byte-identically
   to before this feature existed; only when an image is present does
-  `OpenAIContent` marshal as an array (`partsContent`/`asArray`). The
-  Anthropic-native passthrough path (anthropic, bedrock, vertex) forwards
-  raw request bytes unchanged and needed no change.
+  `OpenAIContent` marshal as an array (`partsContent`/`asArray`). On
+  `/v1/messages`, the Anthropic-native passthrough path (anthropic,
+  bedrock, vertex) forwards raw request bytes unchanged and needed no
+  change (the gateway's OpenAI-to-Anthropic direction is covered below).
 - **Operator-supplied vision-model override, not a NEXUS-maintained
   catalog** (`config.go`/`generic.go`): a new optional `vision_model` TOML
   key on `Provider` flows into `providers.Spec.VisionModel`, read through
@@ -261,16 +266,80 @@ the semantic cache's request-skip logic. Spans
   used for `model_map`, pricing, and tier. An empty return means "no
   override": NEXUS has no built-in notion of which model IDs support
   vision for any provider.
-- **Handler wiring** (`handler.go`): `hasImageContent` — a shallow,
-  top-level-only scan over the raw parsed messages (it does not recurse
-  into `tool_result`, unlike the transformer's full conversion) — sets a
-  new unexported, per-request `AnthropicRequest.nexusImages` field (same
+- **One shared, recursive image detector** (`images.go`):
+  `contentHasImage` / `messagesHaveImage` replaced the earlier per-site
+  scans (`hasImageContent` in `handler.go`, which only looked at top-level
+  blocks and so missed images nested in a `tool_result`, and
+  `hasImageBlock` in `semantic.go`, which only matched the Anthropic
+  `"image"` type). It matches Anthropic `"image"` and OpenAI `"image_url"`
+  / `"input_image"` blocks, and recurses into a block's own `content`
+  array (an Anthropic `tool_result`) up to `maxImageScanDepth` (8) levels.
+  Recursion matters because that is how Claude Code delivers an image it
+  read from disk. Plain-string content is never an image. Every consumer
+  (the `nexusImages` flag on both inbound paths, and the semantic-cache
+  skip) goes through it, so the sites cannot drift apart again.
+- **Handler wiring** (`handler.go`, `gateway.go`): `messagesHaveImage` sets
+  the unexported, per-request `AnthropicRequest.nexusImages` field (same
   pattern as `nexusUser`/`nexusRedacted`: derived per request, never
-  serialized). In `callUpstreamOnce`, when `nexusImages` is true and the
-  active provider implements `VisionCapable` with a non-empty
-  `VisionModel(req.Model)`, that value replaces `MapModel(req.Model)` as
-  the `targetModel` passed to `TransformToOpenAI` — otherwise behavior is
-  completely unchanged from before this feature.
+  serialized) in `HandleMessages` and in `HandleChatCompletions`. The model
+  id actually sent upstream comes from one function, `upstreamModel(active,
+  requestedModel, images)`, used by `callUpstreamOnce` (`/v1/messages`),
+  by `callOpenAIPassthrough` (`/v1/chat/completions` raw passthrough), and
+  by every log/usage record (`model_used`), so the recorded model always
+  names the model that was really sent. Order: `StrategyDirect` returns the
+  requested id verbatim; else, if `images` is true, the provider is
+  OpenAI-compatible (`providers.IsOpenAICompatible`) and implements
+  `VisionCapable` with a non-empty `VisionModel(requestedModel)`, that
+  value is used; else `mappedModel`. The vision override is applied only
+  for OpenAI-compatible providers: the Anthropic-native paths (anthropic,
+  bedrock, vertex) forward the model id unchanged and never consult
+  `vision_model`. `mappedModel` still exists and stays image-unaware (it is
+  `upstreamModel`'s fallback); do not call it directly for a model id that
+  is sent upstream or logged.
+- **Gateway inbound `image_url` support** (`transformer.go`,
+  `OpenAIContent.UnmarshalJSON`): `/v1/chat/completions` content arrays
+  accept `"text"` and `"image_url"` parts (previously every non-text part
+  was a 400). The `image_url` part is validated strictly at parse time,
+  against the shapes the OpenAI spec defines: an `http://` or `https://`
+  URL with a non-empty remainder, or `data:<mime>;base64,<payload>` with a
+  non-empty mime type and payload (`validImageURL`/`splitDataURI`).
+  Anything else, and any other part type (`input_audio`, `file`, ...), is
+  rejected with a 400 naming the problem rather than silently dropped.
+  Validating up front is what guarantees the later Anthropic conversion
+  cannot lose an image. For OpenAI-compatible providers the gateway forwards
+  the original body (model swapped) as raw passthrough, so image parts
+  reach the provider as received.
+- **Anthropic-format providers on the gateway** (`transformer.go`,
+  `OpenAIContent.Anthropic()`): when the chain lands on anthropic, bedrock
+  or vertex, `image_url` parts are converted to Anthropic image blocks in
+  order (`anthropicImageBlock`): a base64 data URI becomes a `base64`
+  source (media type and payload split out), an http(s) URL becomes a `url`
+  source. Previously every part became a text block, so an image turned
+  into an empty text block that those providers reject.
+- **URLs are forwarded as received; NEXUS never fetches images.** An
+  http(s) image URL is passed through to the provider (or converted to a
+  `url` source) untouched. Whether a given provider can fetch URL images,
+  and which image formats it accepts, is provider-dependent and not
+  something NEXUS knows or checks; a provider that cannot handle it returns
+  its own error, which is relayed unchanged. Fetching in a forwarder would
+  add SSRF, size and timeout surface, so it was rejected, the same
+  philosophy as "no chain filtering" below.
+- **Privacy firewall leaves image bytes alone** (`firewall.go`):
+  `redact` walks every JSON string and previously regex-scanned base64
+  image payloads too. Random base64 can contain a secret-shaped substring
+  (e.g. `AIza` followed by 20 URL-safe characters matches the Gemini key
+  detector), which silently rewrote the image bytes into a placeholder and
+  corrupted the image. It now skips (a) any string for which
+  `isBase64DataURI` is true (OpenAI `image_url` data URIs; a cheap prefix
+  test requiring `;base64,` within the first 128 bytes) and (b) the `data`
+  member of an Anthropic `{"type":"base64", ...}` source. Text and URLs
+  are still scanned.
+- **Inspector omits image payloads** (`images.go` `elideImageData`,
+  called from `handler.go`'s inspect capture): with `--inspect`, the
+  marshaled request is stored capped at 64KB. Long (128+ char) base64
+  `"data":"..."` values are replaced with `"data":"[image data omitted: N
+  bytes]"` before the cap, so the budget is spent on text instead of a
+  truncated base64 blob.
 - **No chain filtering, by design:** `nexusImages` never reaches
   `RouteChain`, the sticky-provider logic, or the cooldown machinery — an
   image-bearing request walks the exact same provider chain a text-only
@@ -278,10 +347,11 @@ the semantic cache's request-skip logic. Spans
   image, its own error response is relayed to Claude Code as-is, identical
   to how any other provider 4xx is already relayed today — an honest
   failure, not a NEXUS-side guess.
-- **Semantic-cache exclusion** (`semantic.go`): `promptText` now also
-  returns `hasImages`, computed by a sibling scan `hasImageBlock` that
-  walks the same `system`/message-`content` shape `collectText` already
-  walks. Both call sites — `HandleMessages` (`handler.go`) and
+- **Semantic-cache exclusion** (`semantic.go`): `promptText` also
+  returns `hasImages`, computed with the shared `contentHasImage` over the
+  same `system`/message-`content` shape `collectText` already walks, so
+  both the Anthropic (`image`) and OpenAI (`image_url`) shapes are caught.
+  Both call sites — `HandleMessages` (`handler.go`) and
   `HandleChatCompletions` (`gateway.go`, the OpenAI-compatible
   `/v1/chat/completions` gateway) — skip the semantic embed/lookup when
   `hasImages` is true, mirroring the existing `hasTools` skip: the
@@ -321,18 +391,18 @@ model-id forwarding. Spans `internal/router/router.go`,
   OpenAI-compatible providers: `Handler.directModel` (`handler.go` line
   192) is set once in `NewHandler` (line 320:
   `h.directModel = router.RoutingStrategy(appCfg.Routing.Strategy) ==
-  router.StrategyDirect`). The helper `mappedModel` (`handler.go` lines
-  918-923) returns `requestedModel` verbatim when `directModel` is set,
-  else falls back to `active.impl.MapModel(requestedModel)`; it's used for
-  the OpenAI passthrough gateway (`callOpenAIPassthrough`, `gateway.go`
-  line 183) and for the log/dashboard `model_used` value (`openai.go` line
-  62, `handler.go` line 1123, `logResult`). The request-shaping branch
-  itself lives in `callUpstreamOnce` (`handler.go` lines 926-938): inside
-  the `providers.IsOpenAICompatible` block, `targetModel` starts as
-  `req.Model` and, when `h.directModel` is true, skips the entire
-  `mappedModel`/`nexusImages`/`VisionCapable` block below it — one branch
-  bypasses `MapModel` and the `vision_model` override together, not two
-  separate opt-outs.
+  router.StrategyDirect`). The helper `mappedModel` (`handler.go`)
+  returns `requestedModel` verbatim when `directModel` is set, else falls
+  back to `active.impl.MapModel(requestedModel)`. It is the fallback step
+  of `upstreamModel(active, requestedModel, images)`, which is the single
+  function that decides the model id sent to OpenAI-compatible providers
+  and recorded as `model_used` (used by `callUpstreamOnce`,
+  `callOpenAIPassthrough` in `gateway.go`, and the log/usage records in
+  `openai.go` / `handler.go`; see "Vision / Image Content Support"). Its
+  first check is `h.directModel`: when true it returns the requested id
+  immediately, before any `vision_model` lookup — one branch bypasses
+  `MapModel` and the `vision_model` override together, not two separate
+  opt-outs.
 - **Why it exists**: `Generic.MapModel` (`internal/providers/generic.go`
   lines 186-193) silently substitutes `g.models[0]` (the provider's first
   configured model) for any Claude model id it can't find in `model_map`.
@@ -344,9 +414,11 @@ model-id forwarding. Spans `internal/router/router.go`,
 - **Unconditional passthrough, no exceptions — including images.**
   Confirmed with the user rather than assumed: under `direct`, an
   image-bearing request does **not** get the `vision_model` override
-  either, unlike `auto` (where `nexusImages` + `VisionCapable.VisionModel`
-  can replace the mapped model — see "Vision / Image Content Support"
-  above). Under `direct` the requested model id always wins, image or not.
+  either, unlike `auto` (where `upstreamModel` lets `VisionCapable.
+  VisionModel` replace the mapped model for an image-bearing request —
+  see "Vision / Image Content Support" above). Under `direct` the
+  requested model id always wins, image or not; the image itself is still
+  forwarded.
 - **Scope boundary.** This only touches OpenAI-compatible providers
   (`providers.IsOpenAICompatible`, `internal/providers/provider.go` —
   everything except `anthropic`, `bedrock`, `vertex`). The Anthropic-native
@@ -660,6 +732,20 @@ claude
   role as a sticky forwarder, not a content-aware router. There is no
   vision-based filtering of the routing/cooldown chain. See "Vision / Image
   Content Support" section above.
+- **Images on the OpenAI gateway: strict inbound validation, one shared
+  recursive detector, forward URLs as received** — `/v1/chat/completions`
+  accepts `image_url` parts (http(s) URL or base64 data URI, validated at
+  parse time; other part types still rejected) and converts them to
+  Anthropic image blocks for anthropic/bedrock/vertex. A single recursive
+  `contentHasImage` replaced the shallow per-site scans (the earlier
+  "shallow by design" decision is reversed: it defeated the `vision_model`
+  override for Claude Code's `tool_result` images). `upstreamModel` is the
+  one place that picks the upstream/logged model id (vision override only
+  for OpenAI-compatible providers; `direct` still wins unconditionally).
+  The firewall never rewrites base64 image payloads, the inspector elides
+  them, and NEXUS never fetches image URLs (provider-dependent support, the
+  provider's own error is relayed). Still no vision-model catalog. See
+  "Vision / Image Content Support" section above.
 - **`direct` routing strategy: unconditional model-id passthrough, no
   vision-override exception** — `Generic.MapModel` silently substitutes the
   provider's first configured model for any unrecognized Claude model id,
