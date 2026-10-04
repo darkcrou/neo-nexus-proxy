@@ -859,7 +859,7 @@ func (h *Handler) HandleMessages(w http.ResponseWriter, r *http.Request) {
 		}
 		switch {
 		case providers.IsOpenAICompatible(active.impl.Name()) && req.Stream:
-			h.relayOpenAIStream(w, active, req, resp, startTime, complexity, att)
+			h.relayOpenAIStream(w, r, active, req, resp, startTime, complexity, att)
 		case providers.IsOpenAICompatible(active.impl.Name()):
 			h.relayOpenAI(w, active, req, resp, startTime, complexity, att)
 		default:
@@ -1165,6 +1165,27 @@ func resolveAnthropicKeyFor(configured string, origHeaders http.Header) string {
 	return key
 }
 
+// Abort annotations for streams that ended before completing. The same text
+// lands on the usage event (error) and the requests row (Error column) so
+// the two records tell one story.
+const (
+	abortClientGone  = "aborted: client disconnected"
+	abortUpstreamErr = "aborted: upstream stream error"
+)
+
+// logAbortedStream records a stream that ended before completing — client
+// disconnect or upstream read error — preserving partial-usage semantics: the
+// tokens observed up to the abort are kept (the provider generated and billed
+// them), usage_partial=1 marks the incompleteness, and the abort text marks
+// both the usage event and the requests row.
+func (h *Handler) logAbortedStream(active *activeProvider, req AnthropicRequest, complexity router.Complexity, u tokenUsage, respBody []byte, status int, startTime time.Time, att *attemptInfo, raw rawUsage, abortText string) {
+	if att != nil {
+		att.partial = true
+		att.errText = abortText
+	}
+	h.logResult(active, req, complexity, u, respBody, status, time.Since(startTime), true, att, raw)
+}
+
 // logResult records a completed request to storage and pushes live events.
 // respBody is the upstream response (used only for --inspect capture; may be nil).
 // att is the winning upstream attempt's metadata (chain position, key slot,
@@ -1193,6 +1214,11 @@ func (h *Handler) logResult(active *activeProvider, req AnthropicRequest, comple
 		Stream:           stream,
 		User:             req.nexusUser,
 		Redacted:         req.nexusRedacted,
+	}
+	if att != nil && att.partial {
+		// aborted stream: mark the requests row too (its Error column was
+		// never populated before; aborted streams are its first user)
+		rec.Error = att.errText
 	}
 	if h.inspect { // opt-in: capture full prompt + response for the inspector
 		if pj, err := json.Marshal(req); err == nil {

@@ -18,7 +18,9 @@ package proxy
 //   - events with no DB configured are silently skipped
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -714,5 +716,363 @@ func TestUsageEvent_ConcurrentRequests(t *testing.T) {
 			t.Errorf("duplicate event id %d", e.ID)
 		}
 		ids[e.ID] = true
+	}
+}
+
+// ─── U5: aborted-stream handling ───────────────────────────────────────────
+//
+// A stream that ends without completing — client disconnect or upstream read
+// error — must record a partial event (usage_partial=1, observed tokens kept:
+// the provider generated and billed them) and mark the requests row's Error
+// column with the same abort text. Completed streams must stay unmarked.
+
+// failAfterWriter accepts ok writes and then fails, simulating a client that
+// disconnected mid-stream. Relays require a Flusher.
+type failAfterWriter struct {
+	header http.Header
+	ok     int
+	writes int
+}
+
+func (f *failAfterWriter) Header() http.Header { return f.header }
+func (f *failAfterWriter) Write(p []byte) (int, error) {
+	f.writes++
+	if f.writes > f.ok {
+		return 0, errors.New("broken pipe")
+	}
+	return len(p), nil
+}
+func (f *failAfterWriter) WriteHeader(int) {}
+func (f *failAfterWriter) Flush()          {}
+
+// errAfterBody yields data and then a read error (never EOF) — an upstream
+// connection that dies mid-stream.
+type errAfterBody struct{ data []byte }
+
+func (b *errAfterBody) Read(p []byte) (int, error) {
+	if len(b.data) > 0 {
+		n := copy(p, b.data)
+		b.data = b.data[n:]
+		return n, nil
+	}
+	return 0, errors.New("connection reset by peer")
+}
+func (b *errAfterBody) Close() error { return nil }
+
+// yieldingBody produces one SSE chunk per Read until closed — an upstream that
+// would keep generating tokens if nobody stopped it. Used to prove the relays
+// stop consuming upstream once the client context is cancelled.
+type yieldingBody struct {
+	chunk []byte
+	reads int
+	stop  chan struct{}
+}
+
+func (b *yieldingBody) Read(p []byte) (int, error) {
+	select {
+	case <-b.stop:
+		return 0, io.EOF
+	default:
+		b.reads++
+		return copy(p, b.chunk), nil
+	}
+}
+func (b *yieldingBody) Close() error { return nil }
+
+// lastRequestRow fetches the most recent requests row.
+func lastRequestRow(t *testing.T, db *storage.DB) *storage.Request {
+	t.Helper()
+	rows, err := db.GetRecentRequests(3)
+	if err != nil {
+		t.Fatalf("GetRecentRequests: %v", err)
+	}
+	for _, r := range rows {
+		if r.Provider != "cache" {
+			return r
+		}
+	}
+	t.Fatalf("no non-cache requests row found")
+	return nil
+}
+
+const anthropicSSEPartial = "event: message_start\n" +
+	`data: {"type":"message_start","message":{"usage":{"input_tokens":50}}}` + "\n\n" +
+	"event: content_block_delta\n" +
+	`data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"hel"}}` + "\n\n"
+
+func TestAbort_AnthropicStreamClientDisconnect(t *testing.T) {
+	h, db := buildUsageHandler(t, nil)
+	active := &activeProvider{impl: providers.NewAnthropic(""), apiKey: "sk"}
+	req := AnthropicRequest{Model: "claude-sonnet-4-6", Stream: true}
+
+	// first body write fails, but the chunk was already read and captured →
+	// the relay must record the partial stream, not complete normally
+	resp := &http.Response{
+		StatusCode: 200,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body: io.NopCloser(strings.NewReader(
+			anthropicSSEPartial +
+				"event: content_block_delta\n" +
+				`data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"lo more text"}}` + "\n\n")),
+	}
+	att := newAnthropicAttempt(resp)
+	w := &failAfterWriter{header: make(http.Header), ok: 0}
+	httpReq := httptest.NewRequest("POST", "/v1/messages", nil)
+
+	h.relayAnthropicStream(w, httpReq, active, req, resp, time.Now(), router.ComplexityStandard, att)
+
+	evs := requireEvents(t, db, 1)
+	e := evs[0]
+	if !e.UsagePartial || e.Error != "aborted: client disconnected" {
+		t.Errorf("event partial=%v error=%q, want partial with client-disconnect mark", e.UsagePartial, e.Error)
+	}
+	wantIntPtr(t, e.In, 50, "in")  // observed before the abort
+	wantNilIntPtr(t, e.Out, "out") // stream never reached message_delta
+
+	row := lastRequestRow(t, db)
+	if row.Error != "aborted: client disconnected" {
+		t.Errorf("requests row error = %q, want abort mark", row.Error)
+	}
+}
+
+func TestAbort_AnthropicStreamUpstreamError(t *testing.T) {
+	h, db := buildUsageHandler(t, nil)
+	active := &activeProvider{impl: providers.NewAnthropic(""), apiKey: "sk"}
+	req := AnthropicRequest{Model: "claude-sonnet-4-6", Stream: true}
+
+	resp := &http.Response{
+		StatusCode: 200,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       &errAfterBody{data: []byte(anthropicSSEPartial)},
+	}
+	att := newAnthropicAttempt(resp)
+	rec := httptest.NewRecorder()
+	httpReq := httptest.NewRequest("POST", "/v1/messages", nil)
+
+	h.relayAnthropicStream(rec, httpReq, active, req, resp, time.Now(), router.ComplexityStandard, att)
+
+	evs := requireEvents(t, db, 1)
+	e := evs[0]
+	if !e.UsagePartial || e.Error != "aborted: upstream stream error" {
+		t.Errorf("event partial=%v error=%q, want upstream-error mark", e.UsagePartial, e.Error)
+	}
+	wantIntPtr(t, e.In, 50, "in")
+
+	if row := lastRequestRow(t, db); row.Error != "aborted: upstream stream error" {
+		t.Errorf("requests row error = %q", row.Error)
+	}
+}
+
+func TestAbort_AnthropicStreamContextCancelled(t *testing.T) {
+	h, db := buildUsageHandler(t, nil)
+	active := &activeProvider{impl: providers.NewAnthropic(""), apiKey: "sk"}
+	req := AnthropicRequest{Model: "claude-sonnet-4-6", Stream: true}
+
+	body := &yieldingBody{
+		chunk: []byte(`data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"x"}}` + "\n\n"),
+		stop:  make(chan struct{}),
+	}
+	defer func() { go func() { time.Sleep(100 * time.Millisecond); close(body.stop) }() }()
+
+	resp := &http.Response{
+		StatusCode: 200,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       body,
+	}
+	att := newAnthropicAttempt(resp)
+	rec := httptest.NewRecorder()
+
+	// pre-cancelled context: the relay must stop consuming upstream after the
+	// first chunk instead of relaying an ever-growing stream
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	httpReq := httptest.NewRequest("POST", "/v1/messages", nil).WithContext(ctx)
+
+	h.relayAnthropicStream(rec, httpReq, active, req, resp, time.Now(), router.ComplexityStandard, att)
+
+	evs := requireEvents(t, db, 1)
+	e := evs[0]
+	if !e.UsagePartial || e.Error != "aborted: client disconnected" {
+		t.Errorf("event partial=%v error=%q", e.UsagePartial, e.Error)
+	}
+	if body.reads > 3 {
+		t.Errorf("upstream consumed %d chunks after client cancellation, want ≤ 3", body.reads)
+	}
+}
+
+func TestAbort_OpenAIStreamClientDisconnect(t *testing.T) {
+	h, db := buildUsageHandler(t, nil)
+	active := &activeProvider{impl: providers.NewGroq("k")}
+	req := AnthropicRequest{Model: "claude-haiku-4-5", Stream: true}
+
+	sse := strings.Join([]string{
+		`data: {"choices":[{"delta":{"content":"Hello "},"finish_reason":null}]}`,
+		`data: {"choices":[{"delta":{"content":"world"},"finish_reason":null}]}`,
+	}, "\n") + "\n"
+	resp := &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(sse)), Header: http.Header{}}
+	att := newAnthropicAttempt(resp)
+	w := &failAfterWriter{header: make(http.Header), ok: 2} // message_start + first delta OK, then fail
+	httpReq := httptest.NewRequest("POST", "/v1/messages", nil)
+
+	h.relayOpenAIStream(w, httpReq, active, req, resp, time.Now(), router.ComplexitySimple, att)
+
+	evs := requireEvents(t, db, 1)
+	e := evs[0]
+	if !e.UsagePartial || e.Error != "aborted: client disconnected" {
+		t.Errorf("event partial=%v error=%q", e.UsagePartial, e.Error)
+	}
+	// usage chunk never arrived → counts unknown, not zero
+	wantNilIntPtr(t, e.In, "in")
+	if row := lastRequestRow(t, db); row.Error != "aborted: client disconnected" {
+		t.Errorf("requests row error = %q", row.Error)
+	}
+}
+
+func TestAbort_OpenAIStreamUpstreamError(t *testing.T) {
+	h, db := buildUsageHandler(t, nil)
+	active := &activeProvider{impl: providers.NewGroq("k")}
+	req := AnthropicRequest{Model: "claude-haiku-4-5", Stream: true}
+
+	sse := strings.Join([]string{
+		`data: {"choices":[{"delta":{"content":"Hi"},"finish_reason":null}]}`,
+		`data: {"choices":[],"usage":{"prompt_tokens":40,"completion_tokens":6}}`,
+		"",
+	}, "\n")
+	resp := &http.Response{
+		StatusCode: 200, Header: http.Header{},
+		Body: &errAfterBody{data: []byte(sse)},
+	}
+	att := newAnthropicAttempt(resp)
+	rec := httptest.NewRecorder()
+	httpReq := httptest.NewRequest("POST", "/v1/messages", nil)
+
+	h.relayOpenAIStream(rec, httpReq, active, req, resp, time.Now(), router.ComplexitySimple, att)
+
+	evs := requireEvents(t, db, 1)
+	e := evs[0]
+	if !e.UsagePartial || e.Error != "aborted: upstream stream error" {
+		t.Errorf("event partial=%v error=%q", e.UsagePartial, e.Error)
+	}
+	// usage chunk arrived before the connection died → keep the real counts
+	wantIntPtr(t, e.In, 40, "in")
+	wantIntPtr(t, e.Out, 6, "out")
+	if row := lastRequestRow(t, db); row.Error != "aborted: upstream stream error" {
+		t.Errorf("requests row error = %q", row.Error)
+	}
+}
+
+func TestAbort_OpenAIStreamContextCancelled(t *testing.T) {
+	h, db := buildUsageHandler(t, nil)
+	active := &activeProvider{impl: providers.NewGroq("k")}
+	req := AnthropicRequest{Model: "claude-haiku-4-5", Stream: true}
+
+	body := &yieldingBody{
+		chunk: []byte(`data: {"choices":[{"delta":{"content":"x"},"finish_reason":null}]}` + "\n\n"),
+		stop:  make(chan struct{}),
+	}
+	defer func() { go func() { time.Sleep(100 * time.Millisecond); close(body.stop) }() }()
+
+	resp := &http.Response{StatusCode: 200, Body: body, Header: http.Header{}}
+	att := newAnthropicAttempt(resp)
+	rec := httptest.NewRecorder()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	httpReq := httptest.NewRequest("POST", "/v1/messages", nil).WithContext(ctx)
+
+	h.relayOpenAIStream(rec, httpReq, active, req, resp, time.Now(), router.ComplexitySimple, att)
+
+	evs := requireEvents(t, db, 1)
+	if !evs[0].UsagePartial || evs[0].Error != "aborted: client disconnected" {
+		t.Errorf("event partial=%v error=%q", evs[0].UsagePartial, evs[0].Error)
+	}
+	if body.reads > 3 {
+		t.Errorf("upstream consumed %d chunks after client cancellation, want ≤ 3", body.reads)
+	}
+}
+
+func TestAbort_PassthroughStreamClientDisconnect(t *testing.T) {
+	h, db := buildUsageHandler(t, nil)
+	active := &activeProvider{impl: providers.NewGroq("k")}
+	areq := AnthropicRequest{Model: "gpt-4"}
+
+	sse := strings.Join([]string{
+		`data: {"choices":[{"delta":{"content":"Hello "},"finish_reason":null}]}`,
+		`data: {"choices":[],"usage":{"prompt_tokens":40,"completion_tokens":6}}`,
+		"",
+	}, "\n")
+	resp := &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(sse)), Header: http.Header{}}
+	att := newAnthropicAttempt(resp)
+	w := &failAfterWriter{header: make(http.Header), ok: 0} // first write fails
+	httpReq := httptest.NewRequest("POST", "/v1/chat/completions", nil)
+
+	h.relayOpenAIPassthroughStream(w, httpReq, active, areq, resp, time.Now(), router.ComplexitySimple, att)
+
+	evs := requireEvents(t, db, 1)
+	e := evs[0]
+	if !e.UsagePartial || e.Error != "aborted: client disconnected" {
+		t.Errorf("event partial=%v error=%q", e.UsagePartial, e.Error)
+	}
+	if row := lastRequestRow(t, db); row.Error != "aborted: client disconnected" {
+		t.Errorf("requests row error = %q", row.Error)
+	}
+}
+
+func TestAbort_PassthroughStreamUpstreamError(t *testing.T) {
+	h, db := buildUsageHandler(t, nil)
+	active := &activeProvider{impl: providers.NewGroq("k")}
+	areq := AnthropicRequest{Model: "gpt-4"}
+
+	sse := strings.Join([]string{
+		`data: {"choices":[{"delta":{"content":"Hi"},"finish_reason":null}]}`,
+		`data: {"choices":[],"usage":{"prompt_tokens":40,"completion_tokens":6}}`,
+		"",
+	}, "\n")
+	resp := &http.Response{StatusCode: 200, Body: &errAfterBody{data: []byte(sse)}, Header: http.Header{}}
+	att := newAnthropicAttempt(resp)
+	rec := httptest.NewRecorder()
+	httpReq := httptest.NewRequest("POST", "/v1/chat/completions", nil)
+
+	h.relayOpenAIPassthroughStream(rec, httpReq, active, areq, resp, time.Now(), router.ComplexitySimple, att)
+
+	evs := requireEvents(t, db, 1)
+	e := evs[0]
+	if !e.UsagePartial || e.Error != "aborted: upstream stream error" {
+		t.Errorf("event partial=%v error=%q", e.UsagePartial, e.Error)
+	}
+	// usage line was captured before the break — the regex scrape finds it
+	wantIntPtr(t, e.In, 40, "in")
+}
+
+func TestAbort_CompletedStreamsNotMarked(t *testing.T) {
+	h, db := buildUsageHandler(t, nil)
+	active := &activeProvider{impl: providers.NewAnthropic(""), apiKey: "sk"}
+	req := AnthropicRequest{Model: "claude-sonnet-4-6", Stream: true}
+
+	sse := strings.Join([]string{
+		`event: message_start`,
+		`data: {"type":"message_start","message":{"usage":{"input_tokens":12}}}`,
+		``,
+		`event: message_delta`,
+		`data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":4}}`,
+		``,
+		`event: message_stop`,
+		`data: {"type":"message_stop"}`,
+		``,
+	}, "\n")
+	resp := &http.Response{
+		StatusCode: 200, Header: http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body: io.NopCloser(strings.NewReader(sse)),
+	}
+	att := newAnthropicAttempt(resp)
+
+	rec := httptest.NewRecorder()
+	h.relayAnthropicStream(rec, httptest.NewRequest("POST", "/v1/messages", nil), active, req, resp, time.Now(), router.ComplexityStandard, att)
+
+	evs := requireEvents(t, db, 1)
+	if evs[0].UsagePartial || evs[0].Error != "" {
+		t.Errorf("completed stream must not be marked partial: partial=%v error=%q", evs[0].UsagePartial, evs[0].Error)
+	}
+	if row := lastRequestRow(t, db); row.Error != "" {
+		t.Errorf("completed stream requests row error = %q, want empty", row.Error)
 	}
 }

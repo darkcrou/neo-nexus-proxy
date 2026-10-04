@@ -43,30 +43,39 @@ func (h *Handler) relayAnthropicStream(w http.ResponseWriter, r *http.Request, a
 
 	var captured bytes.Buffer
 	buf := make([]byte, 4096)
+	// abort records the partial stream and marks both records; the captured
+	// bytes hold whatever usage blocks arrived before the break
+	abort := func(abortText string) {
+		raw := streamRawUsage(captured.Bytes())
+		h.logAbortedStream(active, req, complexity, raw.anthropicTokens(), captured.Bytes(), resp.StatusCode, startTime, att, raw, abortText)
+	}
 	for {
 		n, readErr := resp.Body.Read(buf)
 		if n > 0 {
-			if _, writeErr := w.Write(buf[:n]); writeErr != nil {
-				log.Warn().Err(writeErr).Msg("Client disconnected during stream")
-				return
-			}
-			flusher.Flush()
 			if captured.Len() < 1<<20 { // cap capture at 1MB
 				captured.Write(buf[:n])
 			}
+			if _, writeErr := w.Write(buf[:n]); writeErr != nil {
+				log.Warn().Err(writeErr).Msg("Client disconnected during stream")
+				abort(abortClientGone)
+				return
+			}
+			flusher.Flush()
 		}
 		if readErr == io.EOF {
 			break
 		}
 		if readErr != nil {
 			log.Error().Err(readErr).Msg("Stream read error")
-			break
+			abort(abortUpstreamErr)
+			return
 		}
 
 		// Stop early if the client went away.
 		select {
 		case <-r.Context().Done():
 			log.Debug().Msg("Client context cancelled, ending stream")
+			abort(abortClientGone)
 			return
 		default:
 		}

@@ -29,7 +29,7 @@ func TestRelayOpenAIStream(t *testing.T) {
 	rec := httptest.NewRecorder()
 
 	// nil att — this test exercises the relay's SSE synthesis, not events
-	h.relayOpenAIStream(rec, active, AnthropicRequest{Model: "claude-haiku-4-5", Stream: true}, resp, time.Now(), router.ComplexitySimple, nil)
+	h.relayOpenAIStream(rec, httptest.NewRequest("POST", "/v1/messages", nil), active, AnthropicRequest{Model: "claude-haiku-4-5", Stream: true}, resp, time.Now(), router.ComplexitySimple, nil)
 
 	out := rec.Body.String()
 	for _, want := range []string{"event: message_start", "content_block_start", "text_delta", "Hello ", "world", "event: message_stop"} {

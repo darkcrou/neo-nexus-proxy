@@ -134,7 +134,7 @@ func (h *Handler) HandleChatCompletions(w http.ResponseWriter, r *http.Request) 
 				continue
 			}
 			if oreq.Stream {
-				h.relayOpenAIPassthroughStream(w, active, areq, resp, startTime, complexity, att)
+				h.relayOpenAIPassthroughStream(w, r, active, areq, resp, startTime, complexity, att)
 			} else {
 				h.relayOpenAIPassthrough(w, active, areq, resp, startTime, complexity, att)
 			}
@@ -235,7 +235,7 @@ func (h *Handler) relayOpenAIPassthrough(w http.ResponseWriter, active *activePr
 		Int("in", u.In).Int("out", u.Out).Int("cache_read", u.CacheRead).Str("complexity", complexity.String()).Msg("Request completed (gateway)")
 }
 
-func (h *Handler) relayOpenAIPassthroughStream(w http.ResponseWriter, active *activeProvider, areq AnthropicRequest, resp *http.Response, startTime time.Time, complexity router.Complexity, att *attemptInfo) {
+func (h *Handler) relayOpenAIPassthroughStream(w http.ResponseWriter, r *http.Request, active *activeProvider, areq AnthropicRequest, resp *http.Response, startTime time.Time, complexity router.Complexity, att *attemptInfo) {
 	defer resp.Body.Close()
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -252,19 +252,38 @@ func (h *Handler) relayOpenAIPassthroughStream(w http.ResponseWriter, active *ac
 
 	var captured bytes.Buffer
 	buf := make([]byte, 4096)
+	// abort records the partial stream; the captured bytes are scraped for
+	// whatever usage lines arrived before the break
+	abort := func(abortText string) {
+		raw := openAIRawUsage(captured.Bytes())
+		h.logAbortedStream(active, areq, complexity, raw.openAITokens(), captured.Bytes(), resp.StatusCode, startTime, att, raw, abortText)
+	}
 	for {
 		n, readErr := resp.Body.Read(buf)
 		if n > 0 {
-			if _, werr := w.Write(buf[:n]); werr != nil {
-				return
-			}
-			flusher.Flush()
 			if captured.Len() < 1<<20 {
 				captured.Write(buf[:n])
 			}
+			if _, werr := w.Write(buf[:n]); werr != nil {
+				abort(abortClientGone)
+				return
+			}
+			flusher.Flush()
+		}
+		if readErr == io.EOF {
+			break
 		}
 		if readErr != nil {
-			break
+			log.Error().Err(readErr).Msg("Upstream stream read error (gateway)")
+			abort(abortUpstreamErr)
+			return
+		}
+		// Stop consuming upstream once the client is gone.
+		select {
+		case <-r.Context().Done():
+			abort(abortClientGone)
+			return
+		default:
 		}
 	}
 	raw := openAIRawUsage(captured.Bytes())

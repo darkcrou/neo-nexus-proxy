@@ -178,8 +178,11 @@ type oaiStreamChunk struct {
 }
 
 // relayOpenAIStream converts a live OpenAI streaming response into the Anthropic
-// SSE event sequence, forwarding tokens to Claude Code as they arrive.
-func (h *Handler) relayOpenAIStream(w http.ResponseWriter, active *activeProvider, req AnthropicRequest, resp *http.Response, startTime time.Time, complexity router.Complexity, att *attemptInfo) {
+// SSE event sequence, forwarding tokens to Claude Code as they arrive. It stops
+// consuming upstream as soon as the client goes away (write error or cancelled
+// request context) or the upstream connection breaks, recording partial usage
+// in either case.
+func (h *Handler) relayOpenAIStream(w http.ResponseWriter, r *http.Request, active *activeProvider, req AnthropicRequest, resp *http.Response, startTime time.Time, complexity router.Complexity, att *attemptInfo) {
 	defer resp.Body.Close()
 
 	flusher, ok := w.(http.Flusher)
@@ -206,22 +209,6 @@ func (h *Handler) relayOpenAIStream(w http.ResponseWriter, active *activeProvide
 	w.Header().Set("X-Nexus-Provider", active.impl.Name())
 	w.WriteHeader(http.StatusOK)
 
-	send := func(event string, payload map[string]interface{}) {
-		b, _ := json.Marshal(payload)
-		fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, b)
-		flusher.Flush()
-	}
-
-	send("message_start", map[string]interface{}{
-		"type": "message_start",
-		"message": map[string]interface{}{
-			"id": "msg_" + active.impl.Name(), "type": "message", "role": "assistant",
-			"model": req.Model, "content": []interface{}{},
-			"stop_reason": nil, "stop_sequence": nil,
-			"usage": map[string]interface{}{"input_tokens": 0, "output_tokens": 0},
-		},
-	})
-
 	type toolAcc struct{ id, name, args string }
 	tools := map[int]*toolAcc{}
 	var toolOrder []int
@@ -232,6 +219,45 @@ func (h *Handler) relayOpenAIStream(w http.ResponseWriter, active *activeProvide
 	// presence flags: a usage chunk seen means in/out were reported; cache and
 	// reasoning are only claimed when the provider actually reported them
 	sawUsage, sawReasoning := false, false
+
+	send := func(event string, payload map[string]interface{}) error {
+		b, _ := json.Marshal(payload)
+		if _, err := fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, b); err != nil {
+			return err
+		}
+		flusher.Flush()
+		return nil
+	}
+
+	// abort records the partial stream on both records with whatever tokens
+	// the upstream reported so far, so a disconnect stops consuming upstream
+	// quota without losing the consumption that already happened
+	abort := func(abortText string) {
+		var raw rawUsage
+		if sawUsage {
+			raw.In, raw.Out = &inTok, &outTok
+			if cachedTok > 0 {
+				raw.CacheRead = &cachedTok
+			}
+			if sawReasoning {
+				raw.Reasoning = &reasonTok
+			}
+		}
+		h.logAbortedStream(active, req, complexity, tokenUsage{In: inTok - cachedTok, Out: outTok, CacheRead: cachedTok}, nil, resp.StatusCode, startTime, att, raw, abortText)
+	}
+
+	if err := send("message_start", map[string]interface{}{
+		"type": "message_start",
+		"message": map[string]interface{}{
+			"id": "msg_" + active.impl.Name(), "type": "message", "role": "assistant",
+			"model": req.Model, "content": []interface{}{},
+			"stop_reason": nil, "stop_sequence": nil,
+			"usage": map[string]interface{}{"input_tokens": 0, "output_tokens": 0},
+		},
+	}); err != nil {
+		abort(abortClientGone)
+		return
+	}
 
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
@@ -267,10 +293,16 @@ func (h *Handler) relayOpenAIStream(w http.ResponseWriter, active *activeProvide
 		ch := chunk.Choices[0]
 		if ch.Delta.Content != "" {
 			if !textOpen {
-				send("content_block_start", map[string]interface{}{"type": "content_block_start", "index": 0, "content_block": map[string]interface{}{"type": "text", "text": ""}})
+				if err := send("content_block_start", map[string]interface{}{"type": "content_block_start", "index": 0, "content_block": map[string]interface{}{"type": "text", "text": ""}}); err != nil {
+					abort(abortClientGone)
+					return
+				}
 				textOpen = true
 			}
-			send("content_block_delta", map[string]interface{}{"type": "content_block_delta", "index": 0, "delta": map[string]interface{}{"type": "text_delta", "text": ch.Delta.Content}})
+			if err := send("content_block_delta", map[string]interface{}{"type": "content_block_delta", "index": 0, "delta": map[string]interface{}{"type": "text_delta", "text": ch.Delta.Content}}); err != nil {
+				abort(abortClientGone)
+				return
+			}
 		}
 		for _, tc := range ch.Delta.ToolCalls {
 			acc, exists := tools[tc.Index]
@@ -290,6 +322,19 @@ func (h *Handler) relayOpenAIStream(w http.ResponseWriter, active *activeProvide
 		if ch.FinishReason != nil && *ch.FinishReason != "" {
 			finish = *ch.FinishReason
 		}
+
+		// Stop consuming upstream once the client is gone.
+		select {
+		case <-r.Context().Done():
+			abort(abortClientGone)
+			return
+		default:
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		log.Error().Err(err).Msg("Upstream stream read error")
+		abort(abortUpstreamErr)
+		return
 	}
 
 	if textOpen {

@@ -38,7 +38,7 @@ Probe requests recorded with `probe=1`.
 | 2  | U2 | window derivation + aggregations        | Critical | done    | Storage      | segmentation tests |
 | 3  | U3 | presence-aware parsing + header capture | Critical | done   | Extraction   | parser unit tests |
 | 4  | U4 | recording hooks in proxy hot path      | Critical | done   | Extraction   | handler/stream/gateway tests |
-| 5  | U5 | aborted-stream handling + marked rows   | High     | pending | Grouped: Relays | abort tests |
+| 5  | U5 | aborted-stream handling + marked rows   | High     | done   | Grouped: Relays | abort tests |
 | 6  | U6 | dashboard API endpoints                 | High     | pending | API          | dashboard tests |
 | 7  | U7 | dashboard UI panel + rebuild embed      | Medium   | pending | UI (delegate) | build + embed + visual check |
 | 8  | U8 | CHANGELOG + CLAUDE.md docs              | Medium   | pending | Docs         | review |
@@ -118,6 +118,13 @@ Probe requests recorded with `probe=1`.
 - **Verify:** tests: client-abort mid-stream → partial event + marked requests
   row; upstream read error mid-stream → partial event; openAI-stream abort
   stops relaying.
+- **Status:** done — `logAbortedStream` helper (handler.go) marks both records;
+  `abortClientGone`/`abortUpstreamErr` constants; capture-before-write in the
+  two byte-copy relays so aborted chunks are still counted; `relayOpenAIStream`
+  gained an `r` param + error-returning `send` + scanner.Err()/context checks;
+  `relayOpenAIPassthroughStream` gained an `r` param + EOF/error split + context
+  check; 9 tests in usage_events_test.go (3 abort modes × 3 relays, plus
+  completed-stream not marked).
 
 ### U6 — dashboard API endpoints
 - **What:** `GET /api/usage/windows?provider=&dimension=5h&limit=` (current +
