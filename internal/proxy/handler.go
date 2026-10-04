@@ -584,31 +584,6 @@ func stickyReorder(chain []*router.Provider, sticky string) []*router.Provider {
 	return out
 }
 
-// hasImageContent reports whether any message's content array contains an
-// image block. This is a shallow, top-level scan only — unlike the
-// transformer's full conversion logic, it does not recurse into tool_result
-// content — because it is used solely to decide whether to consult a
-// provider's configured vision-model override (providers.VisionCapable), not
-// to reproduce V1's transform-time image handling.
-func hasImageContent(messages []map[string]interface{}) bool {
-	for _, m := range messages {
-		content, ok := m["content"].([]interface{})
-		if !ok {
-			continue
-		}
-		for _, block := range content {
-			b, ok := block.(map[string]interface{})
-			if !ok {
-				continue
-			}
-			if t, _ := b["type"].(string); t == "image" {
-				return true
-			}
-		}
-	}
-	return false
-}
-
 // HandleMessages is the main handler for POST /v1/messages (Claude Code calls this).
 func (h *Handler) HandleMessages(w http.ResponseWriter, r *http.Request) {
 	startTime := time.Now()
@@ -689,7 +664,7 @@ func (h *Handler) HandleMessages(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = json.Unmarshal(body, &raw)
 	hasTools := len(req.Tools) > 0
-	req.nexusImages = hasImageContent(raw.Messages)
+	req.nexusImages = messagesHaveImage(raw.Messages)
 	complexity := router.ClassifyRequest(req.Model, raw.Messages, hasTools)
 
 	log.Debug().

@@ -83,14 +83,14 @@ func promptText(body []byte) (text string, hasTools bool, hasImages bool, ok boo
 	}
 	var sb strings.Builder
 	collectText(m["system"], &sb)
-	if hasImageBlock(m["system"]) {
+	if contentHasImage(m["system"]) {
 		hasImages = true
 	}
 	if msgs, isArr := m["messages"].([]interface{}); isArr {
 		for _, mm := range msgs {
 			if mp, isMap := mm.(map[string]interface{}); isMap {
 				collectText(mp["content"], &sb)
-				if hasImageBlock(mp["content"]) {
+				if contentHasImage(mp["content"]) {
 					hasImages = true
 				}
 			}
@@ -98,25 +98,6 @@ func promptText(body []byte) (text string, hasTools bool, hasImages bool, ok boo
 	}
 	text = strings.TrimSpace(sb.String())
 	return text, hasTools, hasImages, text != ""
-}
-
-// hasImageBlock reports whether v (a "system" field or a message's "content"
-// field) contains any content block whose "type" is "image". It walks the
-// same []interface{}-of-map[string]interface{} shape collectText already
-// walks, as a sibling scan rather than a second decode.
-func hasImageBlock(v interface{}) bool {
-	arr, ok := v.([]interface{})
-	if !ok {
-		return false
-	}
-	for _, b := range arr {
-		if bm, ok := b.(map[string]interface{}); ok {
-			if t, _ := bm["type"].(string); t == "image" {
-				return true
-			}
-		}
-	}
-	return false
 }
 
 func collectText(v interface{}, sb *strings.Builder) {
