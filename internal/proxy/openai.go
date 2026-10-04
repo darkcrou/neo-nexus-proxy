@@ -234,22 +234,32 @@ func (h *Handler) relayOpenAIStream(w http.ResponseWriter, r *http.Request, acti
 	// quota without losing the consumption that already happened
 	abort := func(abortText string) {
 		var raw rawUsage
+		var cost tokenUsage
 		if sawUsage {
-			raw.In, raw.Out = &inTok, &outTok
-			if cachedTok > 0 {
-				raw.CacheRead = &cachedTok
+			// copy before taking pointers: the clamping below mutates the
+			// cached portion, and aliasing the loop variables would let a
+			// reorder silently desync the event's raw fields from the cost view.
+			in, out, cached, reason := inTok, outTok, cachedTok, reasonTok
+			// clamp the cached portion the same way openAITokens does, so a
+			// malformed upstream reporting cached > prompt can't produce a
+			// negative fresh-input cost.
+			if cached > in {
+				cached = in
+			}
+			raw.In, raw.Out = &in, &out
+			// cached > 0 doubles as the presence flag: the stream chunk struct
+			// carries plain ints, so a reported cached_tokens=0 is
+			// indistinguishable from "not reported" on this one path (the
+			// non-streaming parser preserves the zero).
+			if cached > 0 {
+				raw.CacheRead = &cached
 			}
 			if sawReasoning {
-				raw.Reasoning = &reasonTok
+				raw.Reasoning = &reason
 			}
+			cost = tokenUsage{In: in - cached, Out: out, CacheRead: cached}
 		}
-		// clamp the cached portion the same way openAITokens does, so a
-		// malformed upstream reporting cached > prompt can't produce a
-		// negative fresh-input cost.
-		if cachedTok > inTok {
-			cachedTok = inTok
-		}
-		h.logAbortedStream(active, req, complexity, tokenUsage{In: inTok - cachedTok, Out: outTok, CacheRead: cachedTok}, nil, resp.StatusCode, startTime, att, raw, abortText)
+		h.logAbortedStream(active, req, complexity, cost, nil, resp.StatusCode, startTime, att, raw, abortText)
 	}
 
 	if err := send("message_start", map[string]interface{}{

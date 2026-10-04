@@ -202,10 +202,10 @@ func (h *Handler) callOpenAIPassthrough(active *activeProvider, rawMap map[strin
 	h.authorize(active, req, payload, key)
 	resp, err := h.httpClient.Do(req)
 	if err != nil {
-		// the raw OpenAI request has no AnthropicRequest equivalent here; the
-		// event still names the provider and chain position, which is what
-		// discard-site analysis needs — model_asked/model_used stay empty
-		h.recordUsageEvent(active, AnthropicRequest{}, stream, 0, &attemptInfo{
+		// inModel is in scope; keeping model attribution on the event makes
+		// discard-site analysis consistent with every other recording site
+		// (recordUsageEvent derives model_used from mappedModel itself)
+		h.recordUsageEvent(active, AnthropicRequest{Model: inModel}, stream, 0, &attemptInfo{
 			keyIdx: idx, chainPos: chainPos, started: start,
 			errText: "transport: " + err.Error(),
 		}, rawUsage{})

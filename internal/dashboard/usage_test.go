@@ -2,6 +2,7 @@ package dashboard
 
 import (
 	"encoding/json"
+	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"testing"
@@ -249,5 +250,23 @@ func TestUsageAPI_Quota(t *testing.T) {
 	seven := qs[1].(map[string]interface{})
 	if seven["dimension"] != "7d" || seven["utilization"].(float64) != 0.12 {
 		t.Errorf("7d snapshot: %v", seven)
+	}
+}
+
+// Storage failures must be loud: a broken DB surfaces as HTTP 500, never as
+// HTTP 200 with an empty payload (the failure mode that once hid the
+// COALESCE scan bug as "no usage").
+func TestUsageAPI_StorageErrorsAre500(t *testing.T) {
+	db := newUsageTestDB(t)
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s := &Server{db: db}
+	for _, p := range []string{"/api/usage/windows", "/api/usage/events", "/api/usage/totals", "/api/usage/quota"} {
+		rec := httptest.NewRecorder()
+		s.Routes().ServeHTTP(rec, httptest.NewRequest("GET", p, nil))
+		if rec.Code != http.StatusInternalServerError {
+			t.Errorf("%s = %d, want 500 (storage error must not masquerade as empty data)", p, rec.Code)
+		}
 	}
 }

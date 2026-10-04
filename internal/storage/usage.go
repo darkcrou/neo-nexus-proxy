@@ -83,7 +83,10 @@ func (db *DB) RecordUsageEvent(e *UsageEvent) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	id, _ := res.LastInsertId()
+	id, err := res.LastInsertId()
+	if err != nil {
+		return 0, err
+	}
 	return id, nil
 }
 
@@ -313,7 +316,7 @@ func (db *DB) GetUsageWindows(provider string, window time.Duration, dimension s
 			// the window it terminated; the other order would end the window
 			// at the wall and drop the 429 from every window.
 			if cur != nil && e.RateLimited {
-				cur.add(e)
+				cur.add(e, dimension)
 				closeCur(at, EndRateLimit)
 			}
 			// 3. The assumed duration wall passed before this event.
@@ -329,7 +332,7 @@ func (db *DB) GetUsageWindows(provider string, window time.Duration, dimension s
 			curStart = at
 			resetAt = nil
 		}
-		cur.add(e)
+		cur.add(e, dimension)
 		if dimension != "" && e.QuotaDimension == dimension && e.QuotaResetAt != nil {
 			resetAt = e.QuotaResetAt
 		}
@@ -354,15 +357,16 @@ func (db *DB) GetUsageWindows(provider string, window time.Duration, dimension s
 		windows[0].EndReason = EndUnknown
 	}
 
-	// Most recent first, bounded by limit.
-	sort.Slice(windows, func(i, j int) bool { return windows[i].StartedAt.After(windows[j].StartedAt) })
+	// Most recent first, bounded by limit. Stable sort: derivation order is
+	// oldest-first and two windows can share a second-precision start.
+	sort.SliceStable(windows, func(i, j int) bool { return windows[i].StartedAt.After(windows[j].StartedAt) })
 	if limit > 0 && len(windows) > limit {
 		windows = windows[:limit]
 	}
 	return windows, nil
 }
 
-func (w *UsageWindow) add(e *UsageEvent) {
+func (w *UsageWindow) add(e *UsageEvent, dimension string) {
 	w.Requests++
 	if e.In != nil {
 		w.InTokens += int64(*e.In)
@@ -385,7 +389,10 @@ func (w *UsageWindow) add(e *UsageEvent) {
 	if e.RateLimited {
 		w.RateLimitedEvents++
 	}
-	if e.QuotaUtilization != nil {
+	// Only attach quota observations matching the queried dimension, so a
+	// 5h window can't end up carrying a 7d snapshot when a provider reports
+	// both. An empty dimension means "no filtering requested".
+	if e.QuotaUtilization != nil && (dimension == "" || e.QuotaDimension == dimension) {
 		w.Quota = &QuotaObservation{
 			Dimension:   e.QuotaDimension,
 			Utilization: *e.QuotaUtilization,
@@ -499,7 +506,8 @@ func (db *DB) GetUsageTotals(by string, period string) ([]*UsageTotals, error) {
 		t := &UsageTotals{}
 		if err := rows.Scan(&t.Group, &t.Requests, &t.In, &t.CacheRead, &t.CacheWrite,
 			&t.Out, &t.Reasoning, &t.Partial); err != nil {
-			continue
+			// same policy as scanUsageEvents: a bad row must be loud, not hidden
+			return nil, fmt.Errorf("scan usage totals %q: %w", t.Group, err)
 		}
 		out = append(out, t)
 	}
@@ -537,7 +545,7 @@ func (db *DB) GetProviderQuota() ([]*QuotaSnapshot, error) {
 		s := &QuotaSnapshot{}
 		var reset sql.NullTime
 		if err := rows.Scan(&s.Provider, &s.Dimension, &s.Utilization, &reset, &s.ObservedAt); err != nil {
-			continue
+			return nil, fmt.Errorf("scan quota snapshot %s/%s: %w", s.Provider, s.Dimension, err)
 		}
 		s.ResetAt = nilTime(reset)
 		out = append(out, s)
@@ -559,6 +567,11 @@ func usageSince(period string) string {
 		return " AND date(created_at) >= date('now')"
 	}
 }
+
+// Naming convention for the pointer/SQL conversion helpers below: null*
+// converts a struct pointer field into a driver value for binding
+// (nil → NULL); nil* converts a scanned sql.Null* back into a pointer
+// (NULL → nil).
 
 func nullInt(v *int) any {
 	if v == nil {

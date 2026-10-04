@@ -869,3 +869,34 @@ func TestGetUsageEvents_NullRawStringColumns(t *testing.T) {
 		t.Errorf("in_tokens = %v, want 30", evs[0].In)
 	}
 }
+
+// A window's provider-reported quota snapshot must match the queried
+// dimension: a provider reporting both 5h and 7d (Anthropic does, on every
+// response) must not have its 5h window end up carrying the 7d number.
+func TestUsageWindowsQuotaDimensionFilter(t *testing.T) {
+	db := newTestDB(t)
+	base := ago(120)
+	recordAt(t, db, "zai", base, func(e *UsageEvent) {
+		e.In = intPtr(100)
+		e.QuotaDimension, e.QuotaUtilization = "5h", floatPtr(0.5)
+	})
+	// a later 7d observation must not overwrite the 5h snapshot
+	recordAt(t, db, "zai", base.Add(30*time.Minute), func(e *UsageEvent) {
+		e.In = intPtr(50)
+		e.QuotaDimension, e.QuotaUtilization = "7d", floatPtr(0.9)
+	})
+
+	ws, err := db.GetUsageWindows("zai", 5*time.Hour, "5h", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ws) != 1 {
+		t.Fatalf("expected 1 window, got %d", len(ws))
+	}
+	if ws[0].Quota == nil {
+		t.Fatal("window should carry the 5h quota snapshot")
+	}
+	if ws[0].Quota.Dimension != "5h" || ws[0].Quota.Utilization != 0.5 {
+		t.Errorf("quota snapshot = %+v, want the 5h observation (0.5)", ws[0].Quota)
+	}
+}

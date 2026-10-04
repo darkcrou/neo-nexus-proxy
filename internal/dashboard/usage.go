@@ -48,7 +48,7 @@ func (s *Server) handleUsageWindows(w http.ResponseWriter, r *http.Request) {
 		// derive the provider list from recorded usage itself
 		totals, err := s.db.GetUsageTotals("provider", "all")
 		if err != nil {
-			writeJSON(w, map[string]interface{}{"windows": []*storage.UsageWindow{}})
+			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
 		providers = providers[:0]
@@ -61,7 +61,11 @@ func (s *Server) handleUsageWindows(w http.ResponseWriter, r *http.Request) {
 	for _, p := range providers {
 		ws, err := s.db.GetUsageWindows(p, window, dimension, limit)
 		if err != nil {
-			continue // SQLite local: unreachable in practice; skip empty provider
+			// A provider whose derivation fails must be loud: returning the
+			// rest would present partial data as complete (the exact silent-
+			// emptiness failure mode the storage COALESCE fix addressed).
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
 		}
 		windows = append(windows, ws...)
 	}
@@ -98,7 +102,7 @@ func (s *Server) handleUsageEvents(w http.ResponseWriter, r *http.Request) {
 	}
 	events, err := s.db.GetUsageEvents(f)
 	if err != nil {
-		writeJSON(w, empty)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	if events == nil {
@@ -128,7 +132,11 @@ func (s *Server) handleUsageTotals(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	totals, err := s.db.GetUsageTotals(by, period)
-	if err != nil || totals == nil {
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if totals == nil {
 		writeJSON(w, empty)
 		return
 	}
@@ -147,7 +155,11 @@ func (s *Server) handleUsageQuota(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	quota, err := s.db.GetProviderQuota()
-	if err != nil || quota == nil {
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if quota == nil {
 		writeJSON(w, empty)
 		return
 	}

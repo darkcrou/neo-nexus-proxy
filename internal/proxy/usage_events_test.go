@@ -1077,3 +1077,31 @@ func TestAbort_CompletedStreamsNotMarked(t *testing.T) {
 		t.Errorf("completed stream requests row error = %q, want empty", row.Error)
 	}
 }
+
+// A gateway transport error must still attribute the model: inModel is in
+// scope at the recording site, so the discard event names what was asked,
+// like every other discard site.
+func TestUsageEvent_GatewayTransportError(t *testing.T) {
+	srv := openAIServer(http.StatusOK, "never reached")
+	srv.Close() // unreachable
+
+	h, db := buildUsageHandler(t, []testProv{{"test", "free", srv.URL}})
+	rec := chatCompletions(h, `{"model":"gpt-4","max_tokens":50,"messages":[{"role":"user","content":"hi"}]}`)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status=%d, want 502", rec.Code)
+	}
+	// the passthrough has no same-provider retry loop: one transport error
+	// → one event, then the chain ends and the client sees 502
+	evs := requireEvents(t, db, 1)
+	for i, e := range evs {
+		if e.Status != 0 || e.Success {
+			t.Errorf("event %d: status=%d success=%v", i, e.Status, e.Success)
+		}
+		if e.ModelAsked != "gpt-4" {
+			t.Errorf("event %d: model_asked=%q, want gpt-4 (transport discards keep model attribution)", i, e.ModelAsked)
+		}
+		if !strings.Contains(e.Error, "transport") {
+			t.Errorf("event %d: error=%q", i, e.Error)
+		}
+	}
+}
