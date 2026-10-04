@@ -3,9 +3,9 @@ package proxy
 import (
 	"encoding/json"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
-	"regexp"
 )
 
 // redactor is the privacy firewall: it finds secrets/PII in an outbound request
@@ -46,6 +46,9 @@ func (r *redactor) redact(body []byte) ([]byte, map[string]string) {
 	walk = func(x interface{}) interface{} {
 		switch t := x.(type) {
 		case string:
+			if isBase64DataURI(t) {
+				return t // OpenAI image_url payload: never rewrite image bytes
+			}
 			return redactString(t, repl, counter)
 		case []interface{}:
 			for i := range t {
@@ -53,7 +56,17 @@ func (r *redactor) redact(body []byte) ([]byte, map[string]string) {
 			}
 			return t
 		case map[string]interface{}:
+			// Anthropic image source {"type":"base64","data":"..."}: the data
+			// value is image bytes, not text; a detector match inside it would
+			// corrupt the image.
+			skipData := false
+			if typ, ok := t["type"].(string); ok && typ == "base64" {
+				skipData = true
+			}
 			for k := range t {
+				if skipData && k == "data" {
+					continue
+				}
 				t[k] = walk(t[k])
 			}
 			return t
@@ -69,6 +82,20 @@ func (r *redactor) redact(body []byte) ([]byte, map[string]string) {
 		return body, nil
 	}
 	return out, repl
+}
+
+// isBase64DataURI reports whether s is a base64 data URI ("data:<mime>;base64,...").
+// It is a cheap prefix test (no regex): the ";base64," marker must appear within
+// the first 128 bytes.
+func isBase64DataURI(s string) bool {
+	if !strings.HasPrefix(s, "data:") {
+		return false
+	}
+	head := s
+	if len(head) > 128 {
+		head = head[:128]
+	}
+	return strings.Contains(head, ";base64,")
 }
 
 func redactString(s string, repl map[string]string, counter map[string]int) string {
