@@ -403,12 +403,24 @@ endpoints. Spans `internal/storage/db.go` (schema),
 - **Windows are derived at query time**, never persisted
   (`GetUsageWindows`). Probes are excluded (internal recovery pings, not
   workload). Rate-limited events **close** the current window as
-  `RATE_LIMIT` but never open one. A provider-reported `quota_reset_at`
+  `RATE_LIMIT` — at the 429's own timestamp, which outranks an
+  already-passed duration wall (the 429 belongs to the window it
+  terminates; the flipped order would drop it from every window) — but
+  never open one. A provider-reported `quota_reset_at`
   (matching the queried dimension) closes as `PROVIDER_RESET` — trusted
   over assumed walls. Otherwise the assumed duration wall (default 5h)
   closes as `TIME_ELAPSED`; the oldest window's start-relative
   `TIME_ELAPSED` is downgraded to `UNKNOWN` (its true start predates
   recorded history). The current window is open (`ended_at` absent).
+- **Scale characteristic, accepted by design:** `GetUsageWindows` scans a
+  provider's full event history (per dashboard windows call, per provider)
+  because events are never pruned — the immutable history IS the point of
+  the subsystem. Rows are tiny and a single-user proxy accumulates them
+  slowly, so this stays cheap for the intended lifetime of a local install.
+  If it ever matters, the fix is SQL-side windowed aggregation — NOT a
+  time-bounded event load, which would silently truncate the oldest
+  returned window's token totals (`UNKNOWN` covers end reasons, not
+  missing data).
 - **API shape** (`internal/dashboard/usage.go`, all plural-envelope
   snake_case, empty arrays on nil-db): `GET /api/usage/windows`,
   `/api/usage/events`, `/api/usage/totals`, `/api/usage/quota`.
