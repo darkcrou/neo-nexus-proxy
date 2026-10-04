@@ -1210,7 +1210,9 @@ func (h *Handler) logResult(active *activeProvider, req AnthropicRequest, comple
 	}
 	if h.inspect { // opt-in: capture full prompt + response for the inspector
 		if pj, err := json.Marshal(req); err == nil {
-			rec.Prompt = capText(string(pj))
+			// elide base64 image payloads BEFORE capping, so the 64KB budget is
+			// spent on text, not on truncated base64
+			rec.Prompt = capText(elideImageData(string(pj)))
 		}
 		rec.Response = capText(string(respBody))
 	}

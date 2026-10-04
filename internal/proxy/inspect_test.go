@@ -95,3 +95,40 @@ func TestInspectCapturesPromptResponse(t *testing.T) {
 		t.Errorf("response not captured: %q", d.Response)
 	}
 }
+
+func TestInspectOmitsBase64ImagePayload(t *testing.T) {
+	srv := openAIServer(http.StatusOK, "saw it")
+	defer srv.Close()
+
+	h := buildTestHandler(t, []testProv{{"p", "free", srv.URL}})
+	db, err := storage.New(filepath.Join(t.TempDir(), "img.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	h.db = db
+	h.inspect = true
+
+	b64 := strings.Repeat("QUJD", 200) // 800 base64 chars
+	doMessages(h, `{"model":"claude-haiku-4-5","max_tokens":50,"messages":[{"role":"user","content":[`+
+		`{"type":"text","text":"describe-this-picture"},`+
+		`{"type":"image","source":{"type":"base64","media_type":"image/png","data":"`+b64+`"}}]}]}`)
+
+	recents, _ := db.GetRecentRequests(1)
+	if len(recents) == 0 {
+		t.Fatal("request was not logged")
+	}
+	d, err := db.GetRequestDetail(recents[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(d.Prompt, "QUJDQUJD") {
+		t.Errorf("stored prompt still contains base64 image data: %.120q", d.Prompt)
+	}
+	if !strings.Contains(d.Prompt, "[image data omitted: 800 bytes]") {
+		t.Errorf("stored prompt lacks the omission marker: %.300q", d.Prompt)
+	}
+	if !strings.Contains(d.Prompt, "describe-this-picture") {
+		t.Errorf("stored prompt lost its text: %.300q", d.Prompt)
+	}
+}

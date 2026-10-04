@@ -3,6 +3,7 @@ package proxy
 import (
 	"encoding/json"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -149,5 +150,25 @@ func TestHandleMessages_ToolResultImage_UsesVisionModelOverride(t *testing.T) {
 	}
 	if gotModel != "llama-vision-90b" {
 		t.Errorf("upstream model = %q, want vision_model override %q", gotModel, "llama-vision-90b")
+	}
+}
+
+func TestElideImageData(t *testing.T) {
+	long := strings.Repeat("QUJD", 100) // 400 base64 chars
+	short := strings.Repeat("A", 127)
+	cases := []struct{ name, in, want string }{
+		{"short data untouched", `{"source":{"data":"aGk="}}`, `{"source":{"data":"aGk="}}`},
+		{"just under threshold untouched", `{"data":"` + short + `"}`, `{"data":"` + short + `"}`},
+		{"long base64 replaced", `{"type":"base64","data":"` + long + `","x":1}`, `{"type":"base64","data":"[image data omitted: 400 bytes]","x":1}`},
+		{"padded and url-safe alphabet", `{"data":"` + strings.Repeat("a-_", 50) + `=="}`, `{"data":"[image data omitted: 152 bytes]"}`},
+		{"two images", `[{"data":"` + long + `"},{"data":"` + long + `"}]`, `[{"data":"[image data omitted: 400 bytes]"},{"data":"[image data omitted: 400 bytes]"}]`},
+		{"long non-data text untouched", `{"text":"` + long + `"}`, `{"text":"` + long + `"}`},
+		{"long non-base64 data untouched", `{"data":"` + strings.Repeat("hello world ", 40) + `"}`, `{"data":"` + strings.Repeat("hello world ", 40) + `"}`},
+		{"plain text untouched", `{"messages":[{"role":"user","content":"hi"}]}`, `{"messages":[{"role":"user","content":"hi"}]}`},
+	}
+	for _, c := range cases {
+		if got := elideImageData(c.in); got != c.want {
+			t.Errorf("%s:\n got  %s\n want %s", c.name, got, c.want)
+		}
 	}
 }

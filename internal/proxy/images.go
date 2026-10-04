@@ -1,5 +1,31 @@
 package proxy
 
+import (
+	"regexp"
+	"strconv"
+	"strings"
+)
+
+// imageDataRe matches a JSON `"data":"<base64>"` member whose value is a run of
+// at least 128 base64 characters (standard or URL-safe alphabet, padded or
+// not). It is how an Anthropic image block's base64 source appears in the
+// marshaled request. Go's regexp is RE2 (linear time), so large inputs are safe.
+var imageDataRe = regexp.MustCompile(`"data":"[A-Za-z0-9+/_=-]{128,}"`)
+
+// elideImageData replaces the value of every long base64 `"data":"..."` member
+// in s (a marshaled request) with `"data":"[image data omitted: N bytes]"`, so
+// the inspector does not store a truncated, useless base64 blob. Short data
+// values and everything else are left untouched.
+func elideImageData(s string) string {
+	if !strings.Contains(s, `"data":"`) { // cheap pre-check: skip the regexp for text-only prompts
+		return s
+	}
+	const wrapLen = len(`"data":""`)
+	return imageDataRe.ReplaceAllStringFunc(s, func(m string) string {
+		return `"data":"[image data omitted: ` + strconv.Itoa(len(m)-wrapLen) + ` bytes]"`
+	})
+}
+
 // maxImageScanDepth caps how deep contentHasImage recurses into nested
 // "content" arrays (tool_result inside tool_result ...), so a hostile request
 // cannot force unbounded recursion.
