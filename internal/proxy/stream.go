@@ -21,7 +21,7 @@ var (
 // relayAnthropicStream proxies a native-Anthropic streaming (SSE) response
 // straight through to Claude Code, flushing each chunk as it arrives. It also
 // captures the stream so token usage can be logged after completion.
-func (h *Handler) relayAnthropicStream(w http.ResponseWriter, r *http.Request, active *activeProvider, req AnthropicRequest, resp *http.Response, startTime time.Time, complexity router.Complexity) {
+func (h *Handler) relayAnthropicStream(w http.ResponseWriter, r *http.Request, active *activeProvider, req AnthropicRequest, resp *http.Response, startTime time.Time, complexity router.Complexity, att *attemptInfo) {
 	defer resp.Body.Close()
 
 	flusher, ok := w.(http.Flusher)
@@ -72,8 +72,9 @@ func (h *Handler) relayAnthropicStream(w http.ResponseWriter, r *http.Request, a
 		}
 	}
 
-	u := streamUsageFull(captured.Bytes())
-	h.logResult(active, req, complexity, u, captured.Bytes(), resp.StatusCode, time.Since(startTime), true)
+	raw := streamRawUsage(captured.Bytes())
+	u := raw.anthropicTokens()
+	h.logResult(active, req, complexity, u, captured.Bytes(), resp.StatusCode, time.Since(startTime), true, att, raw)
 	log.Info().
 		Str("provider", active.impl.Name()).
 		Int("status", resp.StatusCode).

@@ -34,7 +34,7 @@ func (h *Handler) serveCascade(w http.ResponseWriter, r *http.Request, req Anthr
 		}
 		last := i == len(chain)-1
 
-		resp, err := h.callUpstream(active, ureq, noStreamBody, r.Header)
+		resp, att, err := h.callUpstream(active, ureq, noStreamBody, r.Header, i+1)
 		if err != nil {
 			log.Warn().Str("provider", cand.Name).Err(err).Msg("cascade: provider unreachable, escalating")
 			continue
@@ -45,15 +45,22 @@ func (h *Handler) serveCascade(w http.ResponseWriter, r *http.Request, req Anthr
 		if resp.StatusCode != http.StatusOK {
 			h.router.RecordOutcome(active.impl.Name(), complexity, false)
 			if last {
-				h.relayBuffered(w, active, req, raw, resp, startTime, complexity)
+				h.relayBuffered(w, active, req, raw, resp, startTime, complexity, att)
 				return true
 			}
+			// erroring cascade step the client never sees — its attempt is
+			// still real consumption, so record it with whatever usage it reported
+			h.recordUsageEvent(active, ureq, false, resp.StatusCode, att, usageFromRawBody(active.impl.Name(), raw))
 			log.Warn().Str("provider", cand.Name).Int("status", resp.StatusCode).Msg("cascade: upstream error, escalating")
 			continue
 		}
 
 		if !last && !verifyResponse(active.impl.Name(), raw) {
 			h.router.RecordOutcome(active.impl.Name(), complexity, false)
+			// the cheap model answered (and billed) but its output failed the
+			// structural check — annotate the event as discarded, not errored
+			att.errText = "discarded: cascade verification failed, escalated"
+			h.recordUsageEvent(active, ureq, false, resp.StatusCode, att, usageFromRawBody(active.impl.Name(), raw))
 			log.Info().Str("provider", cand.Name).Msg("cascade: weak/invalid output, escalating to a stronger model")
 			continue
 		}
@@ -61,7 +68,7 @@ func (h *Handler) serveCascade(w http.ResponseWriter, r *http.Request, req Anthr
 		if !last {
 			log.Info().Str("provider", cand.Name).Str("complexity", complexity.String()).Msg("cascade: cheap model accepted ✓")
 		}
-		h.relayBuffered(w, active, req, raw, resp, startTime, complexity)
+		h.relayBuffered(w, active, req, raw, resp, startTime, complexity, att)
 		return true
 	}
 	return false
@@ -69,7 +76,7 @@ func (h *Handler) serveCascade(w http.ResponseWriter, r *http.Request, req Anthr
 
 // relayBuffered serves a fully-buffered upstream response, reusing the standard
 // relays (which synthesize streaming to the client when req.Stream is set).
-func (h *Handler) relayBuffered(w http.ResponseWriter, active *activeProvider, req AnthropicRequest, raw []byte, orig *http.Response, startTime time.Time, complexity router.Complexity) {
+func (h *Handler) relayBuffered(w http.ResponseWriter, active *activeProvider, req AnthropicRequest, raw []byte, orig *http.Response, startTime time.Time, complexity router.Complexity, att *attemptInfo) {
 	hdr := orig.Header
 	if hdr == nil {
 		hdr = http.Header{}
@@ -80,10 +87,10 @@ func (h *Handler) relayBuffered(w http.ResponseWriter, active *activeProvider, r
 		Body:       io.NopCloser(bytes.NewReader(raw)),
 	}
 	if providers.IsOpenAICompatible(active.impl.Name()) {
-		h.relayOpenAI(w, active, req, buffered, startTime, complexity)
+		h.relayOpenAI(w, active, req, buffered, startTime, complexity, att)
 		return
 	}
-	h.relayAnthropicBuffered(w, active, req, buffered, startTime, complexity)
+	h.relayAnthropicBuffered(w, active, req, buffered, startTime, complexity, att)
 }
 
 // verifyResponse is a cheap, deterministic structural check: a usable answer has

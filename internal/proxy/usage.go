@@ -7,6 +7,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/lynuxis2026-pixel/nexus-proxy/internal/providers"
 )
 
 // tokenUsage is a normalized token breakdown across providers.
@@ -310,4 +312,44 @@ func parseEpochHeader(v string) *time.Time {
 		t = time.Unix(int64(f), 0).UTC()
 	}
 	return &t
+}
+
+// ─── Attempt metadata (U4) ──────────────────────────────────────────────────
+
+// attemptInfo carries per-upstream-attempt metadata that the relays and
+// logResult cannot derive from the response body: which key-pool slot served,
+// the chain position, when the attempt was dispatched, and the quota headers
+// transcribed from its response (captured exactly once, in callUpstream —
+// NEXUS never computes quota values itself). callUpstream/callOpenAIPassthrough
+// build it for the winning attempt; discard sites (key rotation, failover,
+// cascade escalation, probes) record events from it directly.
+type attemptInfo struct {
+	keyIdx   int          // 0-based key-pool index; -1 = no pool (single key)
+	chainPos int          // 1-based position in the provider chain; 0 = probe
+	started  time.Time    // when this attempt was dispatched
+	probe    bool         // cooldown-recovery probe
+	quota    attemptQuota // transcribed from the response's headers
+	reqID    string       // upstream request-id header, when present
+	partial  bool         // usage only partially known (aborted stream)
+	errText  string       // transport-error / abort annotation
+}
+
+// extractRequestID pulls the upstream correlation id from a response, trying
+// the common header names in order.
+func extractRequestID(h http.Header) string {
+	for _, k := range []string{"Request-Id", "X-Request-Id", "Anthropic-Request-Id"} {
+		if v := h.Get(k); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// usageFromRawBody parses a complete (non-streaming) upstream response body
+// into raw usage with the provider-format-appropriate parser.
+func usageFromRawBody(providerName string, body []byte) rawUsage {
+	if providers.IsOpenAICompatible(providerName) {
+		return openAIRawUsage(body)
+	}
+	return anthropicRawUsage(body)
 }

@@ -18,7 +18,7 @@ import (
 // the OpenAI response back to Anthropic format. Because we always call upstream
 // non-streaming, when the client asked for a stream we synthesize the Anthropic
 // SSE event sequence from the complete response.
-func (h *Handler) relayOpenAI(w http.ResponseWriter, active *activeProvider, req AnthropicRequest, resp *http.Response, startTime time.Time, complexity router.Complexity) {
+func (h *Handler) relayOpenAI(w http.ResponseWriter, active *activeProvider, req AnthropicRequest, resp *http.Response, startTime time.Time, complexity router.Complexity, att *attemptInfo) {
 	defer resp.Body.Close()
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -26,13 +26,15 @@ func (h *Handler) relayOpenAI(w http.ResponseWriter, active *activeProvider, req
 		return
 	}
 
+	raw := openAIRawUsage(respBody)
+
 	// Relay provider-side errors (bad key, rate limit, …) as-is.
 	if resp.StatusCode >= 400 {
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("X-Nexus-Provider", active.impl.Name())
 		w.WriteHeader(resp.StatusCode)
 		_, _ = w.Write(respBody)
-		h.logResult(active, req, complexity, tokenUsage{}, respBody, resp.StatusCode, time.Since(startTime), req.Stream)
+		h.logResult(active, req, complexity, tokenUsage{}, respBody, resp.StatusCode, time.Since(startTime), req.Stream, att, raw)
 		log.Warn().Str("provider", active.impl.Name()).Int("status", resp.StatusCode).Msg("Provider returned error")
 		return
 	}
@@ -44,7 +46,7 @@ func (h *Handler) relayOpenAI(w http.ResponseWriter, active *activeProvider, req
 	}
 
 	anthResp := TransformFromOpenAI(oaiResp, req.Model)
-	u := openAIUsageFull(respBody) // captures DeepSeek/OpenAI prompt-cache tokens
+	u := raw.openAITokens() // captures DeepSeek/OpenAI prompt-cache tokens
 
 	if req.Stream {
 		writeAnthropicSSE(w, active.impl.Name(), anthResp)
@@ -56,7 +58,7 @@ func (h *Handler) relayOpenAI(w http.ResponseWriter, active *activeProvider, req
 		_ = json.NewEncoder(w).Encode(anthResp)
 	}
 
-	h.logResult(active, req, complexity, u, respBody, http.StatusOK, time.Since(startTime), req.Stream)
+	h.logResult(active, req, complexity, u, respBody, http.StatusOK, time.Since(startTime), req.Stream, att, raw)
 	log.Info().
 		Str("provider", active.impl.Name()).
 		Str("model_used", h.mappedModel(active, req.Model)).
@@ -169,12 +171,15 @@ type oaiStreamChunk struct {
 		PromptTokensDetails  struct {
 			CachedTokens int `json:"cached_tokens"` // OpenAI
 		} `json:"prompt_tokens_details"`
+		CompletionTokensDetails struct {
+			ReasoningTokens *int `json:"reasoning_tokens"` // GLM/OpenAI reasoning — nil = not reported
+		} `json:"completion_tokens_details"`
 	} `json:"usage"`
 }
 
 // relayOpenAIStream converts a live OpenAI streaming response into the Anthropic
 // SSE event sequence, forwarding tokens to Claude Code as they arrive.
-func (h *Handler) relayOpenAIStream(w http.ResponseWriter, active *activeProvider, req AnthropicRequest, resp *http.Response, startTime time.Time, complexity router.Complexity) {
+func (h *Handler) relayOpenAIStream(w http.ResponseWriter, active *activeProvider, req AnthropicRequest, resp *http.Response, startTime time.Time, complexity router.Complexity, att *attemptInfo) {
 	defer resp.Body.Close()
 
 	flusher, ok := w.(http.Flusher)
@@ -190,7 +195,7 @@ func (h *Handler) relayOpenAIStream(w http.ResponseWriter, active *activeProvide
 		w.Header().Set("X-Nexus-Provider", active.impl.Name())
 		w.WriteHeader(resp.StatusCode)
 		_, _ = w.Write(body)
-		h.logResult(active, req, complexity, tokenUsage{}, body, resp.StatusCode, time.Since(startTime), true)
+		h.logResult(active, req, complexity, tokenUsage{}, body, resp.StatusCode, time.Since(startTime), true, att, rawUsage{})
 		return
 	}
 
@@ -223,6 +228,10 @@ func (h *Handler) relayOpenAIStream(w http.ResponseWriter, active *activeProvide
 	textOpen := false
 	finish := "stop"
 	inTok, outTok, cachedTok := 0, 0, 0
+	reasonTok := 0
+	// presence flags: a usage chunk seen means in/out were reported; cache and
+	// reasoning are only claimed when the provider actually reported them
+	sawUsage, sawReasoning := false, false
 
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
@@ -240,11 +249,16 @@ func (h *Handler) relayOpenAIStream(w http.ResponseWriter, active *activeProvide
 			continue
 		}
 		if chunk.Usage != nil {
+			sawUsage = true
 			inTok = chunk.Usage.PromptTokens
 			outTok = chunk.Usage.CompletionTokens
 			cachedTok = chunk.Usage.PromptCacheHitTokens
 			if d := chunk.Usage.PromptTokensDetails.CachedTokens; d > cachedTok {
 				cachedTok = d
+			}
+			if rt := chunk.Usage.CompletionTokensDetails.ReasoningTokens; rt != nil {
+				reasonTok = *rt
+				sawReasoning = true
 			}
 		}
 		if len(chunk.Choices) == 0 {
@@ -299,8 +313,21 @@ func (h *Handler) relayOpenAIStream(w http.ResponseWriter, active *activeProvide
 	if cachedTok > inTok {
 		cachedTok = inTok
 	}
+	// raw presence mirrors what the stream actually reported: no usage chunk
+	// at all → all nil (never zeros); cache read only when a cache field was
+	// non-zero; reasoning only when a reasoning field was present
+	var raw rawUsage
+	if sawUsage {
+		raw.In, raw.Out = &inTok, &outTok
+		if cachedTok > 0 {
+			raw.CacheRead = &cachedTok
+		}
+		if sawReasoning {
+			raw.Reasoning = &reasonTok
+		}
+	}
 	u := tokenUsage{In: inTok - cachedTok, Out: outTok, CacheRead: cachedTok}
-	h.logResult(active, req, complexity, u, nil, http.StatusOK, time.Since(startTime), true)
+	h.logResult(active, req, complexity, u, nil, http.StatusOK, time.Since(startTime), true, att, raw)
 	log.Info().
 		Str("provider", active.impl.Name()).
 		Int("in", u.In).Int("out", u.Out).Int("cache_read", u.CacheRead).

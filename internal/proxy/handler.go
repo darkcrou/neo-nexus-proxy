@@ -466,18 +466,35 @@ func (h *Handler) probeCoolingKeys() {
 // response at all — a transport error is treated the same as "still no
 // evidence of recovery" as a 429) decides the outcome: non-429 clears the
 // key's cooldown, anything else doubles its backoff and reschedules the next
-// probe.
+// probe. Every probe is a real upstream attempt, so each outcome (transport
+// error, 429, recovery) records a probe-flagged usage event; probes are
+// excluded from quota windows/totals by default but stay queryable.
 func (h *Handler) probeKey(active *activeProvider, name string, idx int, key string) {
+	start := time.Now()
 	resp, err := h.callUpstreamOnce(active, probeRequest, probeRequestBody, http.Header{}, key)
 	if err != nil {
+		if !errors.Is(err, errLocalPrep) {
+			h.recordUsageEvent(active, probeRequest, false, 0, &attemptInfo{
+				keyIdx: idx, chainPos: 0, started: start, probe: true,
+				errText: "transport: " + err.Error(),
+			}, rawUsage{})
+		}
 		active.reschedule(idx)
 		return
 	}
-	defer resp.Body.Close()
+	probeBody, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	att := &attemptInfo{
+		keyIdx: idx, chainPos: 0, started: start, probe: true,
+		quota: captureQuota(resp.Header), reqID: extractRequestID(resp.Header),
+	}
+	raw := usageFromRawBody(active.impl.Name(), probeBody)
 	if resp.StatusCode == http.StatusTooManyRequests {
+		h.recordUsageEvent(active, probeRequest, false, resp.StatusCode, att, raw)
 		active.reschedule(idx)
 		return
 	}
+	h.recordUsageEvent(active, probeRequest, false, resp.StatusCode, att, raw)
 	h.recoverKey(active, name, idx)
 }
 
@@ -796,9 +813,10 @@ func (h *Handler) HandleMessages(w http.ResponseWriter, r *http.Request) {
 		// 429 reaching here already means callUpstream's own same-provider
 		// key rotation (P1) is exhausted.
 		var resp *http.Response
+		var att *attemptInfo
 		var err error
 		for attempt := 1; attempt <= maxProviderAttempts; attempt++ {
-			resp, err = h.callUpstream(active, req, body, r.Header)
+			resp, att, err = h.callUpstream(active, req, body, r.Header, i+1)
 			if err == nil && (resp.StatusCode == http.StatusTooManyRequests || !isRetryableStatus(resp.StatusCode)) {
 				break
 			}
@@ -806,8 +824,12 @@ func (h *Handler) HandleMessages(w http.ResponseWriter, r *http.Request) {
 				break
 			}
 			if err != nil {
+				// transport error: the event was already recorded inside callUpstream
 				log.Warn().Str("provider", cand.Name).Err(err).Int("attempt", attempt).Msg("Provider request failed, retrying same provider")
 			} else {
+				// this response is being discarded for a tight retry — the
+				// client never sees it, so record its attempt here
+				h.recordUsageEvent(active, req, req.Stream, resp.StatusCode, att, rawUsage{})
 				log.Warn().Str("provider", cand.Name).Int("status", resp.StatusCode).Int("attempt", attempt).Msg("Retryable error, retrying same provider")
 				resp.Body.Close()
 			}
@@ -819,6 +841,9 @@ func (h *Handler) HandleMessages(w http.ResponseWriter, r *http.Request) {
 		}
 		if isRetryableStatus(resp.StatusCode) && i < len(chain)-1 {
 			h.router.RecordOutcome(cand.Name, complexity, false)
+			// the last discarded response of the retry loop — recorded before
+			// the failover drops it
+			h.recordUsageEvent(active, req, req.Stream, resp.StatusCode, att, rawUsage{})
 			resp.Body.Close()
 			log.Warn().Str("provider", cand.Name).Int("status", resp.StatusCode).Msg("Retryable error, failing over to next provider")
 			continue
@@ -834,18 +859,18 @@ func (h *Handler) HandleMessages(w http.ResponseWriter, r *http.Request) {
 		}
 		switch {
 		case providers.IsOpenAICompatible(active.impl.Name()) && req.Stream:
-			h.relayOpenAIStream(w, active, req, resp, startTime, complexity)
+			h.relayOpenAIStream(w, active, req, resp, startTime, complexity, att)
 		case providers.IsOpenAICompatible(active.impl.Name()):
-			h.relayOpenAI(w, active, req, resp, startTime, complexity)
+			h.relayOpenAI(w, active, req, resp, startTime, complexity, att)
 		default:
 			// Anthropic-format. Bedrock/Vertex return a full body (buffered);
 			// native Anthropic streams through.
 			if _, custom := active.impl.(providers.AnthropicNative); custom {
-				h.relayAnthropicBuffered(w, active, req, resp, startTime, complexity)
+				h.relayAnthropicBuffered(w, active, req, resp, startTime, complexity, att)
 			} else if req.Stream {
-				h.relayAnthropicStream(w, r, active, req, resp, startTime, complexity)
+				h.relayAnthropicStream(w, r, active, req, resp, startTime, complexity, att)
 			} else {
-				h.relayAnthropicSync(w, active, req, resp, startTime, complexity)
+				h.relayAnthropicSync(w, active, req, resp, startTime, complexity, att)
 			}
 		}
 		return
@@ -877,12 +902,24 @@ func resolveProviderKeys(pc config.Provider) []string {
 // errors.Is if it needs to.
 var errProviderExhausted = errors.New("nexus: provider exhausted, all keys cooling")
 
+// errLocalPrep wraps failures that happen before anything leaves the machine
+// (transform/marshal/NewRequest errors inside callUpstreamOnce and
+// callOpenAIPassthrough). They consumed nothing upstream, so callUpstream must
+// NOT record a usage event for them — only real round-trip attempts do.
+var errLocalPrep = errors.New("nexus: local request preparation failed")
+
 // callUpstream issues the upstream HTTP request, sticking to one API key from
 // the provider's pool: on a 429 it cools that key and moves to the next
 // non-cooling one, so the handler only fails over to a different provider
 // once every key for this provider is rate-limited. It returns a transport
 // error only — provider HTTP errors come back in *http.Response.
-func (h *Handler) callUpstream(active *activeProvider, req AnthropicRequest, body []byte, origHeaders http.Header) (*http.Response, error) {
+//
+// The returned attemptInfo describes the winning attempt (the response the
+// caller will relay); key-rotation 429s and transport errors are recorded as
+// usage events here because no caller ever sees them. chainPos is the 1-based
+// position of this provider in the caller's chain, stamped onto every event
+// (rotations and retries of the same chain entry share its position).
+func (h *Handler) callUpstream(active *activeProvider, req AnthropicRequest, body []byte, origHeaders http.Header, chainPos int) (*http.Response, *attemptInfo, error) {
 	attempts := len(active.keys)
 	if attempts < 1 {
 		attempts = 1
@@ -892,21 +929,38 @@ func (h *Handler) callUpstream(active *activeProvider, req AnthropicRequest, bod
 	for i := 0; i < attempts; i++ {
 		key, idx, ok := active.pickKey()
 		if !ok {
-			return nil, errProviderExhausted
+			return nil, nil, errProviderExhausted
 		}
+		start := time.Now()
 		resp, err = h.callUpstreamOnce(active, req, body, origHeaders, key)
 		if err != nil {
-			return resp, err
+			if !errors.Is(err, errLocalPrep) {
+				h.recordUsageEvent(active, req, req.Stream, 0, &attemptInfo{
+					keyIdx: idx, chainPos: chainPos, started: start,
+					errText: "transport: " + err.Error(),
+				}, rawUsage{})
+			}
+			return resp, nil, err
 		}
 		if resp.StatusCode == http.StatusTooManyRequests && i < attempts-1 {
+			// This 429 never reaches the client — record it before the body
+			// closes, transcribing the rate-limit headers it carried.
+			att := &attemptInfo{
+				keyIdx: idx, chainPos: chainPos, started: start,
+				quota: captureQuota(resp.Header), reqID: extractRequestID(resp.Header),
+			}
 			h.coolKey(active, active.impl.Name(), idx, initialKeyBackoff)
 			resp.Body.Close()
+			h.recordUsageEvent(active, req, req.Stream, resp.StatusCode, att, rawUsage{})
 			log.Warn().Str("provider", active.impl.Name()).Msg("key rate-limited (429), rotating to next key")
 			continue
 		}
-		return resp, err
+		return resp, &attemptInfo{
+			keyIdx: idx, chainPos: chainPos, started: start,
+			quota: captureQuota(resp.Header), reqID: extractRequestID(resp.Header),
+		}, nil
 	}
-	return resp, err
+	return resp, nil, err
 }
 
 // mappedModel resolves the provider-facing model id for logging/dashboard
@@ -938,7 +992,7 @@ func (h *Handler) callUpstreamOnce(active *activeProvider, req AnthropicRequest,
 		}
 		oaiReq, err := TransformToOpenAI(req, targetModel)
 		if err != nil {
-			return nil, fmt.Errorf("request transform failed: %w", err)
+			return nil, fmt.Errorf("%w: request transform failed: %v", errLocalPrep, err)
 		}
 		oaiReq.Stream = req.Stream // stream upstream when the client streams
 		if req.Stream {
@@ -946,11 +1000,11 @@ func (h *Handler) callUpstreamOnce(active *activeProvider, req AnthropicRequest,
 		}
 		payload, err := json.Marshal(oaiReq)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("%w: %v", errLocalPrep, err)
 		}
 		httpReq, err := http.NewRequest("POST", active.impl.ChatCompletionsURL(), bytes.NewReader(payload))
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("%w: %v", errLocalPrep, err)
 		}
 		httpReq.Header.Set("Content-Type", "application/json")
 		h.authorize(active, httpReq, payload, key)
@@ -966,7 +1020,7 @@ func (h *Handler) callUpstreamOnce(active *activeProvider, req AnthropicRequest,
 	}
 	httpReq, err := http.NewRequest("POST", url, bytes.NewReader(sendBody))
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w: %v", errLocalPrep, err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	if _, ok := active.impl.(providers.Authorizer); ok {
@@ -1000,21 +1054,21 @@ func (h *Handler) authorize(active *activeProvider, req *http.Request, body []by
 // client's (or the server env's) key, exactly like Sprint 1.
 func (h *Handler) forwardDirectAnthropic(w http.ResponseWriter, r *http.Request, req AnthropicRequest, body []byte, startTime time.Time, complexity router.Complexity) {
 	active := &activeProvider{impl: providers.NewAnthropic(""), apiKey: ""}
-	resp, err := h.callUpstream(active, req, body, r.Header)
+	resp, att, err := h.callUpstream(active, req, body, r.Header, 1)
 	if err != nil {
 		log.Error().Err(err).Msg("Provider request failed")
 		h.writeError(w, http.StatusBadGateway, fmt.Sprintf("provider error: %v", err))
 		return
 	}
 	if req.Stream {
-		h.relayAnthropicStream(w, r, active, req, resp, startTime, complexity)
+		h.relayAnthropicStream(w, r, active, req, resp, startTime, complexity, att)
 	} else {
-		h.relayAnthropicSync(w, active, req, resp, startTime, complexity)
+		h.relayAnthropicSync(w, active, req, resp, startTime, complexity, att)
 	}
 }
 
 // relayAnthropicSync relays a non-streaming native-Anthropic response.
-func (h *Handler) relayAnthropicSync(w http.ResponseWriter, active *activeProvider, req AnthropicRequest, resp *http.Response, startTime time.Time, complexity router.Complexity) {
+func (h *Handler) relayAnthropicSync(w http.ResponseWriter, active *activeProvider, req AnthropicRequest, resp *http.Response, startTime time.Time, complexity router.Complexity, att *attemptInfo) {
 	defer resp.Body.Close()
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -1030,8 +1084,9 @@ func (h *Handler) relayAnthropicSync(w http.ResponseWriter, active *activeProvid
 		log.Warn().Err(err).Msg("Failed to write response to client")
 	}
 
-	u := anthropicUsageFull(respBody)
-	h.logResult(active, req, complexity, u, respBody, resp.StatusCode, time.Since(startTime), false)
+	raw := anthropicRawUsage(respBody)
+	u := raw.anthropicTokens()
+	h.logResult(active, req, complexity, u, respBody, resp.StatusCode, time.Since(startTime), false, att, raw)
 	log.Info().
 		Str("provider", active.impl.Name()).
 		Int("status", resp.StatusCode).
@@ -1044,7 +1099,7 @@ func (h *Handler) relayAnthropicSync(w http.ResponseWriter, active *activeProvid
 // relayAnthropicBuffered handles Anthropic-format providers that return a full
 // (non-streaming) body — Bedrock/Vertex. It relays the JSON, or synthesizes the
 // Anthropic SSE sequence when the client asked to stream.
-func (h *Handler) relayAnthropicBuffered(w http.ResponseWriter, active *activeProvider, req AnthropicRequest, resp *http.Response, startTime time.Time, complexity router.Complexity) {
+func (h *Handler) relayAnthropicBuffered(w http.ResponseWriter, active *activeProvider, req AnthropicRequest, resp *http.Response, startTime time.Time, complexity router.Complexity, att *attemptInfo) {
 	defer resp.Body.Close()
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -1052,17 +1107,18 @@ func (h *Handler) relayAnthropicBuffered(w http.ResponseWriter, active *activePr
 		return
 	}
 
+	raw := anthropicRawUsage(respBody)
 	if resp.StatusCode >= 400 {
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("X-Nexus-Provider", active.impl.Name())
 		w.WriteHeader(resp.StatusCode)
 		_, _ = w.Write(respBody)
-		h.logResult(active, req, complexity, tokenUsage{}, respBody, resp.StatusCode, time.Since(startTime), req.Stream)
+		h.logResult(active, req, complexity, tokenUsage{}, respBody, resp.StatusCode, time.Since(startTime), req.Stream, att, raw)
 		log.Warn().Str("provider", active.impl.Name()).Int("status", resp.StatusCode).Msg("Provider returned error")
 		return
 	}
 
-	u := anthropicUsageFull(respBody)
+	u := raw.anthropicTokens()
 	if req.Stream {
 		var ar AnthropicResponse
 		if json.Unmarshal(respBody, &ar) == nil && len(ar.Content) > 0 {
@@ -1084,7 +1140,7 @@ func (h *Handler) relayAnthropicBuffered(w http.ResponseWriter, active *activePr
 		_, _ = w.Write(respBody)
 	}
 
-	h.logResult(active, req, complexity, u, respBody, http.StatusOK, time.Since(startTime), req.Stream)
+	h.logResult(active, req, complexity, u, respBody, http.StatusOK, time.Since(startTime), req.Stream, att, raw)
 	log.Info().
 		Str("provider", active.impl.Name()).
 		Int("in", u.In).Int("out", u.Out).
@@ -1111,7 +1167,10 @@ func resolveAnthropicKeyFor(configured string, origHeaders http.Header) string {
 
 // logResult records a completed request to storage and pushes live events.
 // respBody is the upstream response (used only for --inspect capture; may be nil).
-func (h *Handler) logResult(active *activeProvider, req AnthropicRequest, complexity router.Complexity, u tokenUsage, respBody []byte, status int, latency time.Duration, stream bool) {
+// att is the winning upstream attempt's metadata (chain position, key slot,
+// quota headers); raw is the presence-preserving usage report of that same
+// response. Together they produce the immutable usage event.
+func (h *Handler) logResult(active *activeProvider, req AnthropicRequest, complexity router.Complexity, u tokenUsage, respBody []byte, status int, latency time.Duration, stream bool, att *attemptInfo, raw rawUsage) {
 	now := time.Now()
 	pricing := active.impl.Pricing()
 	cost := pricing.CalculateCostFullAt(u.In, u.Out, u.CacheRead, u.CacheWrite, now) // off-peak-aware
@@ -1168,6 +1227,54 @@ func (h *Handler) logResult(active *activeProvider, req AnthropicRequest, comple
 			Timestamp:     now.Format(time.RFC3339),
 		})
 		h.publishStats()
+	}
+
+	h.recordUsageEvent(active, req, stream, status, att, raw)
+}
+
+// recordUsageEvent persists one immutable per-attempt usage event. Called from
+// logResult for attempts the client saw, and directly from discard sites
+// (callUpstream's key rotation and transport errors, the retry/failover drops,
+// cascade escalation, cooldown probes) for attempts it didn't. att == nil
+// (defensive) or no DB configured means no event — never a panic.
+func (h *Handler) recordUsageEvent(active *activeProvider, req AnthropicRequest, stream bool, status int, att *attemptInfo, raw rawUsage) {
+	if h.db == nil || att == nil {
+		return
+	}
+	ev := &storage.UsageEvent{
+		CreatedAt:        time.Now(),
+		Provider:         active.impl.Name(),
+		ModelUsed:        h.mappedModel(active, req.Model),
+		ModelAsked:       req.Model,
+		RequestID:        att.reqID,
+		Attempt:          att.chainPos,
+		Status:           status,
+		Success:          status > 0 && status < 400,
+		Stream:           stream,
+		UsagePartial:     att.partial,
+		DurationMS:       time.Since(att.started).Milliseconds(),
+		RateLimited:      status == http.StatusTooManyRequests,
+		RetryAfter:       att.quota.RetryAfter,
+		RetryResetAt:     att.quota.RetryResetAt,
+		QuotaDimension:   att.quota.Dimension,
+		QuotaUtilization: att.quota.Utilization,
+		QuotaResetAt:     att.quota.ResetAt,
+		QuotaMeta:        att.quota.Meta,
+		Error:            att.errText,
+		Probe:            att.probe,
+	}
+	if att.keyIdx >= 0 {
+		i := att.keyIdx
+		ev.KeyIndex = &i
+	}
+	// raw pointer fields pass straight through: nil = not reported
+	ev.In = raw.In
+	ev.Out = raw.Out
+	ev.CacheRead = raw.CacheRead
+	ev.CacheWrite = raw.CacheWrite
+	ev.Reasoning = raw.Reasoning
+	if _, err := h.db.RecordUsageEvent(ev); err != nil {
+		log.Warn().Err(err).Msg("Failed to record usage event")
 	}
 }
 

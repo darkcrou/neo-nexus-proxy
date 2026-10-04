@@ -122,36 +122,38 @@ func (h *Handler) HandleChatCompletions(w http.ResponseWriter, r *http.Request) 
 
 		if providers.IsOpenAICompatible(active.impl.Name()) {
 			// High-fidelity pass-through: forward the original OpenAI body (model swapped).
-			resp, err := h.callOpenAIPassthrough(active, rawMap, oreq.Stream)
+			resp, att, err := h.callOpenAIPassthrough(active, rawMap, oreq.Stream, i+1)
 			if err != nil {
 				log.Warn().Str("provider", cand.Name).Err(err).Msg("Provider unreachable, trying next")
 				continue
 			}
 			if isRetryableStatus(resp.StatusCode) && i < len(chain)-1 {
+				h.recordUsageEvent(active, areq, oreq.Stream, resp.StatusCode, att, rawUsage{})
 				resp.Body.Close()
 				log.Warn().Str("provider", cand.Name).Int("status", resp.StatusCode).Msg("Retryable error, failing over")
 				continue
 			}
 			if oreq.Stream {
-				h.relayOpenAIPassthroughStream(w, active, areq, resp, startTime, complexity)
+				h.relayOpenAIPassthroughStream(w, active, areq, resp, startTime, complexity, att)
 			} else {
-				h.relayOpenAIPassthrough(w, active, areq, resp, startTime, complexity)
+				h.relayOpenAIPassthrough(w, active, areq, resp, startTime, complexity, att)
 			}
 			return
 		}
 
 		// Anthropic-format provider: convert OpenAI → Anthropic, then back to OpenAI.
 		abody, _ := json.Marshal(areq)
-		resp, err := h.callUpstream(active, areq, abody, r.Header)
+		resp, att, err := h.callUpstream(active, areq, abody, r.Header, i+1)
 		if err != nil {
 			log.Warn().Str("provider", cand.Name).Err(err).Msg("Provider unreachable, trying next")
 			continue
 		}
 		if isRetryableStatus(resp.StatusCode) && i < len(chain)-1 {
+			h.recordUsageEvent(active, areq, oreq.Stream, resp.StatusCode, att, rawUsage{})
 			resp.Body.Close()
 			continue
 		}
-		h.relayAnthropicToOpenAI(w, active, areq, oreq, resp, startTime, complexity)
+		h.relayAnthropicToOpenAI(w, active, areq, oreq, resp, startTime, complexity, att)
 		return
 	}
 	h.writeOpenAIError(w, http.StatusBadGateway, "all providers unreachable")
@@ -170,11 +172,12 @@ func (h *Handler) HandleModels(w http.ResponseWriter, r *http.Request) {
 
 // ─── upstream call (OpenAI pass-through) ────────────────────────────────────
 
-func (h *Handler) callOpenAIPassthrough(active *activeProvider, rawMap map[string]interface{}, stream bool) (*http.Response, error) {
-	key, _, ok := active.pickKey()
+func (h *Handler) callOpenAIPassthrough(active *activeProvider, rawMap map[string]interface{}, stream bool, chainPos int) (*http.Response, *attemptInfo, error) {
+	key, idx, ok := active.pickKey()
 	if !ok {
-		return nil, errProviderExhausted
+		return nil, nil, errProviderExhausted
 	}
+	start := time.Now()
 	m := make(map[string]interface{}, len(rawMap)+2)
 	for k, v := range rawMap {
 		m[k] = v
@@ -189,20 +192,34 @@ func (h *Handler) callOpenAIPassthrough(active *activeProvider, rawMap map[strin
 	}
 	payload, err := json.Marshal(m)
 	if err != nil {
-		return nil, err
+		return nil, nil, fmt.Errorf("%w: %v", errLocalPrep, err)
 	}
 	req, err := http.NewRequest("POST", active.impl.ChatCompletionsURL(), bytes.NewReader(payload))
 	if err != nil {
-		return nil, err
+		return nil, nil, fmt.Errorf("%w: %v", errLocalPrep, err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	h.authorize(active, req, payload, key)
-	return h.httpClient.Do(req)
+	resp, err := h.httpClient.Do(req)
+	if err != nil {
+		// the raw OpenAI request has no AnthropicRequest equivalent here; the
+		// event still names the provider and chain position, which is what
+		// discard-site analysis needs — model_asked/model_used stay empty
+		h.recordUsageEvent(active, AnthropicRequest{}, stream, 0, &attemptInfo{
+			keyIdx: idx, chainPos: chainPos, started: start,
+			errText: "transport: " + err.Error(),
+		}, rawUsage{})
+		return nil, nil, err
+	}
+	return resp, &attemptInfo{
+		keyIdx: idx, chainPos: chainPos, started: start,
+		quota: captureQuota(resp.Header), reqID: extractRequestID(resp.Header),
+	}, nil
 }
 
 // ─── relays (OpenAI out) ────────────────────────────────────────────────────
 
-func (h *Handler) relayOpenAIPassthrough(w http.ResponseWriter, active *activeProvider, areq AnthropicRequest, resp *http.Response, startTime time.Time, complexity router.Complexity) {
+func (h *Handler) relayOpenAIPassthrough(w http.ResponseWriter, active *activeProvider, areq AnthropicRequest, resp *http.Response, startTime time.Time, complexity router.Complexity, att *attemptInfo) {
 	defer resp.Body.Close()
 	respBody, _ := io.ReadAll(resp.Body)
 	copyResponseHeaders(w.Header(), resp.Header)
@@ -211,13 +228,14 @@ func (h *Handler) relayOpenAIPassthrough(w http.ResponseWriter, active *activePr
 	w.WriteHeader(resp.StatusCode)
 	_, _ = w.Write(respBody)
 
-	u := openAIUsageFull(respBody)
-	h.logResult(active, areq, complexity, u, respBody, resp.StatusCode, time.Since(startTime), false)
+	raw := openAIRawUsage(respBody)
+	u := raw.openAITokens()
+	h.logResult(active, areq, complexity, u, respBody, resp.StatusCode, time.Since(startTime), false, att, raw)
 	log.Info().Str("provider", active.impl.Name()).Int("status", resp.StatusCode).
 		Int("in", u.In).Int("out", u.Out).Int("cache_read", u.CacheRead).Str("complexity", complexity.String()).Msg("Request completed (gateway)")
 }
 
-func (h *Handler) relayOpenAIPassthroughStream(w http.ResponseWriter, active *activeProvider, areq AnthropicRequest, resp *http.Response, startTime time.Time, complexity router.Complexity) {
+func (h *Handler) relayOpenAIPassthroughStream(w http.ResponseWriter, active *activeProvider, areq AnthropicRequest, resp *http.Response, startTime time.Time, complexity router.Complexity, att *attemptInfo) {
 	defer resp.Body.Close()
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -249,21 +267,23 @@ func (h *Handler) relayOpenAIPassthroughStream(w http.ResponseWriter, active *ac
 			break
 		}
 	}
-	u := openAIUsageFull(captured.Bytes())
-	h.logResult(active, areq, complexity, u, captured.Bytes(), resp.StatusCode, time.Since(startTime), true)
+	raw := openAIRawUsage(captured.Bytes())
+	u := raw.openAITokens()
+	h.logResult(active, areq, complexity, u, captured.Bytes(), resp.StatusCode, time.Since(startTime), true, att, raw)
 	log.Info().Str("provider", active.impl.Name()).Int("in", u.In).Int("out", u.Out).Int("cache_read", u.CacheRead).Bool("stream", true).Msg("Stream completed (gateway)")
 }
 
 // relayAnthropicToOpenAI converts an Anthropic provider response into OpenAI format.
-func (h *Handler) relayAnthropicToOpenAI(w http.ResponseWriter, active *activeProvider, areq AnthropicRequest, oreq OpenAIRequest, resp *http.Response, startTime time.Time, complexity router.Complexity) {
+func (h *Handler) relayAnthropicToOpenAI(w http.ResponseWriter, active *activeProvider, areq AnthropicRequest, oreq OpenAIRequest, resp *http.Response, startTime time.Time, complexity router.Complexity, att *attemptInfo) {
 	defer resp.Body.Close()
 	respBody, _ := io.ReadAll(resp.Body)
+	raw := anthropicRawUsage(respBody)
 	if resp.StatusCode >= 400 {
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("X-Nexus-Provider", active.impl.Name())
 		w.WriteHeader(resp.StatusCode)
 		_, _ = w.Write(respBody)
-		h.logResult(active, areq, complexity, tokenUsage{}, respBody, resp.StatusCode, time.Since(startTime), oreq.Stream)
+		h.logResult(active, areq, complexity, tokenUsage{}, respBody, resp.StatusCode, time.Since(startTime), oreq.Stream, att, raw)
 		return
 	}
 	var ar AnthropicResponse
@@ -284,7 +304,7 @@ func (h *Handler) relayAnthropicToOpenAI(w http.ResponseWriter, active *activePr
 		w.WriteHeader(http.StatusOK)
 		_ = json.NewEncoder(w).Encode(oaiResp)
 	}
-	h.logResult(active, areq, complexity, u, respBody, http.StatusOK, time.Since(startTime), oreq.Stream)
+	h.logResult(active, areq, complexity, u, respBody, http.StatusOK, time.Since(startTime), oreq.Stream, att, raw)
 	log.Info().Str("provider", active.impl.Name()).Int("in", u.In).Int("out", u.Out).Bool("stream", oreq.Stream).Msg("Request completed (gateway→anthropic)")
 }
 

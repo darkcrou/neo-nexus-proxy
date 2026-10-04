@@ -34,10 +34,10 @@ Probe requests recorded with `probe=1`.
 
 | #  | ID | Title                                   | Severity | Status | Group        | Verification |
 |----|----|-----------------------------------------|----------|--------|--------------|--------------|
-| 1  | U1 | usage_events schema + record/fetch      | Critical | pending | Storage      | storage tests + migration test |
-| 2  | U2 | window derivation + aggregations        | Critical | pending | Storage      | segmentation tests |
-| 3  | U3 | presence-aware parsing + header capture | Critical | pending | Extraction   | parser unit tests |
-| 4  | U4 | recording hooks in proxy hot path      | Critical | pending | Extraction   | handler/stream/gateway tests |
+| 1  | U1 | usage_events schema + record/fetch      | Critical | done    | Storage      | storage tests + migration test |
+| 2  | U2 | window derivation + aggregations        | Critical | done    | Storage      | segmentation tests |
+| 3  | U3 | presence-aware parsing + header capture | Critical | done   | Extraction   | parser unit tests |
+| 4  | U4 | recording hooks in proxy hot path      | Critical | done   | Extraction   | handler/stream/gateway tests |
 | 5  | U5 | aborted-stream handling + marked rows   | High     | pending | Grouped: Relays | abort tests |
 | 6  | U6 | dashboard API endpoints                 | High     | pending | API          | dashboard tests |
 | 7  | U7 | dashboard UI panel + rebuild embed      | Medium   | pending | UI (delegate) | build + embed + visual check |
