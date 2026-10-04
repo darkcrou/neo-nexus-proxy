@@ -942,8 +942,8 @@ func (h *Handler) callUpstream(active *activeProvider, req AnthropicRequest, bod
 // records and for the OpenAI-compatible gateway's raw pass-through path:
 // under StrategyDirect the client's requested model is returned verbatim
 // (bypassing ModelMap); otherwise it's the provider's ordinary MapModel
-// result. It deliberately does NOT apply a vision_model override — that
-// stays local to callUpstreamOnce below, the one call site that needs it.
+// result. It deliberately does NOT apply a vision_model override — use
+// upstreamModel for the model id that is actually sent upstream.
 func (h *Handler) mappedModel(active *activeProvider, requestedModel string) string {
 	if h.directModel {
 		return requestedModel
@@ -951,21 +951,34 @@ func (h *Handler) mappedModel(active *activeProvider, requestedModel string) str
 	return active.impl.MapModel(requestedModel)
 }
 
+// upstreamModel is the single source of truth for the model id an
+// OpenAI-compatible provider is addressed with, shared by the /v1/messages
+// path (callUpstreamOnce), the /v1/chat/completions pass-through, and every
+// log/usage record, so the recorded model_used always names the model that
+// was really sent. Order: StrategyDirect returns the requested id verbatim
+// (no model_map, no vision_model, images or not); otherwise an image-bearing
+// request uses the provider's operator-configured vision_model when set;
+// otherwise the ordinary mapped model. The vision override only applies to
+// OpenAI-compatible providers — the Anthropic-native paths forward the model
+// id unchanged and never consult vision_model.
+func (h *Handler) upstreamModel(active *activeProvider, requestedModel string, images bool) string {
+	if h.directModel {
+		return requestedModel
+	}
+	if images && providers.IsOpenAICompatible(active.impl.Name()) {
+		if vc, ok := active.impl.(providers.VisionCapable); ok {
+			if vm := vc.VisionModel(requestedModel); vm != "" {
+				return vm
+			}
+		}
+	}
+	return h.mappedModel(active, requestedModel)
+}
+
 // callUpstreamOnce performs a single upstream request with a specific API key.
 func (h *Handler) callUpstreamOnce(active *activeProvider, req AnthropicRequest, body []byte, origHeaders http.Header, key string) (*http.Response, error) {
 	if providers.IsOpenAICompatible(active.impl.Name()) {
-		targetModel := req.Model
-		if !h.directModel {
-			targetModel = h.mappedModel(active, req.Model)
-			if req.nexusImages {
-				if vc, ok := active.impl.(providers.VisionCapable); ok {
-					if vm := vc.VisionModel(req.Model); vm != "" {
-						targetModel = vm
-					}
-				}
-			}
-		}
-		oaiReq, err := TransformToOpenAI(req, targetModel)
+		oaiReq, err := TransformToOpenAI(req, h.upstreamModel(active, req.Model, req.nexusImages))
 		if err != nil {
 			return nil, fmt.Errorf("%w: request transform failed: %v", errLocalPrep, err)
 		}
@@ -1175,7 +1188,7 @@ func (h *Handler) logResult(active *activeProvider, req AnthropicRequest, comple
 	rec := &storage.Request{
 		CreatedAt:        now,
 		ModelAsked:       req.Model,
-		ModelUsed:        h.mappedModel(active, req.Model),
+		ModelUsed:        h.upstreamModel(active, req.Model, req.nexusImages),
 		Provider:         active.impl.Name(),
 		Complexity:       complexity.String(),
 		InputTokens:      u.In,
@@ -1245,7 +1258,7 @@ func (h *Handler) recordUsageEvent(active *activeProvider, req AnthropicRequest,
 	ev := &storage.UsageEvent{
 		CreatedAt:        time.Now(),
 		Provider:         active.impl.Name(),
-		ModelUsed:        h.mappedModel(active, req.Model),
+		ModelUsed:        h.upstreamModel(active, req.Model, req.nexusImages),
 		ModelAsked:       req.Model,
 		RequestID:        att.reqID,
 		Attempt:          att.chainPos,

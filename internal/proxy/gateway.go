@@ -99,6 +99,9 @@ func (h *Handler) HandleChatCompletions(w http.ResponseWriter, r *http.Request) 
 	areq := TransformOpenAIToAnthropic(oreq) // internal form for Anthropic providers + logging
 	areq.nexusUser = user
 	areq.nexusRedacted = len(restoreMap)
+	// images drive the vision_model override and the model_used attribution
+	// (same signal /v1/messages derives in HandleMessages)
+	areq.nexusImages = messagesHaveImage(rawMsgs.Messages)
 
 	log.Debug().Str("model", oreq.Model).Str("complexity", complexity.String()).
 		Bool("stream", oreq.Stream).Bool("tools", hasTools).Msg("Incoming request (openai gateway)")
@@ -122,7 +125,7 @@ func (h *Handler) HandleChatCompletions(w http.ResponseWriter, r *http.Request) 
 
 		if providers.IsOpenAICompatible(active.impl.Name()) {
 			// High-fidelity pass-through: forward the original OpenAI body (model swapped).
-			resp, att, err := h.callOpenAIPassthrough(active, rawMap, oreq.Stream, i+1)
+			resp, att, err := h.callOpenAIPassthrough(active, rawMap, oreq.Stream, areq.nexusImages, i+1)
 			if err != nil {
 				log.Warn().Str("provider", cand.Name).Err(err).Msg("Provider unreachable, trying next")
 				continue
@@ -172,7 +175,7 @@ func (h *Handler) HandleModels(w http.ResponseWriter, r *http.Request) {
 
 // ─── upstream call (OpenAI pass-through) ────────────────────────────────────
 
-func (h *Handler) callOpenAIPassthrough(active *activeProvider, rawMap map[string]interface{}, stream bool, chainPos int) (*http.Response, *attemptInfo, error) {
+func (h *Handler) callOpenAIPassthrough(active *activeProvider, rawMap map[string]interface{}, stream, images bool, chainPos int) (*http.Response, *attemptInfo, error) {
 	key, idx, ok := active.pickKey()
 	if !ok {
 		return nil, nil, errProviderExhausted
@@ -183,7 +186,7 @@ func (h *Handler) callOpenAIPassthrough(active *activeProvider, rawMap map[strin
 		m[k] = v
 	}
 	inModel, _ := rawMap["model"].(string)
-	m["model"] = h.mappedModel(active, inModel)
+	m["model"] = h.upstreamModel(active, inModel, images)
 	m["stream"] = stream
 	if stream {
 		m["stream_options"] = map[string]interface{}{"include_usage": true}
@@ -204,8 +207,9 @@ func (h *Handler) callOpenAIPassthrough(active *activeProvider, rawMap map[strin
 	if err != nil {
 		// inModel is in scope; keeping model attribution on the event makes
 		// discard-site analysis consistent with every other recording site
-		// (recordUsageEvent derives model_used from mappedModel itself)
-		h.recordUsageEvent(active, AnthropicRequest{Model: inModel}, stream, 0, &attemptInfo{
+		// (recordUsageEvent derives model_used from upstreamModel itself, so
+		// the image flag must travel with the request)
+		h.recordUsageEvent(active, AnthropicRequest{Model: inModel, nexusImages: images}, stream, 0, &attemptInfo{
 			keyIdx: idx, chainPos: chainPos, started: start,
 			errText: "transport: " + err.Error(),
 		}, rawUsage{})

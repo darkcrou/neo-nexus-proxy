@@ -61,7 +61,7 @@ func (h *Handler) relayOpenAI(w http.ResponseWriter, active *activeProvider, req
 	h.logResult(active, req, complexity, u, respBody, http.StatusOK, time.Since(startTime), req.Stream, att, raw)
 	log.Info().
 		Str("provider", active.impl.Name()).
-		Str("model_used", h.mappedModel(active, req.Model)).
+		Str("model_used", h.upstreamModel(active, req.Model, req.nexusImages)).
 		Int("in", u.In).
 		Int("out", u.Out).
 		Int("cache_read", u.CacheRead).
