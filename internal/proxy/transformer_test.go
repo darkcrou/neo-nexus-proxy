@@ -16,7 +16,17 @@ func TestOpenAIContent_UnmarshalJSON(t *testing.T) {
 		{name: "plain string", json: `"hello"`, want: "hello"},
 		{name: "single text part", json: `[{"type":"text","text":"hi"}]`, want: "hi"},
 		{name: "multiple text parts join in order", json: `[{"type":"text","text":"a"},{"type":"text","text":"b"}]`, want: "ab"},
-		{name: "unsupported part type is rejected", json: `[{"type":"image_url","image_url":{"url":"x"}}]`, wantErr: "image_url"},
+		{name: "unsupported part type is rejected", json: `[{"type":"input_audio","input_audio":{"data":"x","format":"wav"}}]`, wantErr: `supported: "text", "image_url"`},
+		{name: "unsupported part type names the type", json: `[{"type":"input_audio"}]`, wantErr: "input_audio"},
+		{name: "image data uri accepted", json: `[{"type":"text","text":"a"},{"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0KGgo="}}]`, want: "a"},
+		{name: "image https url accepted", json: `[{"type":"image_url","image_url":{"url":"https://example.com/a.png"}}]`, want: ""},
+		{name: "image http url accepted", json: `[{"type":"image_url","image_url":{"url":"http://example.com/a.png"}}]`, want: ""},
+		{name: "image ftp url rejected", json: `[{"type":"image_url","image_url":{"url":"ftp://example.com/a.png"}}]`, wantErr: "invalid url"},
+		{name: "image non-base64 data uri rejected", json: `[{"type":"image_url","image_url":{"url":"data:text/plain,abc"}}]`, wantErr: "invalid url"},
+		{name: "image data uri with empty payload rejected", json: `[{"type":"image_url","image_url":{"url":"data:image/png;base64,"}}]`, wantErr: "invalid url"},
+		{name: "image data uri without mime rejected", json: `[{"type":"image_url","image_url":{"url":"data:;base64,AAAA"}}]`, wantErr: "invalid url"},
+		{name: "image empty url rejected", json: `[{"type":"image_url","image_url":{"url":""}}]`, wantErr: "invalid url"},
+		{name: "image part missing image_url object rejected", json: `[{"type":"image_url"}]`, wantErr: "invalid url"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -236,5 +246,78 @@ func TestMapStopReason(t *testing.T) {
 		if got := mapStopReason(in); got != want {
 			t.Errorf("mapStopReason(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+func TestOpenAIContent_ImageDetailPreserved(t *testing.T) {
+	var c OpenAIContent
+	in := `[{"type":"image_url","image_url":{"url":"https://example.com/a.png","detail":"high"}}]`
+	if err := json.Unmarshal([]byte(in), &c); err != nil {
+		t.Fatal(err)
+	}
+	if c.parts[0].ImageURL.Detail != "high" {
+		t.Errorf("detail = %q, want high", c.parts[0].ImageURL.Detail)
+	}
+	out, err := json.Marshal(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(out), `"detail":"high"`) {
+		t.Errorf("marshaled content lost detail: %s", out)
+	}
+}
+
+func TestOpenAIContent_Anthropic_ImageBlocksInOrder(t *testing.T) {
+	var c OpenAIContent
+	in := `[{"type":"text","text":"look"},
+		{"type":"image_url","image_url":{"url":"data:image/jpeg;base64,/9j/4AAQ"}},
+		{"type":"image_url","image_url":{"url":"https://example.com/b.png"}}]`
+	if err := json.Unmarshal([]byte(in), &c); err != nil {
+		t.Fatal(err)
+	}
+	blocks, ok := c.Anthropic().([]map[string]interface{})
+	if !ok || len(blocks) != 3 {
+		t.Fatalf("Anthropic() = %#v, want 3 blocks", c.Anthropic())
+	}
+	if blocks[0]["type"] != "text" || blocks[0]["text"] != "look" {
+		t.Errorf("block[0] = %+v", blocks[0])
+	}
+	src1, _ := blocks[1]["source"].(map[string]interface{})
+	if blocks[1]["type"] != "image" || src1["type"] != "base64" || src1["media_type"] != "image/jpeg" || src1["data"] != "/9j/4AAQ" {
+		t.Errorf("block[1] = %+v", blocks[1])
+	}
+	src2, _ := blocks[2]["source"].(map[string]interface{})
+	if blocks[2]["type"] != "image" || src2["type"] != "url" || src2["url"] != "https://example.com/b.png" {
+		t.Errorf("block[2] = %+v", blocks[2])
+	}
+}
+
+func TestOpenAIContent_MarshalKeepsImages(t *testing.T) {
+	var c OpenAIContent
+	in := `[{"type":"text","text":"x"},{"type":"image_url","image_url":{"url":"https://example.com/a.png"}}]`
+	if err := json.Unmarshal([]byte(in), &c); err != nil {
+		t.Fatal(err)
+	}
+	out, err := json.Marshal(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(string(out), "[") || !strings.Contains(string(out), `"image_url":{"url":"https://example.com/a.png"}`) {
+		t.Errorf("images lost on marshal: %s", out)
+	}
+}
+
+func TestOpenAIContent_MarshalTextOnlyUnchanged(t *testing.T) {
+	var c OpenAIContent
+	if err := json.Unmarshal([]byte(`[{"type":"text","text":"a"},{"type":"text","text":"b"}]`), &c); err != nil {
+		t.Fatal(err)
+	}
+	out, _ := json.Marshal(c)
+	if string(out) != `"ab"` {
+		t.Errorf("text-only content marshal = %s, want \"ab\"", out)
+	}
+	out, _ = json.Marshal(textContent("hi"))
+	if string(out) != `"hi"` {
+		t.Errorf("textContent marshal = %s", out)
 	}
 }

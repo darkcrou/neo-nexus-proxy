@@ -277,9 +277,10 @@ type OpenAIMessage struct {
 }
 
 // OpenAIContent represents the OpenAI "content" field, which per spec is either a
-// plain string or an array of content parts. NEXUS only supports the "text" part
-// type — any other part type (image_url, input_audio, ...) is rejected during
-// unmarshal rather than silently dropped.
+// plain string or an array of content parts. NEXUS supports the "text" and
+// "image_url" part types — any other part type (input_audio, ...) and any
+// malformed image_url part is rejected during unmarshal rather than silently
+// dropped.
 //
 // When the source was an array, the original parts are kept (not just the joined
 // text) so callers that route to an Anthropic-format provider can forward the
@@ -299,7 +300,8 @@ type OpenAIContentPart struct {
 // OpenAIImageURL is the "image_url" part payload for an OpenAI vision content
 // part: {"type":"image_url","image_url":{"url":"..."}}.
 type OpenAIImageURL struct {
-	URL string `json:"url"`
+	URL    string `json:"url"`
+	Detail string `json:"detail,omitempty"`
 }
 
 // textContent builds an OpenAIContent from a Go string, for call sites that
@@ -332,23 +334,62 @@ func (c *OpenAIContent) UnmarshalJSON(data []byte) error {
 	}
 	var sb strings.Builder
 	for _, p := range parts {
-		if p.Type != "text" {
-			return fmt.Errorf("content: unsupported content part type %q (only \"text\" is supported)", p.Type)
+		switch p.Type {
+		case "text":
+			sb.WriteString(p.Text)
+		case "image_url":
+			if p.ImageURL == nil || !validImageURL(p.ImageURL.URL) {
+				return fmt.Errorf("content: image_url part has an invalid url (want an http(s) URL or a base64 data URI)")
+			}
+		default:
+			return fmt.Errorf("content: unsupported content part type %q (supported: \"text\", \"image_url\")", p.Type)
 		}
-		sb.WriteString(p.Text)
 	}
 	c.text = sb.String()
 	c.parts = parts
 	return nil
 }
 
+// validImageURL reports whether u is an http(s) URL or a base64 data URI with a
+// non-empty payload ("data:<mime>;base64,<payload>").
+func validImageURL(u string) bool {
+	if strings.HasPrefix(u, "http://") {
+		return len(u) > len("http://")
+	}
+	if strings.HasPrefix(u, "https://") {
+		return len(u) > len("https://")
+	}
+	_, _, ok := splitDataURI(u)
+	return ok
+}
+
+// splitDataURI splits "data:<mime>;base64,<payload>" into its media type and
+// payload. ok is false unless the mime type and the payload are both non-empty
+// and the URI is base64-encoded.
+func splitDataURI(u string) (mediaType, data string, ok bool) {
+	rest, found := strings.CutPrefix(u, "data:")
+	if !found {
+		return "", "", false
+	}
+	header, payload, found := strings.Cut(rest, ",")
+	if !found || payload == "" {
+		return "", "", false
+	}
+	mediaType, found = strings.CutSuffix(header, ";base64")
+	if !found || mediaType == "" {
+		return "", "", false
+	}
+	return mediaType, payload, true
+}
+
 // MarshalJSON emits the parts array when the value was built via partsContent
-// (asArray), and the flattened string otherwise. OpenAIMessage is only ever
+// (asArray) or contains an image_url part (so images are never silently lost),
+// and the flattened string otherwise. OpenAIMessage is only ever
 // marshaled for the outbound-to-OpenAI-provider direction; a plain string is
 // what NEXUS constructs for text-only content (see convertMessage), and an
 // array of parts for content that includes images.
 func (c OpenAIContent) MarshalJSON() ([]byte, error) {
-	if c.asArray {
+	if c.asArray || hasImagePart(c.parts) {
 		return json.Marshal(c.parts)
 	}
 	return json.Marshal(c.text)
@@ -359,18 +400,41 @@ func (c OpenAIContent) MarshalJSON() ([]byte, error) {
 func (c OpenAIContent) Text() string { return c.text }
 
 // Anthropic returns the value to embed in an Anthropic-format Message.Content
-// field: the original array of text blocks when the source was an array
-// (preserving structure, since Anthropic accepts the same block shape natively),
-// or the plain string otherwise.
+// field: an array of blocks when the source was an array (text parts become text
+// blocks, image_url parts become image blocks, in order), or the plain string
+// otherwise. UnmarshalJSON has already validated every image_url part, so the
+// conversion cannot fail.
 func (c OpenAIContent) Anthropic() interface{} {
 	if c.parts == nil {
 		return c.text
 	}
 	blocks := make([]map[string]interface{}, len(c.parts))
 	for i, p := range c.parts {
+		if p.Type == "image_url" && p.ImageURL != nil {
+			blocks[i] = anthropicImageBlock(p.ImageURL.URL)
+			continue
+		}
 		blocks[i] = map[string]interface{}{"type": "text", "text": p.Text}
 	}
 	return blocks
+}
+
+// anthropicImageBlock converts an (already validated) image URL into an
+// Anthropic image block: a base64 data URI becomes a base64 source, an http(s)
+// URL becomes a url source.
+func anthropicImageBlock(u string) map[string]interface{} {
+	if mediaType, data, ok := splitDataURI(u); ok {
+		return map[string]interface{}{
+			"type": "image",
+			"source": map[string]interface{}{
+				"type": "base64", "media_type": mediaType, "data": data,
+			},
+		}
+	}
+	return map[string]interface{}{
+		"type":   "image",
+		"source": map[string]interface{}{"type": "url", "url": u},
+	}
 }
 
 type OpenAITool struct {
