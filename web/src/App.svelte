@@ -6,7 +6,7 @@
     connected, stats, recentRequests, providers, providerBreakdown, complexityMix, timeseries, savings,
   } from './stores/requests'
   import {
-    fetchUsage, refreshUsage, fetchUsageEvents, usageWindows, usageEvents,
+    fetchUsage, refreshUsage, fetchUsageEvents, usageWindows, usageEvents, usageError,
     type UsageWindow,
   } from './stores/usage'
 
@@ -581,6 +581,9 @@
   </div>
 
   <!-- ══ Usage windows: provider quota burn-down + event drill-down ══ -->
+  {#if $usageError}
+    <div class="panel usage-panel"><div class="uw-noquota">{$usageError}</div></div>
+  {/if}
   {#if $usageWindows.length}
     <div class="panel usage-panel">
       <div class="usage-head">
@@ -638,7 +641,12 @@
                class:active={drillProvider === w.provider}
                title="Show recent usage events for {w.provider}"
                on:click={() => toggleDrill(w.provider)}
-               on:keydown={(e) => e.key === 'Enter' && toggleDrill(w.provider)}>
+               on:keydown={(e) => {
+                 if (e.key === 'Enter' || e.key === ' ') {
+                   e.preventDefault() // Space would otherwise scroll the page
+                   toggleDrill(w.provider)
+                 }
+               }}>
             <span class="uw-r-prov">{w.provider}</span>
             <span class="uw-r-time">{fmtWinTime(w.started_at)} → {w.ended_at ? fmtWinTime(w.ended_at) : 'open'}</span>
             <span class="erc {ercStyle(w)}">{ercLabel(w)}</span>

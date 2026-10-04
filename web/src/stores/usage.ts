@@ -80,6 +80,9 @@ export interface UsageEvent {
 // Stores
 export const usageWindows = writable<UsageWindow[]>([])
 export const usageEvents = writable<UsageEvent[]>([])
+// Set when the last fetchUsage failed, cleared on success, so the panel can
+// say "unavailable" instead of silently staying hidden.
+export const usageError = writable('')
 
 // Load the usage panel data: quota windows for every provider with usage.
 // (The panel reads window.quota for provider-reported utilization; the
@@ -89,7 +92,10 @@ export async function fetchUsage(baseURL = '') {
   try {
     const d = await (await fetch(`${baseURL}/api/usage/windows?limit=20`)).json()
     usageWindows.set((d.windows ?? []) as UsageWindow[])
-  } catch {}
+    usageError.set('')
+  } catch {
+    usageError.set('usage data unavailable — refresh to retry')
+  }
 }
 
 // Re-fetch everything the usage panel shows.
