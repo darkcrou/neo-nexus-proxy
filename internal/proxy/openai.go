@@ -233,32 +233,7 @@ func (h *Handler) relayOpenAIStream(w http.ResponseWriter, r *http.Request, acti
 	// the upstream reported so far, so a disconnect stops consuming upstream
 	// quota without losing the consumption that already happened
 	abort := func(abortText string) {
-		var raw rawUsage
-		var cost tokenUsage
-		if sawUsage {
-			// copy before taking pointers: the clamping below mutates the
-			// cached portion, and aliasing the loop variables would let a
-			// reorder silently desync the event's raw fields from the cost view.
-			in, out, cached, reason := inTok, outTok, cachedTok, reasonTok
-			// clamp the cached portion the same way openAITokens does, so a
-			// malformed upstream reporting cached > prompt can't produce a
-			// negative fresh-input cost.
-			if cached > in {
-				cached = in
-			}
-			raw.In, raw.Out = &in, &out
-			// cached > 0 doubles as the presence flag: the stream chunk struct
-			// carries plain ints, so a reported cached_tokens=0 is
-			// indistinguishable from "not reported" on this one path (the
-			// non-streaming parser preserves the zero).
-			if cached > 0 {
-				raw.CacheRead = &cached
-			}
-			if sawReasoning {
-				raw.Reasoning = &reason
-			}
-			cost = tokenUsage{In: in - cached, Out: out, CacheRead: cached}
-		}
+		raw, cost := oaiStreamUsageView(inTok, outTok, cachedTok, reasonTok, sawUsage, sawReasoning)
 		h.logAbortedStream(active, req, complexity, cost, nil, resp.StatusCode, startTime, att, raw, abortText)
 	}
 
@@ -371,23 +346,7 @@ func (h *Handler) relayOpenAIStream(w http.ResponseWriter, r *http.Request, acti
 	send("message_delta", map[string]interface{}{"type": "message_delta", "delta": map[string]interface{}{"stop_reason": mapStopReason(finish), "stop_sequence": nil}, "usage": map[string]interface{}{"output_tokens": outTok}})
 	send("message_stop", map[string]interface{}{"type": "message_stop"})
 
-	if cachedTok > inTok {
-		cachedTok = inTok
-	}
-	// raw presence mirrors what the stream actually reported: no usage chunk
-	// at all → all nil (never zeros); cache read only when a cache field was
-	// non-zero; reasoning only when a reasoning field was present
-	var raw rawUsage
-	if sawUsage {
-		raw.In, raw.Out = &inTok, &outTok
-		if cachedTok > 0 {
-			raw.CacheRead = &cachedTok
-		}
-		if sawReasoning {
-			raw.Reasoning = &reasonTok
-		}
-	}
-	u := tokenUsage{In: inTok - cachedTok, Out: outTok, CacheRead: cachedTok}
+	raw, u := oaiStreamUsageView(inTok, outTok, cachedTok, reasonTok, sawUsage, sawReasoning)
 	h.logResult(active, req, complexity, u, nil, http.StatusOK, time.Since(startTime), true, att, raw)
 	log.Info().
 		Str("provider", active.impl.Name()).

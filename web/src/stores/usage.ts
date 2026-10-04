@@ -90,11 +90,15 @@ export const usageError = writable('')
 // until a UI needs them.)
 export async function fetchUsage(baseURL = '') {
   try {
-    const d = await (await fetch(`${baseURL}/api/usage/windows?limit=20`)).json()
+    const r = await fetch(`${baseURL}/api/usage/windows?limit=20`)
+    // res.ok check: the API returns 500 on storage errors — a JSON-bodied
+    // failure from a fronting proxy must not be ingested as usage data
+    if (!r.ok) throw new Error(`HTTP ${r.status}`)
+    const d = await r.json()
     usageWindows.set((d.windows ?? []) as UsageWindow[])
     usageError.set('')
-  } catch {
-    usageError.set('usage data unavailable — refresh to retry')
+  } catch (e) {
+    usageError.set(`usage data unavailable (${e instanceof Error ? e.message : 'network error'}) — refresh to retry`)
   }
 }
 
@@ -109,7 +113,9 @@ export async function refreshUsage(baseURL = '') {
 export async function fetchUsageEvents(provider: string, baseURL = ''): Promise<boolean> {
   usageEvents.set([]) // drop any stale events from a previously selected provider
   try {
-    const d = await (await fetch(`${baseURL}/api/usage/events?provider=${encodeURIComponent(provider)}&limit=50`)).json()
+    const r = await fetch(`${baseURL}/api/usage/events?provider=${encodeURIComponent(provider)}&limit=50`)
+    if (!r.ok) throw new Error(`HTTP ${r.status}`)
+    const d = await r.json()
     usageEvents.set((d.events ?? []) as UsageEvent[])
     return true
   } catch {

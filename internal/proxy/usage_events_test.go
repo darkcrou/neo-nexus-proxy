@@ -1105,3 +1105,73 @@ func TestUsageEvent_GatewayTransportError(t *testing.T) {
 		}
 	}
 }
+
+// The abort path's cached-token split: the event keeps the as-reported prompt
+// (raw.In=100) plus the cached portion, recordUsageEvent re-derives fresh
+// input, and the requests row's cost view must match — the raw/cost pair
+// can't drift because both come from oaiStreamUsageView.
+func TestAbort_OpenAIStreamCachedUsage(t *testing.T) {
+	h, db := buildUsageHandler(t, nil)
+	active := &activeProvider{impl: providers.NewGroq("k")}
+	req := AnthropicRequest{Model: "claude-haiku-4-5", Stream: true}
+
+	sse := strings.Join([]string{
+		`data: {"choices":[{"delta":{"content":"Hi"},"finish_reason":null}]}`,
+		`data: {"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":6,"prompt_tokens_details":{"cached_tokens":40}}}`,
+		"",
+	}, "\n")
+	resp := &http.Response{
+		StatusCode: 200, Header: http.Header{},
+		Body: &errAfterBody{data: []byte(sse)},
+	}
+	att := newAnthropicAttempt(resp)
+	rec := httptest.NewRecorder()
+	httpReq := httptest.NewRequest("POST", "/v1/messages", nil)
+
+	h.relayOpenAIStream(rec, httpReq, active, req, resp, time.Now(), router.ComplexitySimple, att)
+
+	evs := requireEvents(t, db, 1)
+	e := evs[0]
+	if !e.UsagePartial || e.Error != "aborted: upstream stream error" {
+		t.Errorf("event partial=%v error=%q", e.UsagePartial, e.Error)
+	}
+	wantIntPtr(t, e.CacheRead, 40, "cache_read")
+	wantIntPtr(t, e.Out, 6, "out")
+	// fresh input: 100 reported − 40 cached, after the OpenAI normalization
+	wantIntPtr(t, e.In, 60, "in")
+	// cost view agrees with the event (fresh input, not the raw prompt)
+	if row := lastRequestRow(t, db); row.InputTokens != 60 || row.CacheReadTokens != 40 {
+		t.Errorf("requests row in=%d cache_read=%d, want 60/40", row.InputTokens, row.CacheReadTokens)
+	}
+}
+
+// A malformed upstream reporting cached > prompt must not produce negative
+// fresh input in either the event or the cost view (the clamp in
+// oaiStreamUsageView, shared by abort and completed-stream paths).
+func TestAbort_OpenAIStreamCachedExceedsPrompt(t *testing.T) {
+	h, db := buildUsageHandler(t, nil)
+	active := &activeProvider{impl: providers.NewGroq("k")}
+	req := AnthropicRequest{Model: "claude-haiku-4-5", Stream: true}
+
+	sse := strings.Join([]string{
+		`data: {"choices":[{"delta":{"content":"Hi"},"finish_reason":null}]}`,
+		`data: {"choices":[],"usage":{"prompt_tokens":30,"completion_tokens":4,"prompt_tokens_details":{"cached_tokens":150}}}`,
+		"",
+	}, "\n")
+	resp := &http.Response{
+		StatusCode: 200, Header: http.Header{},
+		Body: &errAfterBody{data: []byte(sse)},
+	}
+	att := newAnthropicAttempt(resp)
+	rec := httptest.NewRecorder()
+	httpReq := httptest.NewRequest("POST", "/v1/messages", nil)
+
+	h.relayOpenAIStream(rec, httpReq, active, req, resp, time.Now(), router.ComplexitySimple, att)
+
+	e := requireEvents(t, db, 1)[0]
+	wantIntPtr(t, e.In, 0, "in (clamped, never negative)")
+	wantIntPtr(t, e.CacheRead, 30, "cache_read (clamped to prompt)")
+	if row := lastRequestRow(t, db); row.InputTokens != 0 {
+		t.Errorf("requests row in=%d, want 0 (clamped)", row.InputTokens)
+	}
+}

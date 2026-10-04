@@ -77,7 +77,8 @@ func (db *DB) GetRecentRequests(limit int) ([]*Request, error) {
 	rows, err := db.conn.Query(`
 		SELECT id, created_at, request_id, model_asked, model_used,
 			   provider, complexity, input_tokens, output_tokens,
-			   cost_usd, latency_ms, status, error, stream
+			   cache_read_tokens, cache_write_tokens,
+			   cost_usd, cache_saved_usd, latency_ms, status, error, stream
 		FROM requests
 		ORDER BY created_at DESC
 		LIMIT ?`, limit)
@@ -383,7 +384,8 @@ func scanRequests(rows *sql.Rows) ([]*Request, error) {
 		err := rows.Scan(
 			&r.ID, &r.CreatedAt, &r.RequestID, &r.ModelAsked, &r.ModelUsed,
 			&r.Provider, &r.Complexity, &r.InputTokens, &r.OutputTokens,
-			&r.CostUSD, &r.LatencyMS, &r.Status, &r.Error, &r.Stream,
+			&r.CacheReadTokens, &r.CacheWriteTokens,
+			&r.CostUSD, &r.CacheSavedUSD, &r.LatencyMS, &r.Status, &r.Error, &r.Stream,
 		)
 		if err != nil {
 			continue

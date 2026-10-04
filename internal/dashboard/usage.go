@@ -27,6 +27,12 @@ func parsePositiveInt(r *http.Request, key string, fallback int) int {
 // omitted. The current window has ended_at = null / end_reason = "".
 //
 //	GET /api/usage/windows?provider=&window=5h&dimension=5h&limit=20
+//
+// Note the window/dimension coupling: dimension names which quota_reset_at
+// observations close a window (PROVIDER_RESET) and which provider-reported
+// utilization snapshot attaches — it defaults to "5h" regardless of `window`,
+// so querying window=7d without dimension=7d yields 7d-spanning windows with
+// 5h-scoped quota information. Pass them together.
 func (s *Server) handleUsageWindows(w http.ResponseWriter, r *http.Request) {
 	window := 5 * time.Hour
 	if d, err := time.ParseDuration(r.URL.Query().Get("window")); err == nil && d > 0 {

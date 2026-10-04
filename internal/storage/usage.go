@@ -452,7 +452,9 @@ func (w *UsageWindow) finalize() {
 	if w.TotalInputTokens > 0 {
 		w.CacheHitRatio = float64(w.CacheReadTokens) / float64(w.TotalInputTokens)
 	}
-	sort.Slice(w.PerModel, func(i, j int) bool {
+	// stable: models tying on volume keep their first-seen order
+	// (consistent API responses for identical data)
+	sort.SliceStable(w.PerModel, func(i, j int) bool {
 		mi, mj := &w.PerModel[i], &w.PerModel[j]
 		ti := mi.In + mi.CacheRead + mi.CacheWrite + mi.Out
 		tj := mj.In + mj.CacheRead + mj.CacheWrite + mj.Out

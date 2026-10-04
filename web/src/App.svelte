@@ -582,16 +582,20 @@
 
   <!-- ══ Usage windows: provider quota burn-down + event drill-down ══ -->
   {#if $usageError}
-    <!-- standalone: the main panel below is hidden in exactly this state, so
-         the retry affordance must live here or a failed fetch is a dead end -->
     <div class="panel usage-panel">
-      <div class="usage-head">
-        <div class="panel-title">Usage windows</div>
-        <button class="usage-refresh" on:click={refreshUsagePanel} disabled={usageRefreshing}
-                title="Refresh usage data" aria-label="Refresh usage data">
-          {usageRefreshing ? 'refreshing…' : '↻ refresh'}
-        </button>
-      </div>
+      {#if !$usageWindows.length}
+        <!-- failed initial fetch: the main panel below never rendered, so the
+             retry affordance must live here or this state is a dead end -->
+        <div class="usage-head">
+          <div class="panel-title">Usage windows</div>
+          <button class="usage-refresh" on:click={refreshUsagePanel} disabled={usageRefreshing}
+                  title="Refresh usage data" aria-label="Refresh usage data">
+            {usageRefreshing ? 'refreshing…' : '↻ refresh'}
+          </button>
+        </div>
+      {/if}
+      <!-- failed refresh with data loaded: stale windows stay visible below,
+           this banner says the refresh itself failed -->
       <div class="uw-noquota">{$usageError}</div>
     </div>
   {/if}

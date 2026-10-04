@@ -77,6 +77,42 @@ func (r rawUsage) openAITokens() tokenUsage {
 	return tokenUsage{In: in - cached, Out: derefInt(r.Out), CacheRead: cached}
 }
 
+// oaiStreamUsageView builds the (event, cost) usage pair from the counters
+// accumulated while relaying an OpenAI-compatible stream — the one shape of
+// usage the regex parsers can't express, because presence here lives in the
+// saw* flags rather than in pointer fields. Both consumers (the completed-
+// stream tail and the abort path) must derive identical views, so they share
+// this one function:
+//
+//   - values are copied before pointers are taken, so the clamping below
+//     can't leak back into the loop variables;
+//   - the cached portion is clamped the same way openAITokens does — a
+//     malformed upstream reporting cached > prompt must not produce a
+//     negative fresh input;
+//   - cached > 0 doubles as the presence flag: the stream chunk struct
+//     carries plain ints, so a reported cached_tokens=0 is indistinguishable
+//     from "not reported" on this one path (the non-streaming parser
+//     preserves the zero);
+//   - no usage chunk at all → all-nil event fields and a zero cost view.
+func oaiStreamUsageView(in, out, cached, reason int, sawUsage, sawReasoning bool) (rawUsage, tokenUsage) {
+	var raw rawUsage
+	if !sawUsage {
+		return raw, tokenUsage{}
+	}
+	if cached > in {
+		cached = in
+	}
+	i, o, c, r := in, out, cached, reason
+	raw.In, raw.Out = &i, &o
+	if cached > 0 {
+		raw.CacheRead = &c
+	}
+	if sawReasoning {
+		raw.Reasoning = &r
+	}
+	return raw, tokenUsage{In: in - cached, Out: out, CacheRead: cached}
+}
+
 var (
 	reCacheRead     = regexp.MustCompile(`"cache_read_input_tokens":\s*(\d+)`)
 	reCacheCreation = regexp.MustCompile(`"cache_creation_input_tokens":\s*(\d+)`)
