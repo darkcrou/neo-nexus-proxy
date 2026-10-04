@@ -180,7 +180,7 @@ func (h *Handler) callOpenAIPassthrough(active *activeProvider, rawMap map[strin
 		m[k] = v
 	}
 	inModel, _ := rawMap["model"].(string)
-	m["model"] = active.impl.MapModel(inModel)
+	m["model"] = h.mappedModel(active, inModel)
 	m["stream"] = stream
 	if stream {
 		m["stream_options"] = map[string]interface{}{"include_usage": true}

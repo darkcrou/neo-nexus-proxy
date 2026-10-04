@@ -42,6 +42,7 @@ const (
 	StrategyCheapest RoutingStrategy = "cheapest" // always cheapest available
 	StrategyFastest  RoutingStrategy = "fastest"  // always fastest provider
 	StrategyManual   RoutingStrategy = "manual"   // explicit model → provider mapping
+	StrategyDirect   RoutingStrategy = "direct"   // pass through the requested model id unchanged
 )
 
 // Provider holds provider configuration for routing
@@ -188,6 +189,8 @@ func (r *Router) RouteChain(requestedModel string, complexity Complexity) []*Pro
 		return r.byTierSpeed()
 	case StrategyManual:
 		return r.manualChain(requestedModel)
+	case StrategyDirect:
+		return r.autoChain(complexity)
 	default: // StrategyAuto
 		return r.autoChain(complexity)
 	}

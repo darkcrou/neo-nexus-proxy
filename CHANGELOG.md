@@ -3,6 +3,15 @@
 High-level summary of each release. Full, commit-level notes are on the
 [GitHub releases page](https://github.com/lynuxis2026-pixel/nexus-proxy/releases).
 
+## Unreleased
+
+- **`direct` routing strategy:** forwards the client's requested model id
+  to OpenAI-compatible providers exactly as received, bypassing
+  `model_map` and the `vision_model` override — for pointing NEXUS
+  straight at a specific provider model (e.g. `glm-5.2`, `zhai/glm-5.2`)
+  with zero translation. Provider selection and sticky-until-429 behavior
+  stay identical to `auto`.
+
 ## v0.7.0
 
 - **Host-editable config in Docker:** swaps the named Docker volume for a

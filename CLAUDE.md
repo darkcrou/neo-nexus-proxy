@@ -302,6 +302,63 @@ paragraph is why it was dropped, not an oversight to fix.
 
 ---
 
+## Direct Strategy (Model-ID Passthrough)
+
+Read this before touching routing-strategy selection or OpenAI-compatible
+model-id forwarding. Spans `internal/router/router.go`,
+`internal/proxy/handler.go`, `internal/proxy/gateway.go`, and
+`internal/proxy/openai.go`.
+
+- **What it does** (`router.go`): `StrategyDirect` (line 45) is a new
+  `RoutingStrategy` value. Its `RouteChain` case (lines 192-193) reuses
+  `autoChain(complexity)` — the exact same chain-ordering, sticky-provider
+  selection, and key/provider cooldown machinery as `auto`, unchanged. The
+  only thing `direct` changes is the model id NEXUS forwards to
+  OpenAI-compatible providers: `Handler.directModel` (`handler.go` line
+  192) is set once in `NewHandler` (line 320:
+  `h.directModel = router.RoutingStrategy(appCfg.Routing.Strategy) ==
+  router.StrategyDirect`). The helper `mappedModel` (`handler.go` lines
+  918-923) returns `requestedModel` verbatim when `directModel` is set,
+  else falls back to `active.impl.MapModel(requestedModel)`; it's used for
+  the OpenAI passthrough gateway (`callOpenAIPassthrough`, `gateway.go`
+  line 183) and for the log/dashboard `model_used` value (`openai.go` line
+  62, `handler.go` line 1123, `logResult`). The request-shaping branch
+  itself lives in `callUpstreamOnce` (`handler.go` lines 926-938): inside
+  the `providers.IsOpenAICompatible` block, `targetModel` starts as
+  `req.Model` and, when `h.directModel` is true, skips the entire
+  `mappedModel`/`nexusImages`/`VisionCapable` block below it — one branch
+  bypasses `MapModel` and the `vision_model` override together, not two
+  separate opt-outs.
+- **Why it exists**: `Generic.MapModel` (`internal/providers/generic.go`
+  lines 186-193) silently substitutes `g.models[0]` (the provider's first
+  configured model) for any Claude model id it can't find in `model_map`.
+  That's the right default for Claude Code's own model names, but it means
+  an operator who wants NEXUS to address a specific, non-mapped provider
+  model literally — e.g. `glm-5.2` — had no way to get that exact string
+  forwarded; it was always silently remapped instead. `direct` exists
+  purely to disable that substitution.
+- **Unconditional passthrough, no exceptions — including images.**
+  Confirmed with the user rather than assumed: under `direct`, an
+  image-bearing request does **not** get the `vision_model` override
+  either, unlike `auto` (where `nexusImages` + `VisionCapable.VisionModel`
+  can replace the mapped model — see "Vision / Image Content Support"
+  above). Under `direct` the requested model id always wins, image or not.
+- **Scope boundary.** This only touches OpenAI-compatible providers
+  (`providers.IsOpenAICompatible`, `internal/providers/provider.go` —
+  everything except `anthropic`, `bedrock`, `vertex`). The Anthropic-native
+  and enterprise (Bedrock/Vertex) passthrough paths forward raw request
+  bytes with their own unrelated, provider-specific model addressing and
+  are untouched by this flag.
+- **Dashboard is unaffected.** `router.ClassifyRequest` (called
+  unconditionally at `handler.go` line 676 and `gateway.go` line 98) runs
+  before any strategy branching, because its output still drives
+  `autoChain`'s tier ordering under `direct` too. So the "Live request
+  feed" complexity badge (`web/src/App.svelte` line 528, `req.complexity`,
+  sourced from `storage.Request.Complexity`) keeps showing the same
+  simple/standard/complex/critical value regardless of strategy.
+
+---
+
 ## Provider Config (~/.nexus/config.toml)
 
 ```toml
@@ -312,7 +369,7 @@ port = 3000
 port = 2222
 
 [routing]
-strategy = "auto"   # auto | manual | cheapest | fastest
+strategy = "auto"   # auto | manual | cheapest | fastest | direct
 
 [[providers]]
 name = "anthropic"
@@ -528,6 +585,16 @@ claude
   role as a sticky forwarder, not a content-aware router. There is no
   vision-based filtering of the routing/cooldown chain. See "Vision / Image
   Content Support" section above.
+- **`direct` routing strategy: unconditional model-id passthrough, no
+  vision-override exception** — `Generic.MapModel` silently substitutes the
+  provider's first configured model for any unrecognized Claude model id,
+  so there was previously no way to address a specific provider model
+  (e.g. `glm-5.2`) literally. `direct` reuses `auto`'s chain ordering
+  (`autoChain`) unchanged but forwards the client's requested model id
+  verbatim to OpenAI-compatible providers, bypassing both `model_map` and
+  `vision_model`. Confirmed with the user that there are no exceptions,
+  including for image requests. See "Direct Strategy (Model-ID
+  Passthrough)" section above.
 
 ---
 

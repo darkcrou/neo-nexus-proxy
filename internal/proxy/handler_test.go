@@ -470,6 +470,43 @@ func TestHandleMessages_ImageRequest_NoOverrideUsesMapModel(t *testing.T) {
 	}
 }
 
+// TestHandleMessages_DirectStrategy_PassesModelThrough confirms that under
+// StrategyDirect, the client's requested model id is forwarded verbatim to
+// an OpenAI-compatible provider, bypassing MapModel entirely — even when
+// MapModel would otherwise silently substitute the provider's first
+// configured model (Generic.MapModel's fallback per generic.go lines
+// 186-193).
+func TestHandleMessages_DirectStrategy_PassesModelThrough(t *testing.T) {
+	var gotModel string
+	srv := captureModelServer(&gotModel)
+	defer srv.Close()
+
+	impl, err := providers.New(providers.Spec{
+		Name: "glmprov", Type: "openai-compatible", BaseURL: srv.URL,
+		Models: []string{"medium"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rt := router.New(router.StrategyDirect)
+	rt.AddProvider(&router.Provider{Name: "glmprov", Tier: "free", Healthy: true})
+	h := &Handler{
+		httpClient:  &http.Client{Timeout: 10 * time.Second},
+		router:      rt,
+		providers:   map[string]*activeProvider{"glmprov": {impl: impl, apiKey: "k"}},
+		directModel: true,
+	}
+
+	rec := doMessages(h, `{"model":"glm-5.2","max_tokens":50,"messages":[{"role":"user","content":"hi"}]}`)
+
+	if rec.Code != 200 {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if gotModel != "glm-5.2" {
+		t.Errorf("upstream model = %q, want the requested model passed through unchanged %q", gotModel, "glm-5.2")
+	}
+}
+
 // TestHandleMessages_ImageRequest_NoChainFiltering confirms that having image
 // content does not exclude a non-vision-capable provider from the failover
 // chain. If a future change filtered the chain by vision capability, this

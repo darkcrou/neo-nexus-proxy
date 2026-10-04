@@ -180,13 +180,14 @@ nexus add anthropic YOUR_ANTHROPIC_KEY
 
 ## Routing strategies
 
-NEXUS has 4 routing modes:
+NEXUS has 5 routing modes:
 
 ```bash
 nexus start --strategy auto      # intelligent (default)
 nexus start --strategy cheapest  # always cheapest available
 nexus start --strategy fastest   # lowest latency
 nexus start --strategy manual    # explicit model mapping
+nexus start --strategy direct    # pass through the requested model id unchanged
 nexus start --budget 5           # cap spend at $5/day → free/local only when exceeded
 nexus start --cascade            # cheap-first: try cheapest, verify, escalate only on failure
 nexus start --adaptive           # learn the best provider per task type from real outcomes

@@ -181,19 +181,20 @@ func (a *activeProvider) dueKeys(now time.Time) []int {
 
 // Handler handles incoming Claude Code requests.
 type Handler struct {
-	httpClient *http.Client
-	router     *router.Router
-	providers  map[string]*activeProvider
-	db         *storage.DB
-	broker     EventPublisher // may be nil
-	budget     *budgetTracker
-	cache      *responseCache // may be nil (disabled)
-	cascade    bool           // cheap-first cascade with verification
-	firewall   *redactor      // privacy firewall (nil = off)
-	inspect    bool           // capture full prompt/response for the inspector
-	rules      []config.Rule  // declarative routing overrides
-	maxReqUSD  float64        // guardrail: downgrade a single request above this
-	stopHealth chan struct{}
+	httpClient  *http.Client
+	router      *router.Router
+	providers   map[string]*activeProvider
+	db          *storage.DB
+	broker      EventPublisher // may be nil
+	budget      *budgetTracker
+	cache       *responseCache // may be nil (disabled)
+	cascade     bool           // cheap-first cascade with verification
+	directModel bool           // StrategyDirect: forward the requested model id to OpenAI-compatible providers unchanged (no model_map/vision_model override)
+	firewall    *redactor      // privacy firewall (nil = off)
+	inspect     bool           // capture full prompt/response for the inspector
+	rules       []config.Rule  // declarative routing overrides
+	maxReqUSD   float64        // guardrail: downgrade a single request above this
+	stopHealth  chan struct{}
 
 	stickyMu sync.Mutex
 	// sticky maps a requested Claude model string (e.g. "claude-sonnet-4-6")
@@ -316,6 +317,7 @@ func NewHandler(cfg *Config, db *storage.DB, broker EventPublisher) (*Handler, e
 	}
 
 	h.cascade = cfg.Cascade || appCfg.Routing.Cascade
+	h.directModel = router.RoutingStrategy(appCfg.Routing.Strategy) == router.StrategyDirect
 	if cfg.Adaptive || appCfg.Routing.Adaptive {
 		rt.SetAdaptive(true)
 		log.Info().Msg("Adaptive routing enabled — NEXUS learns the best provider per task type")
@@ -352,6 +354,9 @@ func NewHandler(cfg *Config, db *storage.DB, broker EventPublisher) (*Handler, e
 		}
 		if h.cascade {
 			log.Info().Msg("Cheap-first cascade enabled — try the cheapest capable model, verify, escalate on failure")
+		}
+		if h.directModel {
+			log.Info().Msg("Direct strategy enabled — requested model id is forwarded to OpenAI-compatible providers unchanged (model_map/vision_model overrides are bypassed)")
 		}
 		go h.keyProbeLoop(h.stopHealth) // background recovery probing of cooling keys
 	}
@@ -904,14 +909,30 @@ func (h *Handler) callUpstream(active *activeProvider, req AnthropicRequest, bod
 	return resp, err
 }
 
+// mappedModel resolves the provider-facing model id for logging/dashboard
+// records and for the OpenAI-compatible gateway's raw pass-through path:
+// under StrategyDirect the client's requested model is returned verbatim
+// (bypassing ModelMap); otherwise it's the provider's ordinary MapModel
+// result. It deliberately does NOT apply a vision_model override — that
+// stays local to callUpstreamOnce below, the one call site that needs it.
+func (h *Handler) mappedModel(active *activeProvider, requestedModel string) string {
+	if h.directModel {
+		return requestedModel
+	}
+	return active.impl.MapModel(requestedModel)
+}
+
 // callUpstreamOnce performs a single upstream request with a specific API key.
 func (h *Handler) callUpstreamOnce(active *activeProvider, req AnthropicRequest, body []byte, origHeaders http.Header, key string) (*http.Response, error) {
 	if providers.IsOpenAICompatible(active.impl.Name()) {
-		targetModel := active.impl.MapModel(req.Model)
-		if req.nexusImages {
-			if vc, ok := active.impl.(providers.VisionCapable); ok {
-				if vm := vc.VisionModel(req.Model); vm != "" {
-					targetModel = vm
+		targetModel := req.Model
+		if !h.directModel {
+			targetModel = h.mappedModel(active, req.Model)
+			if req.nexusImages {
+				if vc, ok := active.impl.(providers.VisionCapable); ok {
+					if vm := vc.VisionModel(req.Model); vm != "" {
+						targetModel = vm
+					}
 				}
 			}
 		}
@@ -1099,7 +1120,7 @@ func (h *Handler) logResult(active *activeProvider, req AnthropicRequest, comple
 	rec := &storage.Request{
 		CreatedAt:        now,
 		ModelAsked:       req.Model,
-		ModelUsed:        active.impl.MapModel(req.Model),
+		ModelUsed:        h.mappedModel(active, req.Model),
 		Provider:         active.impl.Name(),
 		Complexity:       complexity.String(),
 		InputTokens:      u.In,

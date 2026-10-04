@@ -42,6 +42,36 @@ func TestRouteChainFallbackOrder(t *testing.T) {
 	}
 }
 
+func TestDirectStrategyMatchesAutoChainOrder(t *testing.T) {
+	// direct must reuse autoChain's ordering exactly (tier fallback, priority
+	// within tier) — the only difference from auto is model-id passthrough,
+	// which lives in internal/proxy, not here.
+	setup := func(r *Router) {
+		r.AddProvider(&Provider{Name: "groq", Tier: "free", Healthy: true})
+		r.AddProvider(&Provider{Name: "deepseek", Tier: "standard", Healthy: true})
+		r.AddProvider(&Provider{Name: "anthropic", Tier: "premium", Healthy: true})
+	}
+
+	direct := New(StrategyDirect)
+	setup(direct)
+	auto := New(StrategyAuto)
+	setup(auto)
+
+	complexities := []Complexity{ComplexitySimple, ComplexityStandard, ComplexityComplex, ComplexityCritical}
+	for _, c := range complexities {
+		wantChain := auto.RouteChain("glm-5.2", c)
+		gotChain := direct.RouteChain("glm-5.2", c)
+		if len(gotChain) != len(wantChain) {
+			t.Fatalf("%s: chain length = %d, want %d", c, len(gotChain), len(wantChain))
+		}
+		for i := range wantChain {
+			if gotChain[i].Name != wantChain[i].Name {
+				t.Errorf("%s: chain[%d] = %q, want %q (direct chain: %+v)", c, i, gotChain[i].Name, wantChain[i].Name, gotChain)
+			}
+		}
+	}
+}
+
 func TestUnhealthyExcluded(t *testing.T) {
 	r := New(StrategyAuto)
 	r.AddProvider(&Provider{Name: "groq", Tier: "free", Healthy: false})

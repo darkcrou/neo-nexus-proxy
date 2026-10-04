@@ -68,6 +68,47 @@ func TestGateway_OpenAIPassthrough(t *testing.T) {
 	}
 }
 
+// TestGateway_DirectStrategy_PassesModelThrough confirms that /v1/chat/completions
+// forwards the requested model id unchanged under StrategyDirect, matching the
+// /v1/messages behavior in TestHandleMessages_DirectStrategy_PassesModelThrough.
+func TestGateway_DirectStrategy_PassesModelThrough(t *testing.T) {
+	var gotModel string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var m map[string]interface{}
+		json.NewDecoder(r.Body).Decode(&m)
+		gotModel, _ = m["model"].(string)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"id": "x", "object": "chat.completion", "model": gotModel,
+			"choices": []interface{}{map[string]interface{}{"index": 0, "finish_reason": "stop",
+				"message": map[string]interface{}{"role": "assistant", "content": "hello from gateway"}}},
+			"usage": map[string]interface{}{"prompt_tokens": 9, "completion_tokens": 4},
+		})
+	}))
+	defer srv.Close()
+	impl, err := providers.New(providers.Spec{Name: "groqish", Type: "openai-compatible", BaseURL: srv.URL, Tier: "free", Models: []string{"llama-x"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rt := router.New(router.StrategyDirect)
+	rt.AddProvider(&router.Provider{Name: "groqish", Tier: "free", Healthy: true})
+	h := &Handler{
+		httpClient:  &http.Client{Timeout: 10 * time.Second},
+		router:      rt,
+		providers:   map[string]*activeProvider{"groqish": {impl: impl, apiKey: "k"}},
+		directModel: true,
+	}
+
+	rec := chatCompletions(h, `{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}`)
+
+	if rec.Code != 200 {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	if gotModel != "gpt-4o" {
+		t.Errorf("direct strategy should pass the requested model through unchanged, upstream saw %q", gotModel)
+	}
+}
+
 // TestGateway_ArrayContentPassthrough reproduces the bug reported by opencode /
 // pi.dev clients: they send message.content as an array of text parts
 // ([{"type":"text","text":"..."}]) instead of a plain string, which used to fail
