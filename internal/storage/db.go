@@ -28,7 +28,12 @@ func New(dbPath string) (*DB, error) {
 		return nil, fmt.Errorf("failed to create data directory: %w", err)
 	}
 
-	conn, err := sql.Open("sqlite", dbPath+"?_journal_mode=WAL&_timeout=5000")
+	// modernc.org/sqlite configures SQLite via _pragma query params — the
+	// mattn-style ?_journal_mode=WAL&_timeout=5000 syntax is silently ignored
+	// by this driver, which used to leave the DB in delete-journal mode with
+	// no busy timeout. WAL keeps dashboard reads from stalling behind the
+	// per-attempt usage-event writes on the request hot path.
+	conn, err := sql.Open("sqlite", dbPath+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)")
 	if err != nil {
 		return nil, fmt.Errorf("failed to open database: %w", err)
 	}

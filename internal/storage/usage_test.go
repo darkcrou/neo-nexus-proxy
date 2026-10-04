@@ -8,8 +8,8 @@ import (
 	"time"
 )
 
-func intPtr(v int) *int           { return &v }
-func floatPtr(v float64) *float64 { return &v }
+func intPtr(v int) *int              { return &v }
+func floatPtr(v float64) *float64    { return &v }
 func timePtr(v time.Time) *time.Time { return &v }
 
 // ut is a fixed, second-aligned UTC timestamp for tests that don't depend on
@@ -28,13 +28,13 @@ func ago(mins int) time.Time {
 
 func mkUsageEvent(provider string, at time.Time) *UsageEvent {
 	return &UsageEvent{
-		CreatedAt: at,
-		Provider:  provider,
-		ModelUsed: "glm-4.7",
+		CreatedAt:  at,
+		Provider:   provider,
+		ModelUsed:  "glm-4.7",
 		ModelAsked: "claude-sonnet-4-6",
-		Status:    200,
-		Success:   true,
-		Attempt:   1,
+		Status:     200,
+		Success:    true,
+		Attempt:    1,
 	}
 }
 
@@ -45,23 +45,23 @@ func TestUsageEventRoundTrip(t *testing.T) {
 	at := ut(10, 0)
 	reset := at.Add(2 * time.Hour)
 	e := &UsageEvent{
-		CreatedAt:  at,
-		Provider:   "zai",
-		ModelUsed:  "glm-5.2",
-		ModelAsked: "claude-sonnet-4-6",
-		RequestID:  "req_abc",
-		KeyIndex:   intPtr(2),
-		Attempt:    1,
-		Status:     200,
-		Success:    true,
-		Stream:     true,
-		In:         intPtr(1000),
-		Out:        intPtr(500),
-		CacheRead:  intPtr(2000),
-		CacheWrite: intPtr(1500),
-		Reasoning:  intPtr(42),
-		DurationMS: 1234,
-		QuotaDimension:  "5h",
+		CreatedAt:        at,
+		Provider:         "zai",
+		ModelUsed:        "glm-5.2",
+		ModelAsked:       "claude-sonnet-4-6",
+		RequestID:        "req_abc",
+		KeyIndex:         intPtr(2),
+		Attempt:          1,
+		Status:           200,
+		Success:          true,
+		Stream:           true,
+		In:               intPtr(1000),
+		Out:              intPtr(500),
+		CacheRead:        intPtr(2000),
+		CacheWrite:       intPtr(1500),
+		Reasoning:        intPtr(42),
+		DurationMS:       1234,
+		QuotaDimension:   "5h",
 		QuotaUtilization: floatPtr(0.42),
 		QuotaResetAt:     timePtr(reset),
 		QuotaMeta:        `{"anthropic-ratelimit-unified-status":"allowed"}`,
@@ -510,6 +510,73 @@ func TestUsageWindowsRateLimitTermination(t *testing.T) {
 	}
 }
 
+// The mixed case the window precedence exists for: a 429 arrives after the
+// assumed 5h wall already passed. RATE_LIMIT outranks TIME_ELAPSED — the 429
+// closes the window at its own timestamp and is counted in it. The flipped
+// order would end the window at the wall and drop the 429 from every window.
+func TestUsageWindowsRateLimitPastWallOutranksTimeElapsed(t *testing.T) {
+	db := newTestDB(t)
+	base := ago(600) // 10h ago; the 5h wall falls 5h ago
+	recordAt(t, db, "zai", base, func(e *UsageEvent) { e.In = intPtr(100) })
+	recordAt(t, db, "zai", base.Add(2*time.Hour), func(e *UsageEvent) { e.In = intPtr(200) })
+	// 429 a full hour past the wall.
+	rlAt := base.Add(6 * time.Hour)
+	recordAt(t, db, "zai", rlAt, func(e *UsageEvent) {
+		e.Status, e.Success, e.RateLimited = 429, false, true
+	})
+
+	ws, err := db.GetUsageWindows("zai", 5*time.Hour, "5h", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ws) != 1 {
+		t.Fatalf("expected 1 window, got %d", len(ws))
+	}
+	w := ws[0]
+	if w.EndReason != "RATE_LIMIT" {
+		t.Errorf("want RATE_LIMIT (outranks the wall), got %q", w.EndReason)
+	}
+	if w.EndedAt == nil || !w.EndedAt.Equal(rlAt) {
+		t.Errorf("window should end at the 429 timestamp, got %v (want %v)", w.EndedAt, rlAt)
+	}
+	if w.Requests != 3 || w.RateLimitedEvents != 1 {
+		t.Errorf("the 429 must belong to the window it terminates: %+v", w)
+	}
+	if w.InTokens != 300 {
+		t.Errorf("window totals wrong: %+v", w)
+	}
+}
+
+// Windows must never double-count cached tokens: in_tokens is stored fresh
+// (the proxy subtracts the cached portion from OpenAI prompt_tokens at record
+// time), so an OpenAI-style prompt_tokens=100 with cached_tokens=30 is
+// recorded as In=70/CacheRead=30 — distinct input of exactly 100, hit ratio
+// 0.30, not 130 and 0.23.
+func TestUsageWindowsFreshInputNoDoubleCount(t *testing.T) {
+	db := newTestDB(t)
+	recordAt(t, db, "zai", ago(30), func(e *UsageEvent) {
+		e.In, e.CacheRead, e.Out = intPtr(70), intPtr(30), intPtr(20)
+	})
+
+	ws, err := db.GetUsageWindows("zai", 5*time.Hour, "5h", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ws) != 1 {
+		t.Fatalf("expected 1 window, got %d", len(ws))
+	}
+	w := ws[0]
+	if w.TotalInputTokens != 100 {
+		t.Errorf("total_input = %d, want 100 (70 fresh + 30 cached, no double count)", w.TotalInputTokens)
+	}
+	if w.CacheHitRatio < 0.299 || w.CacheHitRatio > 0.301 {
+		t.Errorf("cache hit ratio = %v, want 0.30", w.CacheHitRatio)
+	}
+	if w.TotalTokens != 120 {
+		t.Errorf("total_tokens = %d, want 120", w.TotalTokens)
+	}
+}
+
 func TestUsageWindowsConsecutiveRateLimitsDoNotOpenWindows(t *testing.T) {
 	db := newTestDB(t)
 	base := ago(180)
@@ -769,6 +836,7 @@ func TestGetProviderQuota(t *testing.T) {
 		t.Errorf("unlabeled snapshot wrong: %+v", s)
 	}
 }
+
 // Regression: rows written by something other than RecordUsageEvent (e.g. an
 // operator seeding the SQLite file by hand) can hold NULL in raw-string
 // columns. The events SELECT must COALESCE them instead of dropping the row on

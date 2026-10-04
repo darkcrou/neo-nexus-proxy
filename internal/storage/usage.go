@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -16,22 +17,22 @@ import (
 
 // UsageEvent is a single upstream attempt's measured consumption.
 type UsageEvent struct {
-	ID        int64     `json:"id"`
-	CreatedAt time.Time `json:"created_at"`
-	Provider  string    `json:"provider"`
-	ModelUsed string    `json:"model_used"`
-	ModelAsked string   `json:"model_asked"`
+	ID         int64     `json:"id"`
+	CreatedAt  time.Time `json:"created_at"`
+	Provider   string    `json:"provider"`
+	ModelUsed  string    `json:"model_used"`
+	ModelAsked string    `json:"model_asked"`
 
 	RequestID string `json:"request_id"`
 	KeyIndex  *int   `json:"key_index"` // 0-based key-pool index; nil = no pool
 	Attempt   int    `json:"attempt"`   // 1-based position in the provider chain; 0 = probe
 
-	Status  int  `json:"status"`  // upstream HTTP status; 0 = transport error
+	Status  int  `json:"status"` // upstream HTTP status; 0 = transport error
 	Success bool `json:"success"`
 	Stream  bool `json:"stream"`
 
 	In         *int `json:"in_tokens"`         // fresh input tokens
-	Out        *int `json:"out_tokens"`       // output tokens (reasoning included)
+	Out        *int `json:"out_tokens"`        // output tokens (reasoning included)
 	CacheRead  *int `json:"cache_read_tokens"` // prompt-cache reads
 	CacheWrite *int `json:"cache_write_tokens"`
 	Reasoning  *int `json:"reasoning_tokens"` // subset of Out — never double-counted
@@ -41,14 +42,14 @@ type UsageEvent struct {
 	Error        string `json:"error"`
 	Probe        bool   `json:"probe"`
 
-	RateLimited  bool      `json:"rate_limited"`
-	RetryAfter   *float64  `json:"retry_after"`    // seconds
+	RateLimited  bool       `json:"rate_limited"`
+	RetryAfter   *float64   `json:"retry_after"`    // seconds
 	RetryResetAt *time.Time `json:"retry_reset_at"` // absolute reset from the 429
 
-	QuotaDimension  string    `json:"quota_dimension"`  // e.g. "5h"/"7d", transcribed from provider headers
-	QuotaUtilization *float64 `json:"quota_utilization"` // 0..1 fraction, exactly as reported
-	QuotaResetAt    *time.Time `json:"quota_reset_at"`    // provider-reported quota reset epoch
-	QuotaMeta       string    `json:"quota_meta"`         // JSON: raw captured rate-limit/quota headers
+	QuotaDimension   string     `json:"quota_dimension"`   // e.g. "5h"/"7d", transcribed from provider headers
+	QuotaUtilization *float64   `json:"quota_utilization"` // 0..1 fraction, exactly as reported
+	QuotaResetAt     *time.Time `json:"quota_reset_at"`    // provider-reported quota reset epoch
+	QuotaMeta        string     `json:"quota_meta"`        // JSON: raw captured rate-limit/quota headers
 }
 
 // RecordUsageEvent appends one immutable usage event and returns its row ID.
@@ -134,7 +135,7 @@ func (db *DB) GetUsageEvents(f UsageFilter) ([]*UsageEvent, error) {
 		where = append(where, "probe = 0")
 	}
 	if len(where) > 0 {
-		q += " WHERE " + joinStrings(where, " AND ")
+		q += " WHERE " + strings.Join(where, " AND ")
 	}
 	dir := "DESC"
 	if f.Ascending {
@@ -158,16 +159,16 @@ func scanUsageEvents(rows *sql.Rows) ([]*UsageEvent, error) {
 	var out []*UsageEvent
 	for rows.Next() {
 		var (
-			e              UsageEvent
-			keyIdx         sql.NullInt64
+			e                        UsageEvent
+			keyIdx                   sql.NullInt64
 			nIn, nOut, nCR, nCW, nRS sql.NullInt64
-			partial        bool
-			rl             bool
-			retryAfter     sql.NullFloat64
-			retryReset     sql.NullTime
-			util           sql.NullFloat64
-			qReset         sql.NullTime
-			probe          bool
+			partial                  bool
+			rl                       bool
+			retryAfter               sql.NullFloat64
+			retryReset               sql.NullTime
+			util                     sql.NullFloat64
+			qReset                   sql.NullTime
+			probe                    bool
 		)
 		err := rows.Scan(
 			&e.ID, &e.CreatedAt, &e.RequestID, &e.Provider, &e.ModelUsed, &e.ModelAsked,
@@ -178,7 +179,10 @@ func scanUsageEvents(rows *sql.Rows) ([]*UsageEvent, error) {
 			&e.Error, &probe,
 		)
 		if err != nil {
-			continue
+			// A row that fails to scan is surfaced, not swallowed: silently
+			// dropping it would hide the event from every consumer (events
+			// API, windows, totals) the way the pre-COALESCE NULLs once did.
+			return nil, fmt.Errorf("scan usage event id=%d: %w", e.ID, err)
 		}
 		e.KeyIndex = nilInt(keyIdx)
 		e.In, e.Out, e.CacheRead, e.CacheWrite, e.Reasoning = nilInt(nIn), nilInt(nOut), nilInt(nCR), nilInt(nCW), nilInt(nRS)
@@ -247,22 +251,22 @@ type ModelUsage struct {
 
 // UsageWindow is one derived quota window for one provider.
 type UsageWindow struct {
-	Provider string `json:"provider"`
-	StartedAt time.Time `json:"started_at"`
+	Provider  string     `json:"provider"`
+	StartedAt time.Time  `json:"started_at"`
 	EndedAt   *time.Time `json:"ended_at,omitempty"` // nil = still open
-	EndReason string     `json:"end_reason"`          // "" (open) or an End* constant
+	EndReason string     `json:"end_reason"`         // "" (open) or an End* constant
 
-	Requests         int     `json:"requests"`
-	InTokens         int64   `json:"in_tokens"` // fresh input
-	CacheReadTokens  int64   `json:"cache_read_tokens"`
-	CacheWriteTokens int64   `json:"cache_write_tokens"`
-	OutTokens        int64   `json:"out_tokens"`
-	ReasoningTokens  int64   `json:"reasoning_tokens"`
-	TotalInputTokens int64   `json:"total_input_tokens"` // in + cache_read + cache_write
-	TotalTokens      int64   `json:"total_tokens"`        // total_input + out
-	CacheHitRatio    float64 `json:"cache_hit_ratio"`     // cache_read / total_input
-	PartialEvents   int     `json:"partial_events"`      // aborted streams contributing partial usage
-	RateLimitedEvents int    `json:"rate_limited_events"`
+	Requests          int     `json:"requests"`
+	InTokens          int64   `json:"in_tokens"` // fresh input
+	CacheReadTokens   int64   `json:"cache_read_tokens"`
+	CacheWriteTokens  int64   `json:"cache_write_tokens"`
+	OutTokens         int64   `json:"out_tokens"`
+	ReasoningTokens   int64   `json:"reasoning_tokens"`
+	TotalInputTokens  int64   `json:"total_input_tokens"` // in + cache_read + cache_write
+	TotalTokens       int64   `json:"total_tokens"`       // total_input + out
+	CacheHitRatio     float64 `json:"cache_hit_ratio"`    // cache_read / total_input
+	PartialEvents     int     `json:"partial_events"`     // aborted streams contributing partial usage
+	RateLimitedEvents int     `json:"rate_limited_events"`
 
 	Quota    *QuotaObservation `json:"quota,omitempty"` // latest provider-reported utilization inside the window
 	PerModel []ModelUsage      `json:"per_model,omitempty"`
@@ -302,16 +306,19 @@ func (db *DB) GetUsageWindows(provider string, window time.Duration, dimension s
 			if resetAt != nil && at.After(*resetAt) {
 				closeCur(*resetAt, EndProviderReset)
 			}
-			// 2. The assumed duration wall passed before this event.
-			if cur != nil && at.After(curStart.Add(window)) {
-				end := curStart.Add(window)
-				closeCur(end, EndTimeElapsed)
+			// 2. A rate-limited event terminates the open window at its own
+			// timestamp — the 429 belongs to the window it closes, even when
+			// the assumed wall already passed. Checking the rate limit before
+			// the wall (per the approved precedence) keeps the 429 counted in
+			// the window it terminated; the other order would end the window
+			// at the wall and drop the 429 from every window.
+			if cur != nil && e.RateLimited {
+				cur.add(e)
+				closeCur(at, EndRateLimit)
 			}
-			// A rate-limited event never opens a window; after the checks
-			// above, either cur is nil (this 429 follows a boundary and is
-			// skipped) or it terminates cur at its own timestamp.
-			if cur == nil && e.RateLimited {
-				continue
+			// 3. The assumed duration wall passed before this event.
+			if cur != nil && at.After(curStart.Add(window)) {
+				closeCur(curStart.Add(window), EndTimeElapsed)
 			}
 		}
 		if cur == nil {
@@ -325,9 +332,6 @@ func (db *DB) GetUsageWindows(provider string, window time.Duration, dimension s
 		cur.add(e)
 		if dimension != "" && e.QuotaDimension == dimension && e.QuotaResetAt != nil {
 			resetAt = e.QuotaResetAt
-		}
-		if e.RateLimited {
-			closeCur(at, EndRateLimit)
 		}
 	}
 
@@ -554,17 +558,6 @@ func usageSince(period string) string {
 	default: // today
 		return " AND date(created_at) >= date('now')"
 	}
-}
-
-func joinStrings(parts []string, sep string) string {
-	out := ""
-	for i, p := range parts {
-		if i > 0 {
-			out += sep
-		}
-		out += p
-	}
-	return out
 }
 
 func nullInt(v *int) any {
