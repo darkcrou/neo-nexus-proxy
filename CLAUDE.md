@@ -127,6 +127,10 @@ nexus config                        # open config in editor
 | `GET /api/stats` | Aggregated stats JSON |
 | `GET /api/requests` | Request history |
 | `GET /api/providers` | Provider status |
+| `GET /api/usage/windows` | Derived quota windows (per provider, most recent first) |
+| `GET /api/usage/events` | Raw usage events (newest first, filterable) |
+| `GET /api/usage/totals` | Usage totals grouped by provider or model |
+| `GET /api/usage/quota` | Latest provider-reported quota utilization |
 | `GET /events` | SSE stream for live updates |
 
 ---
@@ -356,6 +360,65 @@ model-id forwarding. Spans `internal/router/router.go`,
   feed" complexity badge (`web/src/App.svelte` line 528, `req.complexity`,
   sourced from `storage.Request.Complexity`) keeps showing the same
   simple/standard/complex/critical value regardless of strategy.
+
+---
+
+## Usage Measurement (immutable events + quota windows)
+
+Read this before touching usage parsing, the `usage_events` table, the
+attempt-recording hooks in the proxy hot path, or the `/api/usage/*`
+endpoints. Spans `internal/storage/db.go` (schema),
+`internal/storage/usage.go` (queries), `internal/proxy/usage.go`
+(parsing), `internal/proxy/handler.go` / `openai.go` / `stream.go` /
+`gateway.go` / `cascade.go` (recording hooks), `internal/dashboard/usage.go`
+(API), and the web usage panel.
+
+- **One immutable event per upstream attempt.** Every roundtrip that leaves
+  the machine — chain failover steps, 429 key rotations, cascade candidates,
+  cooldown-recovery probes, and streams that aborted mid-flight — appends one
+  row to `usage_events` (SQLite; single-connection, concurrency-safe writes
+  via the existing storage conventions). Rows are never updated or deleted;
+  nothing is reset at window boundaries. The `requests` table is untouched
+  except that aborted streams additionally set its previously-never-populated
+  `Error` column to the same abort text.
+- **Presence-aware token counts.** `in_tokens`, `out_tokens`,
+  `cache_read_tokens`, `cache_write_tokens`, `reasoning_tokens` are all
+  **nullable**: NULL means the provider did not report it, 0 means the
+  provider reported zero — never collapse the two, never fabricate. Fresh
+  input is `prompt − cached` (clamped at 0) so input and cache-read never
+  double-count. Reasoning tokens remain a subset of `out_tokens` (never
+  added to totals). Parsers: `anthropicRawUsage` (JSON), `streamRawUsage`
+  (SSE regex, last `output_tokens` wins), `openAIRawUsage` (DeepSeek
+  `prompt_cache_hit_tokens`, OpenAI `cached_tokens`, `reasoning_tokens`
+  inside `completion_tokens_details`).
+- **Quota is transcribed, never computed.** Response headers are captured
+  by prefix (`anthropic-ratelimit-`, `x-ratelimit-`, `x-quota-`,
+  `x-ollama-`, `ratelimit-`, `x-remaining-`, `retry-after`) into
+  `quota_meta` raw JSON; the Anthropic unified family additionally
+  transcribes typed fields (`quota_dimension` "5h"/"7d",
+  `quota_utilization` exactly as reported, `quota_reset_at`). A 429 sets
+  `rate_limited=1` + `retry_after` (seconds) + `retry_reset_at`
+  (RFC3339) — and is **never** treated as proof of 5h-quota exhaustion
+  unless the provider's own headers say so.
+- **Windows are derived at query time**, never persisted
+  (`GetUsageWindows`). Probes are excluded (internal recovery pings, not
+  workload). Rate-limited events **close** the current window as
+  `RATE_LIMIT` but never open one. A provider-reported `quota_reset_at`
+  (matching the queried dimension) closes as `PROVIDER_RESET` — trusted
+  over assumed walls. Otherwise the assumed duration wall (default 5h)
+  closes as `TIME_ELAPSED`; the oldest window's start-relative
+  `TIME_ELAPSED` is downgraded to `UNKNOWN` (its true start predates
+  recorded history). The current window is open (`ended_at` absent).
+- **API shape** (`internal/dashboard/usage.go`, all plural-envelope
+  snake_case, empty arrays on nil-db): `GET /api/usage/windows`,
+  `/api/usage/events`, `/api/usage/totals`, `/api/usage/quota`.
+- **Provider limitations** (why fields are NULL, not bugs): Z.ai does not
+  expose the account credit balance in API responses (only on the plan
+  web pages) → no quota observations. Ollama Cloud sends no quota or
+  rate-limit headers on responses (ollama/ollama#15663) → none captured.
+  Anthropic reports the fullest picture: unified quota-status headers
+  (5h/7d utilization + reset epochs) plus per-model API-key
+  `anthropic-ratelimit-*` limits (raw-captured).
 
 ---
 
@@ -595,6 +658,19 @@ claude
   `vision_model`. Confirmed with the user that there are no exceptions,
   including for image requests. See "Direct Strategy (Model-ID
   Passthrough)" section above.
+- **Usage measurement: immutable per-attempt events + query-time windows,
+  presence-aware NULLs, transcribed (never computed) quota** — the
+  subsystem records one append-only `usage_events` row per upstream
+  attempt (failover step, key rotation, cascade candidate, probe, aborted
+  stream); token fields are nullable where NULL = "provider didn't
+  report" (0 = reported zero); quota/rate-limit headers are transcribed
+  verbatim (Anthropic unified family typed, others raw-captured JSON);
+  429s are never interpreted as quota exhaustion; windows are derived at
+  query time with termination reasons (TIME_ELAPSED / RATE_LIMIT /
+  PROVIDER_RESET / UNKNOWN) and provider-reported resets preferred over
+  assumed 5h walls; aborted streams record partial usage (`usage_partial=1`)
+  and mark the requests row's `Error` column; probes are recorded but
+  excluded from windows/totals. See "Usage Measurement" section above.
 
 ---
 

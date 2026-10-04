@@ -11,6 +11,30 @@ High-level summary of each release. Full, commit-level notes are on the
   straight at a specific provider model (e.g. `glm-5.2`, `zhai/glm-5.2`)
   with zero translation. Provider selection and sticky-until-429 behavior
   stay identical to `auto`.
+- **Usage measurement (immutable per-attempt events):** every roundtrip
+  that leaves the machine — chain failover steps, 429 key rotations,
+  cascade candidates, cooldown-recovery probes, and streams that aborted
+  mid-flight — now appends one row to a new append-only `usage_events`
+  table. Token counts are presence-aware (fresh input, cache reads,
+  cache writes, output, reasoning as a subset of output; NULL means the
+  provider didn't report a value, 0 means it reported zero) and never
+  double-counted. Rate-limit/quota headers are transcribed verbatim
+  (Anthropic's unified 5h/7d utilization + reset epochs typed; other
+  providers raw-captured), 429s record `Retry-After`/reset timestamps,
+  and a 429 is never interpreted as proof of quota exhaustion. Aborted
+  streams keep their observed tokens as partial usage and mark the
+  request log row with the abort reason.
+- **Quota windows + usage dashboard:** windows are derived at query time
+  from the event history (never persisted) with honest termination
+  reasons — provider-reported resets (`PROVIDER_RESET`) are trusted over
+  assumed 5-hour walls (`TIME_ELAPSED`), rate limits close windows as
+  `RATE_LIMIT` but never open them, and the oldest window's assumed end
+  is reported `UNKNOWN` because its true start predates recorded
+  history. Exposed via `GET /api/usage/{windows,events,totals,quota}` on
+  the dashboard port plus a new "Usage windows" panel: current window
+  per provider with cache-hit ratio and provider-reported utilization,
+  recent window history with end reasons, and a per-provider event
+  drill-down.
 
 ## v0.7.0
 

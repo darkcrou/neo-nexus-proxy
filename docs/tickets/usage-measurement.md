@@ -40,8 +40,8 @@ Probe requests recorded with `probe=1`.
 | 4  | U4 | recording hooks in proxy hot path      | Critical | done   | Extraction   | handler/stream/gateway tests |
 | 5  | U5 | aborted-stream handling + marked rows   | High     | done   | Grouped: Relays | abort tests |
 | 6  | U6 | dashboard API endpoints                 | High     | done   | API          | dashboard tests |
-| 7  | U7 | dashboard UI panel + rebuild embed      | Medium   | pending | UI (delegate) | build + embed + visual check |
-| 8  | U8 | CHANGELOG + CLAUDE.md docs              | Medium   | pending | Docs         | review |
+| 7  | U7 | dashboard UI panel + rebuild embed      | Medium   | done   | UI (delegate) | build + embed + structural check |
+| 8  | U8 | CHANGELOG + CLAUDE.md docs              | Medium   | done   | Docs         | review |
 
 ## Item Details
 
@@ -147,14 +147,40 @@ Probe requests recorded with `probe=1`.
   strictly from the existing palette. `make build-web && make embed`.
 - **Verify:** web build green; visual check via vision agent; API shapes frozen
   from U6.
+- **Status:** done — built by a delegated sub-agent (which died on provider
+  quota/model limits mid-verification; work reviewed and finished in the main
+  session): `web/src/stores/usage.ts` (typed stores, NULL ≠ 0), panel between
+  charts and leaderboard, `web/tsconfig.json` added so `npm run check`
+  actually runs (0 errors, 2 pre-existing a11y warnings); dead totals/quota
+  fetches trimmed from the store. Pixel-level visual check **deferred**: all
+  reachable vision-capable upstreams reject image content parts (4 attempts,
+  2 model overrides). Structural verification done instead via Playwright
+  accessibility snapshots against a seeded live instance: all token values,
+  cache-hit %, 71% provider-reported utilization + reset time, "no provider
+  quota" note, all 4 end-reason chips, drill-down with NULL tokens as "–" and
+  probe/partial/429 badges — zero console errors. Also surfaced (and fixed)
+  a storage bug: hand-seeded NULL `quota_dimension` rows were silently
+  dropped by the events scan (separate `fix(storage)` commit 60995fe).
 
 ### U8 — docs
 - **What:** CHANGELOG Unreleased bullets; CLAUDE.md section documenting the
   subsystem, NULL semantics, window rules, provider limitations (Z.ai credits
   not in API responses; Ollama Cloud no quota headers — ollama/ollama#15663).
 - **Verify:** review pass.
+- **Status:** done — CHANGELOG Unreleased carries two usage-measurement
+  bullets; CLAUDE.md gained the "Usage Measurement" section + Critical
+  Decisions entry + the four /api/usage/* rows in the dashboard endpoint
+  table.
 
 ## Completion Log
 
 | Date | Item | Notes |
 |------|------|-------|
+| 2026-10-04 | U1+U2 | 938fc77 — schema, record/fetch, windows, totals, quota |
+| 2026-10-04 | U3 | 33c2f4d — rawUsage parsers, attemptQuota, captureQuota |
+| 2026-10-04 | U4 | fdc79c0 — attemptInfo threading, 12 recording-hook tests |
+| 2026-10-04 | U5 | cc5f0e6 — aborted streams, marked rows, 9 tests |
+| 2026-10-04 | U6 | 2175f6d — /api/usage/* endpoints, 5 tests |
+| 2026-10-04 | fix | 60995fe — COALESCE quota_dimension (found during U7 verification) |
+| 2026-10-04 | U7 | 5413c33 — usage panel UI; pixel check deferred (no image-capable upstream) |
+| 2026-10-04 | U8 | this commit — CHANGELOG + CLAUDE.md + plan-doc statuses |
