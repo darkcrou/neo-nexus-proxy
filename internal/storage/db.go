@@ -100,6 +100,44 @@ func (db *DB) migrate() error {
 		last_check  DATETIME,
 		added_at    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 	);
+
+	-- Usage events: one immutable row per completed upstream request attempt
+	-- (failover steps, key rotations, and probes each get their own row).
+	-- Token columns are NULL when the provider did not report them — 0 is a
+	-- genuine reported zero, never a placeholder. Append-only: nothing ever
+	-- updates or deletes rows here.
+	CREATE TABLE IF NOT EXISTS usage_events (
+		id             INTEGER PRIMARY KEY AUTOINCREMENT,
+		created_at     DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		provider       TEXT NOT NULL,
+		model_used     TEXT NOT NULL,
+		model_asked    TEXT NOT NULL DEFAULT '',
+		request_id     TEXT,
+		key_index      INTEGER,               -- 0-based key-pool index; NULL = no pool
+		attempt        INTEGER,               -- 1-based position in the provider chain; 0 = probe
+		status         INTEGER NOT NULL,      -- upstream HTTP status; 0 = transport error
+		success        BOOLEAN NOT NULL DEFAULT 0,
+		stream         BOOLEAN NOT NULL DEFAULT 0,
+		in_tokens      INTEGER,               -- fresh input (excludes cached)
+		out_tokens     INTEGER,
+		cache_read_tokens    INTEGER,
+		cache_write_tokens   INTEGER,
+		reasoning_tokens     INTEGER,         -- subset of out_tokens (no double count)
+		usage_partial  BOOLEAN NOT NULL DEFAULT 0, -- stream aborted / usage only partially known
+		duration_ms    INTEGER NOT NULL DEFAULT 0,
+		rate_limited   BOOLEAN NOT NULL DEFAULT 0,
+		retry_after    REAL,                  -- seconds, from 429 Retry-After
+		retry_reset_at DATETIME,              -- absolute reset timestamp from 429
+		quota_dimension  TEXT,                -- e.g. "5h"/"7d", transcribed from provider headers
+		quota_utilization REAL,               -- 0..1 fraction, exactly as reported
+		quota_reset_at   DATETIME,            -- provider-reported quota reset epoch
+		quota_meta     TEXT,                 -- JSON: raw captured rate-limit/quota headers
+		error          TEXT,
+		probe          BOOLEAN NOT NULL DEFAULT 0
+	);
+	CREATE INDEX IF NOT EXISTS idx_usage_events_provider_created ON usage_events(provider, created_at);
+	CREATE INDEX IF NOT EXISTS idx_usage_events_created_at ON usage_events(created_at);
+	CREATE INDEX IF NOT EXISTS idx_usage_events_model_used ON usage_events(model_used);
 	`
 
 	if _, err := db.conn.Exec(schema); err != nil {
