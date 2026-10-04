@@ -769,3 +769,35 @@ func TestGetProviderQuota(t *testing.T) {
 		t.Errorf("unlabeled snapshot wrong: %+v", s)
 	}
 }
+// Regression: rows written by something other than RecordUsageEvent (e.g. an
+// operator seeding the SQLite file by hand) can hold NULL in raw-string
+// columns. The events SELECT must COALESCE them instead of dropping the row on
+// a scan error — a hand-seeded NULL quota_dimension used to make the whole
+// event vanish from /api/usage/events and the provider's windows with it.
+func TestGetUsageEvents_NullRawStringColumns(t *testing.T) {
+	db := newTestDB(t)
+	_, err := db.conn.Exec(`INSERT INTO usage_events
+		(created_at, provider, model_used, model_asked, request_id, key_index, attempt,
+		 status, success, stream, in_tokens, out_tokens, cache_read_tokens, cache_write_tokens,
+		 reasoning_tokens, usage_partial, duration_ms, rate_limited, retry_after, retry_reset_at,
+		 quota_dimension, quota_utilization, quota_reset_at, quota_meta, error, probe)
+		VALUES (?, 'zai', 'glm-5.2', 'glm-5.2', NULL, NULL, 1, 200, 1, 0, 30, 8, NULL, NULL,
+		 NULL, 0, 100, 0, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 0)`,
+		time.Now().UTC().Format("2006-01-02 15:04:05"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	evs, err := db.GetUsageEvents(UsageFilter{Provider: "zai"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(evs) != 1 {
+		t.Fatalf("GetUsageEvents returned %d events, want 1 — NULL raw strings must not drop the row", len(evs))
+	}
+	if evs[0].QuotaDimension != "" || evs[0].RequestID != "" || evs[0].Error != "" || evs[0].QuotaMeta != "" {
+		t.Errorf("NULL raw strings should scan as empty: %+v", evs[0])
+	}
+	if evs[0].In == nil || *evs[0].In != 30 {
+		t.Errorf("in_tokens = %v, want 30", evs[0].In)
+	}
+}

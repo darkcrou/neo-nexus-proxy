@@ -106,7 +106,7 @@ func (db *DB) GetUsageEvents(f UsageFilter) ([]*UsageEvent, error) {
 			key_index, attempt, status, success, stream,
 			in_tokens, out_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens,
 			usage_partial, duration_ms, rate_limited, retry_after, retry_reset_at,
-			quota_dimension, quota_utilization, quota_reset_at, COALESCE(quota_meta,''),
+			COALESCE(quota_dimension,''), quota_utilization, quota_reset_at, COALESCE(quota_meta,''),
 			COALESCE(error,''), probe
 		FROM usage_events`
 	var where []string
