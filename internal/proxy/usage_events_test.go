@@ -147,9 +147,10 @@ func TestUsageEvent_NonStreamSuccess(t *testing.T) {
 	if e.KeyIndex != nil {
 		t.Errorf("key_index = %v, want nil (no key pool)", *e.KeyIndex)
 	}
-	// raw (presence-preserving) values, NOT the normalized cost arithmetic:
-	// prompt_tokens stays 100 even though fresh-input is 70 after cache hit.
-	wantIntPtr(t, e.In, 100, "in")
+	// fresh-input semantics: OpenAI prompt_tokens (100) folds in the cached
+	// 30, so the event stores In=70 — the same meaning as an Anthropic event.
+	// The as-reported prompt_tokens stays reconstructible as in + cache_read.
+	wantIntPtr(t, e.In, 70, "in")
 	wantIntPtr(t, e.Out, 20, "out")
 	wantIntPtr(t, e.CacheRead, 30, "cache_read")
 	wantIntPtr(t, e.Reasoning, 8, "reasoning")
@@ -296,7 +297,7 @@ func TestUsageEvent_FailoverDiscards(t *testing.T) {
 	if last.Attempt != 2 {
 		t.Errorf("final attempt=%d, want 2 (second chain entry)", last.Attempt)
 	}
-	wantIntPtr(t, last.In, 100, "final in")
+	wantIntPtr(t, last.In, 70, "final in") // fresh portion of prompt_tokens=100 minus cached 30
 }
 
 func TestUsageEvent_TransportErrors(t *testing.T) {
@@ -633,7 +634,7 @@ func TestUsageEvent_GatewayPassthrough(t *testing.T) {
 	if e.Stream {
 		t.Error("non-streaming request")
 	}
-	wantIntPtr(t, e.In, 100, "in")
+	wantIntPtr(t, e.In, 70, "in") // fresh portion of prompt_tokens=100 minus cached 30
 	wantIntPtr(t, e.Reasoning, 8, "reasoning")
 	if e.RequestID != "req-abc-123" {
 		t.Errorf("request_id=%q", e.RequestID)

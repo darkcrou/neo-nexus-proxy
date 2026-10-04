@@ -1293,12 +1293,26 @@ func (h *Handler) recordUsageEvent(active *activeProvider, req AnthropicRequest,
 		i := att.keyIdx
 		ev.KeyIndex = &i
 	}
-	// raw pointer fields pass straight through: nil = not reported
+	// Token fields are stored with cross-provider "fresh input" semantics:
+	// in_tokens is always the portion of the prompt that was NOT served from
+	// cache, matching what Anthropic reports natively. OpenAI-compatible
+	// providers fold cached tokens into prompt_tokens, so the cached portion
+	// is subtracted here (clamped at zero, presence preserved: a nil In or nil
+	// CacheRead stays nil). The as-reported prompt_tokens stays reconstructible
+	// as in + cache_read, and the window derivation can sum in + cache_read +
+	// cache_write without double-counting for any provider.
 	ev.In = raw.In
 	ev.Out = raw.Out
 	ev.CacheRead = raw.CacheRead
 	ev.CacheWrite = raw.CacheWrite
 	ev.Reasoning = raw.Reasoning
+	if providers.IsOpenAICompatible(active.impl.Name()) && raw.In != nil && raw.CacheRead != nil {
+		fresh := *raw.In - *raw.CacheRead
+		if fresh < 0 {
+			fresh = 0
+		}
+		ev.In = &fresh
+	}
 	if _, err := h.db.RecordUsageEvent(ev); err != nil {
 		log.Warn().Err(err).Msg("Failed to record usage event")
 	}

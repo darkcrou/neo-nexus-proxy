@@ -243,6 +243,12 @@ func (h *Handler) relayOpenAIStream(w http.ResponseWriter, r *http.Request, acti
 				raw.Reasoning = &reasonTok
 			}
 		}
+		// clamp the cached portion the same way openAITokens does, so a
+		// malformed upstream reporting cached > prompt can't produce a
+		// negative fresh-input cost.
+		if cachedTok > inTok {
+			cachedTok = inTok
+		}
 		h.logAbortedStream(active, req, complexity, tokenUsage{In: inTok - cachedTok, Out: outTok, CacheRead: cachedTok}, nil, resp.StatusCode, startTime, att, raw, abortText)
 	}
 

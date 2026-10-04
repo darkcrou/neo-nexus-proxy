@@ -34,8 +34,10 @@ func (u tokenUsage) billable() int { return u.In + u.Out + u.CacheRead + u.Cache
 //
 // rawUsage preserves exactly what the provider reported: nil means "not
 // reported", a reported zero stays zero. It feeds the immutable usage_events
-// store; the normalized tokenUsage views below are derived from it for cost
-// calculation so the two can never drift apart.
+// store (which normalizes In to fresh-input semantics for OpenAI-compatible
+// providers at the record site — see recordUsageEvent); the normalized
+// tokenUsage views below are derived from it for cost calculation so the two
+// can never drift apart.
 
 type rawUsage struct {
 	In         *int // as-reported input (OpenAI: includes cached; Anthropic: excludes)
@@ -245,6 +247,13 @@ func captureQuota(h http.Header) attemptQuota {
 
 	// Anthropic unified-quota transcription: prefer the explicit per-dimension
 	// headers; fall back to the representative claim's reset epoch alone.
+	// Deliberately 5h-first: Anthropic reports both dimensions on every
+	// response, so the typed fields (Utilization/ResetAt) carry the 5h window —
+	// the one the dashboard derives windows for. 7d observations stay
+	// preserved verbatim in Meta (they are only hand-seeded into typed fields
+	// in tests). The claim-vocabulary fallback headers below are defensive:
+	// real-world Anthropic dumps send the per-dimension headers, not the
+	// representative-claim text form.
 	for _, key := range []string{"5h", "7d"} {
 		v := h.Get("Anthropic-Ratelimit-Unified-" + key + "-Utilization")
 		if v == "" {
