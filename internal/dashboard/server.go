@@ -71,6 +71,12 @@ func (s *Server) Routes() http.Handler {
 	api.HandleFunc("/report", s.handleReport).Methods("GET")
 	api.HandleFunc("/savings/card.svg", s.handleSavingsCard).Methods("GET")
 
+	// Usage-measurement endpoints (immutable event history + aggregations).
+	api.HandleFunc("/usage/windows", s.handleUsageWindows).Methods("GET")
+	api.HandleFunc("/usage/events", s.handleUsageEvents).Methods("GET")
+	api.HandleFunc("/usage/totals", s.handleUsageTotals).Methods("GET")
+	api.HandleFunc("/usage/quota", s.handleUsageQuota).Methods("GET")
+
 	// Setup wizard (first-run experience).
 	api.HandleFunc("/setup/status", s.handleSetupStatus).Methods("GET")
 	api.HandleFunc("/setup/test", s.handleSetupTest).Methods("POST")

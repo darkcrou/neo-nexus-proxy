@@ -39,7 +39,7 @@ Probe requests recorded with `probe=1`.
 | 3  | U3 | presence-aware parsing + header capture | Critical | done   | Extraction   | parser unit tests |
 | 4  | U4 | recording hooks in proxy hot path      | Critical | done   | Extraction   | handler/stream/gateway tests |
 | 5  | U5 | aborted-stream handling + marked rows   | High     | done   | Grouped: Relays | abort tests |
-| 6  | U6 | dashboard API endpoints                 | High     | pending | API          | dashboard tests |
+| 6  | U6 | dashboard API endpoints                 | High     | done   | API          | dashboard tests |
 | 7  | U7 | dashboard UI panel + rebuild embed      | Medium   | pending | UI (delegate) | build + embed + visual check |
 | 8  | U8 | CHANGELOG + CLAUDE.md docs              | Medium   | pending | Docs         | review |
 
@@ -134,6 +134,10 @@ Probe requests recorded with `probe=1`.
   snake_case JSON, plural-key envelopes, empty shapes when db==nil.
 - **Verify:** dashboard tests seeding events via `RecordUsageEvent` and
   asserting JSON shapes (full-router style + handler-direct style).
+- **Status:** done — `internal/dashboard/usage.go` (4 handlers, empty shapes on
+  nil db, plural envelopes), routes registered in server.go; providerless
+  `/windows` derives the provider list from usage totals; 5 tests in
+  dashboard/usage_test.go.
 
 ### U7 — dashboard UI panel (delegate)
 - **What:** "Usage windows" panel in App.svelte + stores: current window per
