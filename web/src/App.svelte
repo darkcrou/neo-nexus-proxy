@@ -274,7 +274,7 @@
     drillErr = ''
     const ok = await fetchUsageEvents(provider)
     drillLoading = false
-    if (!ok) drillErr = 'failed to load events — try the refresh button'
+    if (!ok) drillErr = 'failed to load events'
   }
 
   async function refreshUsagePanel() {
@@ -282,10 +282,11 @@
     await Promise.all([
       refreshUsage(),
       // keep the failure visible: a failed drill-down refresh clears the
-      // events store, which would otherwise read as "no events"
+      // events store, which would otherwise read as "no events"; cleared
+      // again on success so a recovered fetch isn't masked by a stale error
       drillProvider
         ? fetchUsageEvents(drillProvider).then((ok) => {
-            if (!ok) drillErr = 'failed to load events — try the refresh button'
+            drillErr = ok ? '' : 'failed to load events'
           })
         : Promise.resolve(true),
     ])

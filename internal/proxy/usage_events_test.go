@@ -1185,7 +1185,7 @@ func TestUsageEvent_LiveStreamCachedUsage(t *testing.T) {
 		for _, c := range []string{
 			`{"choices":[{"delta":{"content":"Hi"},"finish_reason":null}]}`,
 			`{"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":6,"prompt_tokens_details":{"cached_tokens":40}}}`,
-			`data: [DONE]`,
+			`[DONE]`,
 		} {
 			fmt.Fprintf(w, "data: %s\n\n", c)
 			fl.Flush()
