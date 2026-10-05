@@ -183,4 +183,10 @@ Probe requests recorded with `probe=1`.
 | 2026-10-04 | U6 | 2175f6d — /api/usage/* endpoints, 5 tests |
 | 2026-10-04 | fix | 60995fe — COALESCE quota_dimension (found during U7 verification) |
 | 2026-10-04 | U7 | 5413c33 — usage panel UI; pixel check deferred (no image-capable upstream) |
-| 2026-10-04 | U8 | this commit — CHANGELOG + CLAUDE.md + plan-doc statuses |
+| 2026-10-04 | U8 | this commit — CHANGELOG + CLAUDE.md + plan-doc statuses || 2026-10-05 | G4 review | Rounds 1–2 fixes: 7657f9f fresh-input normalization, 4aab4d0 window precedence + WAL DSN, 825a3a2/03354e0 UI errors + docs; f1a69bb loud scan errors, quota dimension scoping, gateway model attribution, 500s on storage errors, aliasing/retry fixes |
+| 2026-10-05 | G4 review | Rounds 3–5 closure: 643450b res.ok checks, oaiStreamUsageView shared abort/tail helper, GetRecentRequests cache columns, stable sorts; 2892670 drill-down failure surfacing, tail cached test; c19fde1 error cleared on recovery, well-formed [DONE] fixture. Final round: APPROVE, no must/should findings |
+
+**Known follow-ups (review nice-to-haves, deliberately not blocking):**
+- `scanRequests` (internal/storage/requests.go) swallows per-row scan errors — pre-existing convention outside this subsystem; the cache-column lockstep is now pinned by `TestAbort_OpenAIStreamCachedUsage`/`TestUsageEvent_LiveStreamCachedUsage` asserting requests-row values.
+- Drill-down mid-refresh provider switch races the in-flight fetch (last-write-wins on `usageEvents`/`drillErr`) — pre-existing; a request-epoch guard in the usage store would close it if it ever bites.
+- No test pins break-on-`[DONE]` specifically (EOF takes the same completed-tail path); a hold-open-server variant would, if the relay's termination handling is ever reworked.

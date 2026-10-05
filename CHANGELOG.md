@@ -1,7 +1,7 @@
-# Changelog
+## Unreleased
 
-High-level summary of each release. Full, commit-level notes are on the
-[GitHub releases page](https://github.com/lynuxis2026-pixel/nexus-proxy/releases).
+- **Fixed:** usage drill-down error lifecycle — a failed events fetch now
+  shows an error (and clears on recovery) instead of a silently empty table.
 
 ## v0.8.0
 
