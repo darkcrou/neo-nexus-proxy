@@ -1,4 +1,4 @@
-## Unreleased
+## v0.8.1
 
 - **Fixed:** usage drill-down error lifecycle — a failed events fetch now
   shows an error (and clears on recovery) instead of a silently empty table.
