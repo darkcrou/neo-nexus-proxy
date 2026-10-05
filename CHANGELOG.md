@@ -10,9 +10,9 @@ High-level summary of each release. Full, commit-level notes are on the
   `data:` URI) are now accepted instead of failing with a 400
   (`unsupported content part type "image_url"`). This affects OpenAI-style
   clients such as pi.dev, opencode and Cursor. OpenAI-compatible providers
-  receive the image as sent; when the request is routed to an Anthropic,
-  Bedrock or Vertex provider, the image is converted to an Anthropic image
-  block (previously it became an empty text block). Malformed `image_url`
+  receive the image as sent, including the `detail` field; when the request
+  is routed to an Anthropic, Bedrock or Vertex provider, the image is
+  converted to an Anthropic image block. Malformed `image_url`
   parts and other unsupported part types still return a clear 400. NEXUS
   does not fetch image URLs: they are forwarded as received, and URL support
   and accepted formats depend on the provider (its own error is relayed
@@ -23,8 +23,9 @@ High-level summary of each release. Full, commit-level notes are on the
   image); the semantic cache now also skips OpenAI-shaped `image_url`
   requests; image detection recurses into `tool_result` content, so the
   `vision_model` override now applies to images Claude Code reads from disk
-  and to requests on the OpenAI gateway, and the logged `model_used` names
-  the model actually sent (the override applies to OpenAI-compatible
+  and to requests on the OpenAI gateway, and the logged `model_used`
+  (in both the request log and the usage events) names the model
+  actually sent (the override applies to OpenAI-compatible
   providers only; the `direct` strategy still forwards the requested model
   verbatim); `--inspect` capture omits long base64 image data instead of
   storing a truncated blob.
@@ -33,31 +34,52 @@ High-level summary of each release. Full, commit-level notes are on the
   `model_map` and the `vision_model` override — for pointing NEXUS
   straight at a specific provider model (e.g. `glm-5.2`, `zhai/glm-5.2`)
   with zero translation. Provider selection and sticky-until-429 behavior
-  stay identical to `auto`.
+  stay identical to `auto`. Enable it with `strategy = "direct"` under
+  `[routing]` in `config.toml`.
 - **Usage measurement (immutable per-attempt events):** every roundtrip
   that leaves the machine — chain failover steps, 429 key rotations,
   cascade candidates, cooldown-recovery probes, and streams that aborted
   mid-flight — now appends one row to a new append-only `usage_events`
-  table. Token counts are presence-aware (fresh input, cache reads,
-  cache writes, output, reasoning as a subset of output; NULL means the
-  provider didn't report a value, 0 means it reported zero) and never
-  double-counted. Rate-limit/quota headers are transcribed verbatim
-  (Anthropic's unified 5h/7d utilization + reset epochs typed; other
-  providers raw-captured), 429s record `Retry-After`/reset timestamps,
-  and a 429 is never interpreted as proof of quota exhaustion. Aborted
+  table, which is never pruned, so it grows with traffic. Cooldown-recovery
+  probes are recorded but excluded from windows and totals. Token counts
+  are presence-aware (fresh input, cache reads, cache writes, output,
+  reasoning as a subset of output; NULL means the provider didn't report a
+  value, 0 means it reported zero). Input is stored as fresh input for
+  every provider, with cached tokens split out: OpenAI-compatible
+  providers fold cached tokens into `prompt_tokens`, so NEXUS subtracts
+  them, and nothing is double-counted. Rate-limit/quota headers are
+  transcribed verbatim (Anthropic's unified 5h/7d utilization + reset
+  epochs typed; other providers raw-captured), 429s record
+  `Retry-After`/reset timestamps, and a 429 is never interpreted as proof
+  of quota exhaustion. Aborted
   streams keep their observed tokens as partial usage and mark the
   request log row with the abort reason.
 - **Quota windows + usage dashboard:** windows are derived at query time
   from the event history (never persisted) with honest termination
-  reasons — provider-reported resets (`PROVIDER_RESET`) are trusted over
-  assumed 5-hour walls (`TIME_ELAPSED`), rate limits close windows as
-  `RATE_LIMIT` but never open them, and the oldest window's assumed end
-  is reported `UNKNOWN` because its true start predates recorded
+  reasons — a provider-reported reset (`PROVIDER_RESET`) is trusted over
+  everything; a 429 closes the window as `RATE_LIMIT` at its own timestamp
+  and is counted in that window even past the assumed 5-hour wall (it
+  never opens one); otherwise the assumed wall closes it as
+  `TIME_ELAPSED`; the oldest window's end reason is reported `UNKNOWN`
+  instead of `TIME_ELAPSED` because its true start predates recorded
   history. Exposed via `GET /api/usage/{windows,events,totals,quota}` on
   the dashboard port plus a new "Usage windows" panel: current window
   per provider with cache-hit ratio and provider-reported utilization,
   recent window history with end reasons, and a per-provider event
-  drill-down.
+  drill-down. The `/api/usage/*` endpoints return HTTP 500 with the error
+  on a storage failure (instead of an empty 200); a provider's quota
+  snapshot is only attached when it matches the queried dimension (so
+  Anthropic's 7d figure cannot appear on a 5h card); the usage panel
+  loads on page open and on its refresh button (it is not live-streamed)
+  and shows a fetch failure as an error state with a retry instead of
+  hiding the panel.
+- **SQLite WAL mode now actually applied:** `nexus.db` really runs in WAL
+  journal mode with a 5-second busy timeout; the earlier connection
+  options were silently ignored by the pure-Go SQLite driver, leaving
+  rollback-journal mode, which mattered once every request attempt started
+  writing a usage event. Expect `nexus.db-wal` and `nexus.db-shm` next to
+  `nexus.db` (in Docker, in your `./data` directory); copy all three, or
+  stop NEXUS first, when backing up.
 
 ## v0.7.0
 
