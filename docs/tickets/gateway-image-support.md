@@ -127,9 +127,12 @@ Out of scope (observed, not touched): the OpenAI->Anthropic gateway conversion d
 | 6 | I6 | End-to-end image test matrix across all gateway paths | High | done | -- | No | new test file passes with -race |
 | 7 | I7 | Docs: CLAUDE.md, CHANGELOG, provider notes | Medium | done | -- | No | rg checks, no stale "shallow" claims |
 | 8 | V1 | Full verification of committed branch in a clean state | High | done | -- | No | gofmt, vet, build, test -race, diff scope |
-| 9 | D1 | Merge to main, push to opi (needs user decision) | High | pending | -- | No | git log, remote ref |
-| 10 | D2 | Deploy to the Raspberry Pi (docker compose) | High | pending | -- | No | health, version, logs |
-| 11 | D3 | Live end-to-end image test through the real proxy | High | pending | -- | Needs Pi up | real image described |
+| 9 | D1 | Merge to main, push to opi (needs user decision) | High | done | -- | No | git log, remote ref |
+| 10 | D2 | Deploy to the Raspberry Pi (docker compose) | High | done | -- | No | health, version, logs |
+| 11 | D3 | Live end-to-end image test through the real proxy | High | done | -- | Needs Pi up | real image described |
+| 12 | R1 | Changelog audit of everything since v0.7.0 + semver call | High | done | Release | No | report of gaps/stale bullets |
+| 13 | R2 | Backfill + promote Unreleased, commit plan log, annotated tag (local) | High | in_progress | Release | No | git log, git tag -n99 |
+| 14 | R3 | Push main + tag (remote choice needs the user) | High | pending | Release | No | ls-remote on chosen remote |
 
 ## Item Details
 
@@ -405,7 +408,7 @@ Out of scope (observed, not touched): the OpenAI->Anthropic gateway conversion d
   1. Preflight on the Pi: `git status --short` must be clean; record `git rev-parse --short HEAD`;
      `mountpoint /mnt/hdd1` and `ls /mnt/hdd1/apps/nexus` must succeed (the external HDD detached earlier
      today; do not deploy onto a missing mount); record `docker ps` state of `nexus`.
-  2. Rollback point: `docker tag nexus-proxy-nexus:latest nexus-proxy-nexus:pre-image-fix`.
+  2. Rollback points: (a) `docker tag nexus-proxy-nexus:latest nexus-proxy-nexus:pre-image-fix`; (b) database backup BEFORE the new binary ever opens it (this deploy brings the storage change that switches SQLite to WAL mode, and retagging an image does not roll the data back): list `/mnt/hdd1/apps/nexus/` first, then copy `nexus.db` plus any `nexus.db-wal` / `nexus.db-shm` into `/mnt/hdd1/apps/nexus-backup-pre-image-fix/` (create it; `cp -a`; never move or delete originals), and confirm sizes match. Do this while the old container is still running or after `docker stop nexus` if you want a quiescent copy (a plain `cp` of a live delete-journal DB can be torn; prefer `sqlite3 nexus.db ".backup ..."` if the sqlite3 CLI exists on the Pi, otherwise stop the container first, copy, then continue).
   3. `git fetch origin && git merge --ff-only origin/<branch pushed in D1>` (or `git pull --ff-only`).
   4. `docker compose up -d --build` (long-running: use a long Bash timeout or background; the build runs
      `npm ci` and a Go build on aarch64).
@@ -448,6 +451,149 @@ Out of scope (observed, not touched): the OpenAI->Anthropic gateway conversion d
 - **Backend needed:** Needs the Pi up (verified in D2).
 - **Verify:** items 1, 2 and 5 pass; items 3, 4, 6 are consistent; summary of evidence returned.
 
+### R1 Changelog audit of everything since v0.7.0 + semver call
+
+- **What:** Read-only audit. Decide whether `## Unreleased` in `CHANGELOG.md` is complete and accurate for
+  the 24 commits between tag `v0.7.0` and `main`, and recommend the next version number.
+- **Why:** CLAUDE.md "Version Tags" requires every user-facing change since the previous tag to have a
+  bullet under `## Unreleased` BEFORE promotion, and requires choosing patch/minor/major correctly.
+  The Unreleased section was written by several sessions at different times; the usage-measurement review
+  commits (rounds 1-3) changed behavior after its bullets were written (window precedence, scan errors,
+  WAL pragmas, fresh-input accounting, client error handling), so existing bullets may be stale.
+- **How:** Work from the worktree
+  `/private/tmp/claude-501/-Users-av-sources-github-com-nexus-proxy/67a2ba1f-ffc7-42e0-834f-b98a6aa9429e/scratchpad/nexus-imgfix`
+  (branch tip == `main` at e4061ca). Read only; change and stage nothing.
+  1. `git log --format='%h %s%n%b---' v0.7.0..main` (24 commits) and `CHANGELOG.md` `## Unreleased`.
+  2. Classify each commit as user-facing (behavior, config, CLI, API/endpoint, dashboard UI, deployment,
+     data/storage, security/privacy) or internal (tests, tickets/plan docs, CLAUDE.md-only docs, pure
+     refactor). Map each user-facing commit to the Unreleased bullet that covers it, or report it as a gap.
+  3. For each existing Unreleased bullet, check it against the FINAL code on `main` (read the relevant
+     source/tests, not just commit subjects): list bullets that are inaccurate, stale, or missing a
+     user-visible consequence (e.g. WAL journal mode now actually applied to nexus.db; a rate-limited event
+     closes its usage window at its own timestamp; usage events store fresh input; error handling in the
+     usage endpoints/UI). Do not trust bullet wording; verify against code.
+  4. Semver: look for anything BREAKING for an existing user between the two points: removed/renamed
+     config keys or CLI flags (`git diff v0.7.0..main -- internal/config cmd/nexus`), changed response
+     shapes of existing `/api/*` endpoints or the proxy endpoints, storage changes that are not
+     backward-compatible (`git diff v0.7.0..main -- internal/storage`: new tables/columns must be additive;
+     check migrations run on an existing DB), and the journal-mode change. Pre-1.0 precedent in this repo:
+     new features bump the minor (v0.5.0 -> v0.6.0 -> v0.7.0). Recommend v0.8.0 unless something is breaking
+     or the contents are bugfix-only; justify in two or three sentences.
+  5. Propose concrete bullet text for each gap/stale bullet, in the existing voice (bold lead-in, plain
+     sentences, wrapped at about 76 columns, 2-space continuation indent, no emojis). Also propose a
+     one-line tagline for the tag (style: `v0.7.0 — Vision/image support, sticky provider cooldown,
+     host-editable Docker config`) and 4-8 short tag-summary bullets.
+- **Backend needed:** No.
+- **Verify:** Report contains: (a) a table of the 24 commits with user-facing/internal and the covering
+  bullet, (b) the gap list, (c) the stale-bullet list with evidence (file/function), (d) semver
+  recommendation with evidence of breaking/non-breaking, (e) proposed bullet texts, tagline and tag
+  bullets. No files modified (`git status --short` unchanged apart from the plan file).
+
+### R2 Backfill + promote Unreleased, commit plan log, annotated tag (local)
+
+- **What:** Prepare and cut release v0.8.0 locally, in two phases. Phase A (backfill commit) is delegated
+  first. Phase B (plan-log commit, `release:` commit, fast-forward `main`, annotated tag) is delegated only
+  after the main agent says so (it follows the live test D3). Nothing is pushed in this item.
+- **Why:** CLAUDE.md "Version Tags": every user-facing change since the last tag needs a bullet under
+  `## Unreleased` first; then a separate `release:` commit promotes it; then an annotated tag. Precedent:
+  `ff4ea6e docs: backfill changelog entries ...`, `02f9833 release: promote Unreleased to v0.7.0`, tag
+  `v0.7.0` (see `git tag -l -n99 v0.7.0`). Semver: v0.8.0 (minor). R1 audited the 24 commits since v0.7.0 and
+  found nothing breaking (no config/CLI changes; storage changes additive; new `/api/usage/*` GETs only).
+- **How:** Work ONLY in the worktree
+  `/private/tmp/claude-501/-Users-av-sources-github-com-nexus-proxy/67a2ba1f-ffc7-42e0-834f-b98a6aa9429e/scratchpad/nexus-imgfix`
+  (branch `fix/gateway-image-support`, tip e4061ca == `main`). Never run go commands in the main checkout.
+  The plan file in the worktree is modified and uncommitted: never `git add -A` / `.` / `commit -a`; stage by
+  explicit path. Use the Edit/Read tools and `rg`, never sed/awk. Commit trailer (last line):
+  `Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>`. Check the last 5 commit subjects first.
+
+  PHASE A - backfill commit (CHANGELOG.md only). Edit `## Unreleased` IN PLACE with minimal diffs (read the
+  whole section first; keep the existing voice: bold lead-in, plain sentences, wrapped at about 76 columns,
+  2-space continuation indent, no emojis, no em-dash overuse; do not rewrite panel/feature descriptions you
+  are not correcting). Required changes, all verified against the code at e4061ca by the main agent:
+  1. Image bullet ("Image support on the OpenAI gateway"): DELETE the parenthetical "(previously it became an
+     empty text block)" (false: in v0.7.0 the parser rejected `image_url` with a 400 before any conversion ran).
+     Add that OpenAI-compatible providers receive the image as sent, "including the `detail` field".
+  2. Image-fixes bullet: after "the logged `model_used`" add "(in both the request log and the usage events)".
+  3. `direct` bullet: append a sentence: Enable it with `strategy = "direct"` under `[routing]` in `config.toml`.
+  4. Usage-measurement (events) bullet: (a) say the table is never pruned, so it grows with traffic; (b) state
+     that input is stored as fresh input for every provider with cached tokens split out (OpenAI-compatible
+     providers fold cached tokens into `prompt_tokens`, so NEXUS subtracts them), so nothing is double-counted;
+     reasoning tokens stay a subset of output; (c) say cooldown-recovery probes are recorded but excluded from
+     windows and totals. Keep the existing aborted-stream sentence as is. Do NOT add any claim about aborted
+     streams stopping upstream consumption (not verified against v0.7.0).
+  5. Quota-windows bullet: replace the precedence description so it reads: a provider-reported reset
+     (`PROVIDER_RESET`) is trusted over everything; a 429 closes the window as `RATE_LIMIT` at its own timestamp
+     and is counted in that window even past the assumed 5-hour wall (it never opens one); otherwise the
+     assumed wall closes it as `TIME_ELAPSED`; the oldest window's end reason is reported `UNKNOWN` instead of
+     `TIME_ELAPSED` because its true start predates recorded history. Then add: the `/api/usage/*` endpoints
+     return HTTP 500 with the error on a storage failure (instead of an empty 200); a provider's quota snapshot is
+     only attached when it matches the queried dimension (so Anthropic's 7d figure cannot appear on a 5h card);
+     the usage panel loads on page open and on its refresh button (it is not live-streamed) and shows a fetch
+     failure as an error state with a retry instead of hiding the panel. Verify each of those against
+     `internal/dashboard/usage.go`, `internal/storage/usage.go`, `web/src/stores/usage.ts` and
+     `web/src/App.svelte` (the version in the worktree) before writing it; if any is not true, leave it out and
+     report. Do not add claims about keyboard accessibility or stale-data banners.
+  6. Add a NEW bullet after the quota-windows bullet: **SQLite WAL mode now actually applied:** `nexus.db` really
+     runs in WAL journal mode with a 5-second busy timeout; the earlier connection options were silently ignored
+     by the pure-Go SQLite driver, leaving rollback-journal mode, which mattered once every request attempt
+     started writing a usage event. Expect `nexus.db-wal` and `nexus.db-shm` next to `nexus.db` (in Docker, in
+     your `./data` directory); copy all three, or stop NEXUS first, when backing up.
+  Then: `go build ./...` (worktree), `git diff --stat` shows only CHANGELOG.md, commit with subject
+  `docs: backfill changelog entries for usage-review fixes and WAL mode` and a body listing what was
+  corrected/added and why (the R1 audit; the false "empty text block" clause was removed). Stop after Phase A.
+
+  PHASE B - run only when told (the main agent will say "Phase B"). Steps, in order:
+  1. Commit the plan file as it stands in the worktree (it is the completion log; the main agent has finalized
+     it): `git add docs/tickets/gateway-image-support.md`, subject
+     `docs(tickets): gateway image-support plan - deploy and release completion log`.
+  2. Release commit (CHANGELOG.md only): rename the heading `## Unreleased` to `## v0.8.0` (nothing else, as in
+     02f9833), `go build ./...`, commit `release: promote Unreleased to v0.8.0`.
+  3. In the MAIN checkout `/Users/av/sources/github.com/nexus-proxy`: `pwd`, `git branch --show-current` (must
+     be main), `git log --oneline -1 main` (must be e4061ca, the branch point; if main moved, STOP and report),
+     `git status --short` (record it: the other session's uncommitted usage.go, usage_events_test.go,
+     web/src/App.svelte and untracked .pi/ must stay untouched), then
+     `git merge --ff-only fix/gateway-image-support`, then `git status --short` again (must be identical).
+  4. Annotated tag on the release commit: write the message to a file in the scratchpad dir, then
+     `git tag -a v0.8.0 -F <file> <release-commit-hash>`. Message (style of v0.7.0: first line, blank line,
+     hyphen bullets wrapped at about 78 columns with 2-space continuation):
+     ```
+     v0.8.0 — Usage measurement and quota windows, direct routing strategy, image support on the OpenAI gateway
+
+     - Usage measurement: immutable per-attempt usage_events (failovers, key
+       rotations, cascade candidates, probes, aborted streams) with
+       presence-aware token counts and verbatim quota/rate-limit capture
+     - Quota windows derived at query time (PROVIDER_RESET > RATE_LIMIT >
+       TIME_ELAPSED) behind /api/usage/{windows,events,totals,quota}, plus a
+       "Usage windows" dashboard panel
+     - Aborted streams recorded as partial usage
+     - direct routing strategy: forward the requested model id unchanged to
+       OpenAI-compatible providers
+     - Image support on /v1/chat/completions (image_url parts), with the
+       vision_model override and correct model_used on the gateway
+     - Fix: privacy firewall no longer corrupts base64 images; semantic cache
+       skips image_url requests; --inspect omits image data
+     - Fix: SQLite WAL mode and busy timeout now actually applied
+     ```
+  5. Do NOT push anything and do NOT push the tag.
+- **Backend needed:** No.
+- **Verify:** Phase A: `git log --oneline -3`, `git show --stat HEAD` (CHANGELOG.md only), the CHANGELOG diff
+  reviewed for accuracy. Phase B: `git log --oneline -5 main`; `git tag -l -n99 v0.8.0` shows the message;
+  `git rev-parse v0.8.0^{commit}` equals `git rev-parse main`; `git ls-remote --tags opi v0.8.0` is empty
+  (not pushed); main checkout `git status --short` unchanged.
+
+### R3 Push main + tag (remote choice needs the user)
+
+- **What:** Push `main` and the new tag to the remote(s) the user names.
+- **Why:** CLAUDE.md: always ask which remote(s); never push to `origin` unprompted (a tag on `origin`
+  triggers a public GitHub release and a ghcr.io image publish).
+- **How:** Main-agent gate: ask the user which remotes. Evidence for the recommendation: tags v0.6.0 and
+  v0.7.0 exist on `opi` only; `origin` has tags only up to v0.5.0; `fork` has no tags. Then
+  `git push <remote> main` and `git push <remote> <tag>` (never `--force`, never `--tags`; push the single
+  named tag). To be delegated only after the answer.
+- **Backend needed:** No.
+- **Verify:** `git ls-remote --tags <remote> <tag>` returns the tag object id equal to `git rev-parse <tag>`;
+  `git ls-remote <remote> main` equals local `main`.
+
 ## Completion Log
 
 | Date | Item | Notes |
@@ -460,3 +606,11 @@ Out of scope (observed, not touched): the OpenAI->Anthropic gateway conversion d
 | 2026-10-04 | I6 | Commit a7e4ff3. image_e2e_test.go: 8 TestImageE2E_* cases across gateway/messages, stream, Bedrock, failover, exact+semantic cache, firewall; all pass with -race and -count=3. Main agent mutation-checked the matrix: disabling the firewall data-URI skip fails the firewall case; disabling contentHasImage fails the tool_result-vision and semantic-cache cases; restored and clean. |
 | 2026-10-04 | I7 | Commit b0a7790 (CLAUDE.md, CHANGELOG.md only). Vision section rewritten (shared detector, upstreamModel, gateway image_url validation, Anthropic conversion, URLs-not-fetched, firewall, inspector), Direct Strategy section de-staled (dropped stale line refs in the rewritten paragraph), Critical Decisions bullet added (records reversal of "shallow by design"), two CHANGELOG bullets. Main agent read the full diff: accurate against the code. README/docs had no image mentions. |
 | 2026-10-04 | V1 | Clean state verified: go vet ./..., go build ./..., go test -race ./... all pass (8 packages); -count=3 on Image/Firewall/Semantic/Gateway shows no flakes; git diff --check clean; diff scope = 16 files, none of usage.go / usage_events_test.go / web/; no debug prints or TODOs. gofmt lists 20 pre-existing unformatted files, of which only transformer.go is touched by this branch (its unformatted lines predate the branch and are not in its hunks). main tip still 643450b at that time. |
+| 2026-10-04 | D1 | User chose "Everything on main". Plan committed on the branch as e4061ca, main fast-forwarded 643450b -> e4061ca (8 commits), pushed to opi only (2175f6d..e4061ca). Main agent verified: local main == opi/main == e4061ca; origin and fork refs unchanged; the other session's uncommitted files (usage.go, usage_events_test.go, App.svelte) and .pi/ untouched. No tag created. |
+| 2026-10-05 | D2 (retry) | Pi is back up. Sub-agent preflight OK (mount, container Up, /health ok); created rollback image tag nexus-proxy-nexus:pre-image-fix and a verified DB backup (/mnt/hdd1/apps/nexus-backup-pre-image-fix/: nexus.db 3325952 bytes via sqlite3 .backup, integrity_check ok, journal_mode=delete; config.toml). Its `git fetch origin` from a non-interactive ssh was denied (Pi has no key for the git server), so it stopped. Meanwhile the user logged into the Pi interactively (11:21, tmux), ran `git pull` (Pi checkout now e4061ca, clean tree) and started `docker compose build` themselves. Main agent did NOT start a competing build/restart; D2 is being completed by the user. Plan: wait (read-only) for the container to be recreated, then run D3. |
+| 2026-10-05 | R1 | Read-only audit of the 24 commits v0.7.0..main: nothing breaking, recommend v0.8.0 (minor). Gaps found: WAL mode now actually applied (no bullet), usage API 500-on-storage-error, usage-panel behavior, `direct` activation instruction, events-table growth; stale: image bullet claimed "previously empty text block" (false: v0.7.0 rejected image_url with a 400), window precedence (RATE_LIMIT before TIME_ELAPSED), fresh-input accounting. Main agent spot-checked the key claims against committed code (500s, probes excluded, usage error/refresh UI, v0.7.0 parser) and DROPPED two unverified ones (aborted OpenAI streams "stop draining upstream"; keyboard-accessible rows / stale banner). Noticed, out of scope: README.md:186-190 documents `nexus start --strategy <x>` but no such CLI flag exists (strategy is set in config.toml); internal/storage/usage.go header comment lists window rules in the pre-fix order. |
+| 2026-10-05 | D2 (completed by user) | The user finished the deploy interactively: the Pi checkout was fast-forwarded to e4061ca and `docker compose build/up` recreated the container at 11:25 (new image ee2658714120 built 11:25:14, old image kept as nexus-proxy-nexus:pre-image-fix). Main agent confirmed read-only: container Up on the new image, /health ok, Pi HEAD e4061ca with a clean tree. |
+| 2026-10-05 | R2 phase A | Commit 9fc2d1c (CHANGELOG.md only). Removed the false "previously an empty text block" clause, added `detail` passthrough, usage-event model_used, `direct` activation, events-table growth/fresh-input/probe notes, corrected window precedence, usage API 500s, dimension scoping, panel on-demand loading + error state, and a new WAL-mode bullet. Sub-agent read the cited code before writing each claim; main agent reviewed the full diff and re-ran the build. |
+| 2026-10-05 | D3 | PASS against the deployed e4061ca instance (nexus.home.com resolves again; :80 via Zoraxy, :3000 direct, dashboard :2222). The original request shape (image_url data URI, kimi-k3) now returns 200 (was 400) with a correct description of docs/social-preview.png, on both ports, non-stream and stream (300 data lines + [DONE]); ~1236 prompt tokens, so the image reached Ollama Cloud intact. Text-only regression 200. Anthropic-shape /v1/messages with kimi-k3 and a base64 image block: 200 with a correct description; with claude-sonnet-4-6 it is a faithful relay of Ollama's own 404 "model not found" (expected under the `direct` strategy, not a NEXUS fault). ftp:// image URL: 400 with the new message, on both ports. Dashboard: requests and usage_events rows show model_asked = model_used = kimi-k3, status 200, no rate limiting. pi itself (`pi -p --provider nexus --model kimi-k3 ... @png`) described the image correctly through nexus.home.com. Note: the exact-body response cache serves byte-identical repeated image requests (by design; the semantic cache is what skips images). kimi-k3 is a reasoning model: with a small max_tokens (300) it can return empty content with finish_reason "length". |
+| 2026-10-05 | R2 phase B | This snapshot of the plan is committed first in phase B; the `release:` commit promoting Unreleased to v0.8.0 and the local annotated tag v0.8.0 follow it (see `git log` / `git tag -n99 v0.8.0`). R2 therefore stays in_progress here and R3 (push, needs the user's choice of remote) pending. Nothing pushed. |
+| 2026-10-04 | D2 | BLOCKED at preflight, nothing changed on the Pi: ssh rpi -> "Host is down" / timeout, ping 192.168.68.54 100% loss (verified twice, by the sub-agent and by the main agent at 21:43). nexus.home.com also no longer resolves (the Technitium DNS container runs on that Pi). No git fetch, image tag, DB backup or docker command ran. Pi should still be at 2175f6d (unconfirmed). Resume from D2 step 1 once the Pi answers SSH; the DB-backup step stays mandatory. |
