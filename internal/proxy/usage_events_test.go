@@ -1175,3 +1175,38 @@ func TestAbort_OpenAIStreamCachedExceedsPrompt(t *testing.T) {
 		t.Errorf("requests row in=%d, want 0 (clamped)", row.InputTokens)
 	}
 }
+
+// The completed-stream tail shares oaiStreamUsageView with the abort path —
+// this pins its cached-token semantics so the two paths can't drift.
+func TestUsageEvent_LiveStreamCachedUsage(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fl := w.(http.Flusher)
+		for _, c := range []string{
+			`{"choices":[{"delta":{"content":"Hi"},"finish_reason":null}]}`,
+			`{"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":6,"prompt_tokens_details":{"cached_tokens":40}}}`,
+			`data: [DONE]`,
+		} {
+			fmt.Fprintf(w, "data: %s\n\n", c)
+			fl.Flush()
+		}
+	}))
+	defer srv.Close()
+	h, db := buildUsageHandler(t, []testProv{{"test", "free", srv.URL}})
+
+	rec := doMessages(h, `{"model":"claude-haiku-4-5","max_tokens":50,"stream":true,"messages":[{"role":"user","content":"hi"}]}`)
+	if rec.Code != 200 {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	e := requireEvents(t, db, 1)[0]
+	wantIntPtr(t, e.CacheRead, 40, "cache_read")
+	wantIntPtr(t, e.Out, 6, "out")
+	wantIntPtr(t, e.In, 60, "in (fresh: prompt 100 − cached 40)")
+	if e.UsagePartial || e.Error != "" {
+		t.Errorf("completed stream must not be partial: partial=%v error=%q", e.UsagePartial, e.Error)
+	}
+	if row := lastRequestRow(t, db); row.InputTokens != 60 || row.CacheReadTokens != 40 {
+		t.Errorf("requests row in=%d cache_read=%d, want 60/40", row.InputTokens, row.CacheReadTokens)
+	}
+}

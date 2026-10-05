@@ -281,7 +281,13 @@
     usageRefreshing = true
     await Promise.all([
       refreshUsage(),
-      drillProvider ? fetchUsageEvents(drillProvider) : Promise.resolve(true),
+      // keep the failure visible: a failed drill-down refresh clears the
+      // events store, which would otherwise read as "no events"
+      drillProvider
+        ? fetchUsageEvents(drillProvider).then((ok) => {
+            if (!ok) drillErr = 'failed to load events — try the refresh button'
+          })
+        : Promise.resolve(true),
     ])
     usageRefreshing = false
   }

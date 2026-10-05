@@ -84,8 +84,8 @@ func (r rawUsage) openAITokens() tokenUsage {
 // stream tail and the abort path) must derive identical views, so they share
 // this one function:
 //
-//   - values are copied before pointers are taken, so the clamping below
-//     can't leak back into the loop variables;
+//   - Go parameters are by-value copies, so taking pointers to them can't
+//     alias any caller state (the counters stay untouched);
 //   - the cached portion is clamped the same way openAITokens does — a
 //     malformed upstream reporting cached > prompt must not produce a
 //     negative fresh input;
@@ -102,13 +102,12 @@ func oaiStreamUsageView(in, out, cached, reason int, sawUsage, sawReasoning bool
 	if cached > in {
 		cached = in
 	}
-	i, o, c, r := in, out, cached, reason
-	raw.In, raw.Out = &i, &o
+	raw.In, raw.Out = &in, &out
 	if cached > 0 {
-		raw.CacheRead = &c
+		raw.CacheRead = &cached
 	}
 	if sawReasoning {
-		raw.Reasoning = &r
+		raw.Reasoning = &reason
 	}
 	return raw, tokenUsage{In: in - cached, Out: out, CacheRead: cached}
 }
