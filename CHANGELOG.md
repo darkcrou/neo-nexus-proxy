@@ -3,7 +3,7 @@
 High-level summary of each release. Full, commit-level notes are on the
 [GitHub releases page](https://github.com/lynuxis2026-pixel/nexus-proxy/releases).
 
-## Unreleased
+## v0.8.0
 
 - **Image support on the OpenAI gateway (`/v1/chat/completions`):**
   requests with `image_url` content parts (an `http(s)` URL or a base64
