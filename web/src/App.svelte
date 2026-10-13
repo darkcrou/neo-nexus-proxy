@@ -1,12 +1,13 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte'
   import { Chart } from 'chart.js/auto'
+  import UsageWindowDetails from './components/UsageWindowDetails.svelte'
   import {
     connectSSE, disconnectSSE, fetchInitial, fetchTimeseries, fetchSavings,
     connected, stats, recentRequests, providers, providerBreakdown, complexityMix, timeseries, savings,
   } from './stores/requests'
   import {
-    fetchUsage, refreshUsage, fetchUsageEvents, usageWindows, usageEvents, usageError,
+    fetchUsage, refreshUsage, usageWindows, usageError,
     type UsageWindow,
   } from './stores/usage'
 
@@ -213,9 +214,7 @@
   $: namedBoard = leaderboard.filter((e) => e.user && e.user !== 'unattributed')
 
   // ── Usage windows panel ──
-  let drillProvider: string | null = null
-  let drillLoading = false
-  let drillErr = ''
+  let selectedWindow: UsageWindow | null = null
   let usageRefreshing = false
 
   // Most recent window per provider, kept only while it is still open.
@@ -231,9 +230,9 @@
   }
   $: currentWindows = openCurrentWindows($usageWindows)
 
-  // Newest ~8 windows across all providers, for the compact history table.
+  // Only completed windows belong in history; open windows have cards above.
   $: recentWindows = $usageWindows
-    .slice()
+    .filter(w => w.ended_at)
     .sort((a, b) => Date.parse(b.started_at) - Date.parse(a.started_at))
     .slice(0, 8)
 
@@ -246,15 +245,12 @@
   const ercStyle = (w: UsageWindow) => END_REASON_STYLE[w.end_reason] || 'unknown'
   const ercLabel = (w: UsageWindow) => END_REASON_LABEL[w.end_reason] || w.end_reason.toLowerCase()
 
-  // Compact token rendering for window/event numbers.
+  // Compact token rendering for window summaries.
   function fmtTokens(n: number): string {
     if (n >= 1_000_000) return (n / 1_000_000).toFixed(1).replace(/\.0$/, '') + 'M'
     if (n >= 1_000) return (n / 1_000).toFixed(1).replace(/\.0$/, '') + 'k'
     return String(n)
   }
-  // null tokens mean the provider didn't report them — show "–", never 0.
-  const tok = (v: number | null) => (v === null ? '–' : fmtTokens(v))
-
   // "14:32" today, "May 12 14:32" otherwise.
   function fmtWinTime(iso: string): string {
     const d = new Date(iso)
@@ -267,30 +263,18 @@
   // Utilization bar color: closer to the reported limit → hotter.
   const quotaColor = (u: number) => (u >= 0.9 ? '#ef4444' : u >= 0.7 ? '#f59e0b' : '#06b6d4')
 
-  async function toggleDrill(provider: string) {
-    if (drillProvider === provider) { drillProvider = null; return }
-    drillProvider = provider
-    drillLoading = true
-    drillErr = ''
-    const ok = await fetchUsageEvents(provider)
-    drillLoading = false
-    if (!ok) drillErr = 'failed to load events'
+  function toggleWindow(window: UsageWindow) {
+    selectedWindow = selectedWindow === window ? null : window
   }
 
   async function refreshUsagePanel() {
+    selectedWindow = null
     usageRefreshing = true
-    await Promise.all([
-      refreshUsage(),
-      // keep the failure visible: a failed drill-down refresh clears the
-      // events store, which would otherwise read as "no events"; cleared
-      // again on success so a recovered fetch isn't masked by a stale error
-      drillProvider
-        ? fetchUsageEvents(drillProvider).then((ok) => {
-            drillErr = ok ? '' : 'failed to load events'
-          })
-        : Promise.resolve(true),
-    ])
-    usageRefreshing = false
+    try {
+      await refreshUsage()
+    } finally {
+      usageRefreshing = false
+    }
   }
 
   let costCanvas: HTMLCanvasElement
@@ -587,7 +571,7 @@
     </div>
   </div>
 
-  <!-- ══ Usage windows: provider quota burn-down + event drill-down ══ -->
+  <!-- ══ Usage windows: open provider windows + historical model breakdowns ══ -->
   {#if $usageError}
     <div class="panel usage-panel">
       {#if !$usageWindows.length}
@@ -656,64 +640,35 @@
         </div>
       {/if}
 
-      <!-- Recent windows table — click a row to drill into that provider's events -->
+      <!-- Each returned window is its own identity, even if timestamps match. -->
+      <div class="uw-history-title">Previous windows</div>
       <div class="uw-rows">
-        {#each recentWindows as w (w.provider + '|' + w.started_at)}
-          <div class="uw-row clickable" role="button" tabindex="0"
-               class:active={drillProvider === w.provider}
-               title="Show recent usage events for {w.provider}"
-               on:click={() => toggleDrill(w.provider)}
-               on:keydown={(e) => {
-                 if (e.key === 'Enter' || e.key === ' ') {
-                   e.preventDefault() // Space would otherwise scroll the page
-                   toggleDrill(w.provider)
-                 }
-               }}>
-            <span class="uw-r-prov">{w.provider}</span>
-            <span class="uw-r-time">{fmtWinTime(w.started_at)} → {w.ended_at ? fmtWinTime(w.ended_at) : 'open'}</span>
-            <span class="erc {ercStyle(w)}">{ercLabel(w)}</span>
-            <span class="uw-r-req">{w.requests}</span>
-            <span class="uw-r-tok">{fmtTokens(w.total_tokens)}</span>
+        {#each recentWindows as w, i (w)}
+          <div class="uw-entry">
+            <button type="button" class="uw-row"
+                    class:active={selectedWindow === w}
+                    aria-expanded={selectedWindow === w}
+                    aria-controls={selectedWindow === w ? `uw-details-${i}` : undefined}
+                    title="Show usage details for this {w.provider} window"
+                    on:click={() => toggleWindow(w)}>
+              <span class="uw-chevron" aria-hidden="true">{selectedWindow === w ? '▾' : '▸'}</span>
+              <span class="uw-r-prov">{w.provider}</span>
+              <span class="uw-r-time" title="{w.started_at} → {w.ended_at}">{fmtWinTime(w.started_at)} → {fmtWinTime(w.ended_at || '')}</span>
+              <span class="erc {ercStyle(w)}">{ercLabel(w)}</span>
+              <span class="uw-r-req">{w.requests} req</span>
+              <span class="uw-r-tok">{fmtTokens(w.total_tokens)} tokens</span>
+            </button>
+            {#if selectedWindow === w}
+              <div class="uw-detail" id="uw-details-{i}" role="region"
+                   aria-label="Usage details for {w.provider}, {fmtWinTime(w.started_at)} to {fmtWinTime(w.ended_at || '')}">
+                <UsageWindowDetails window={w} />
+              </div>
+            {/if}
           </div>
+        {:else}
+          <div class="uw-history-empty">No completed usage windows yet.</div>
         {/each}
       </div>
-
-      <!-- Drill-down: recent usage events for the selected provider -->
-      {#if drillProvider}
-        <div class="uw-drill">
-          <div class="uw-drill-head">
-            <span>events · {drillProvider} · last 50</span>
-            <button class="x" on:click={() => (drillProvider = null)} aria-label="Close drill-down">✕</button>
-          </div>
-          {#if drillLoading}
-            <div class="uw-drill-note">loading events…</div>
-          {:else if drillErr}
-            <div class="uw-drill-note err">{drillErr}</div>
-          {:else if $usageEvents.length === 0}
-            <div class="uw-drill-note">no events recorded for this provider</div>
-          {:else}
-            <div class="uw-ev uw-ev-head">
-              <span>time</span><span>model</span><span>status</span>
-              <span>in</span><span>out</span><span class="uw-ev-cache">cache</span><span></span>
-            </div>
-            {#each $usageEvents as ev (ev.id)}
-              <div class="uw-ev">
-                <span class="uw-ev-time" title={ev.created_at}>{fmtWinTime(ev.created_at)}</span>
-                <span class="uw-ev-model" title={ev.model_used}>{ev.model_used}</span>
-                <span class="uw-ev-status" class:ok={ev.success} class:bad={!ev.success}>{ev.status === 0 ? 'err' : ev.status}</span>
-                <span class="uw-ev-tok" class:nil={ev.in_tokens === null}>{tok(ev.in_tokens)}</span>
-                <span class="uw-ev-tok" class:nil={ev.out_tokens === null}>{tok(ev.out_tokens)}</span>
-                <span class="uw-ev-tok uw-ev-cache" class:nil={ev.cache_read_tokens === null}>{tok(ev.cache_read_tokens)}</span>
-                <span class="uw-ev-badges">
-                  {#if ev.probe}<span class="evb probe">probe</span>{/if}
-                  {#if ev.rate_limited}<span class="evb limit">429</span>{/if}
-                  {#if ev.usage_partial}<span class="evb partial">partial</span>{/if}
-                </span>
-              </div>
-            {/each}
-          {/if}
-        </div>
-      {/if}
     </div>
   {/if}
 
@@ -1007,10 +962,15 @@
   .uw-reset { font-size: 11px; color: #64748b; }
   .uw-noquota { font-size: 11px; color: #64748b; }
 
+  .uw-history-title { color: #64748b; font-size: 11px; margin-bottom: 8px; }
+  .uw-history-empty { color: #64748b; font-size: 12px; padding: 4px 0; }
   .uw-rows { display: flex; flex-direction: column; gap: 5px; }
-  .uw-row { display: grid; grid-template-columns: 84px minmax(0, 1fr) 88px 40px 60px; gap: 10px; align-items: center; background: #11182f; border: 1px solid #1a2035; border-radius: 6px; padding: 8px 13px; font-family: 'Geist Mono', monospace; font-size: 12px; }
+  .uw-entry { min-width: 0; }
+  .uw-row { display: grid; grid-template-columns: 12px 84px minmax(0, 1fr) 88px 56px 80px; gap: 10px; align-items: center; width: 100%; text-align: left; cursor: pointer; background: #11182f; border: 1px solid #1a2035; border-radius: 6px; padding: 8px 13px; font-family: 'Geist Mono', monospace; font-size: 12px; }
   .uw-row:hover { border-color: #2a2150; }
+  .uw-row:focus-visible { outline: 2px solid #7c3aed; outline-offset: 2px; }
   .uw-row.active { border-color: #7c3aed; }
+  .uw-chevron { color: #64748b; }
   .uw-r-prov { color: #06b6d4; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .uw-r-time { color: #94a3b8; font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .uw-r-req { color: #64748b; text-align: right; }
@@ -1022,29 +982,15 @@
   .erc.reset { background: rgba(6,182,212,0.12); color: #06b6d4; }
   .erc.elapsed, .erc.unknown { background: rgba(100,116,139,0.14); color: #94a3b8; }
 
-  .uw-drill { margin-top: 12px; background: #11182f; border: 1px solid #1a2035; border-radius: 8px; padding: 10px 12px; }
-  .uw-drill-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 8px; font-size: 10px; color: #64748b; text-transform: uppercase; letter-spacing: 0.12em; }
-  .uw-drill-head .x { width: 22px; height: 22px; font-size: 11px; }
-  .uw-drill-note { font-size: 12px; padding: 4px 2px; color: #64748b; }
-  .uw-drill-note.err { color: #ef4444; }
-  .uw-ev { display: grid; grid-template-columns: 56px minmax(0, 1fr) 42px 54px 54px 54px minmax(88px, auto); gap: 10px; align-items: center; background: #0a0e1a; border: 1px solid #1a2035; border-radius: 6px; padding: 6px 12px; font-family: 'Geist Mono', monospace; font-size: 11px; margin-bottom: 4px; }
-  .uw-ev-head { background: transparent; border: 0; padding: 0 12px; margin-bottom: 2px; color: #64748b; font-size: 9px; text-transform: uppercase; letter-spacing: 0.1em; }
-  .uw-ev-time { color: #64748b; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .uw-ev-model { color: #94a3b8; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .uw-ev-status { text-align: center; }
-  .uw-ev-status.ok { color: #10b981; }
-  .uw-ev-status.bad { color: #ef4444; }
-  .uw-ev-tok { text-align: right; color: #94a3b8; white-space: nowrap; }
-  .uw-ev-tok.nil { color: #64748b; }
-  .uw-ev-badges { display: flex; flex-wrap: wrap; gap: 4px; justify-content: flex-end; }
-  .evb { font-size: 9px; padding: 1px 6px; border-radius: 4px; text-transform: uppercase; letter-spacing: 0.06em; }
-  .evb.probe { background: rgba(100,116,139,0.14); color: #94a3b8; }
-  .evb.limit { background: rgba(239,68,68,0.12); color: #ef4444; }
-  .evb.partial { background: rgba(245,158,11,0.12); color: #f59e0b; }
+  .uw-detail { min-width: 0; margin: 5px 0 8px; background: #11182f; border: 1px solid #1a2035; border-radius: 6px; padding: 12px; }
 
   @media (max-width: 620px) {
-    .uw-row { grid-template-columns: 72px minmax(0, 1fr) 88px 36px 54px; gap: 8px; padding: 8px 10px; }
-    .uw-ev, .uw-ev-head { grid-template-columns: 44px minmax(0, 1fr) 34px 44px 44px minmax(76px, auto); gap: 8px; }
-    .uw-ev-cache { display: none; }
+    .uw-row { grid-template-columns: 12px minmax(0, 1fr) auto auto; gap: 6px 8px; padding: 8px 10px; }
+    .uw-chevron { grid-column: 1; grid-row: 1 / 4; }
+    .uw-r-prov { grid-column: 2; grid-row: 1; }
+    .uw-row .erc { grid-column: 3 / 5; grid-row: 1; }
+    .uw-r-time { grid-column: 2 / 5; grid-row: 2; }
+    .uw-r-req { grid-column: 2; grid-row: 3; text-align: left; }
+    .uw-r-tok { grid-column: 3 / 5; grid-row: 3; }
   }
 </style>
