@@ -184,6 +184,38 @@ func TestUsageAPI_Windows(t *testing.T) {
 	}
 }
 
+func TestUsageAPI_WindowsSameSecondKeepsOpenBreakdown(t *testing.T) {
+	db := newUsageTestDB(t)
+	at := time.Now().UTC().Add(-time.Minute).Truncate(time.Second)
+	for _, e := range []*storage.UsageEvent{
+		{CreatedAt: at, Provider: "anthropic", ModelUsed: "old-model", Status: 200, Success: true, In: ip(50)},
+		{CreatedAt: at, Provider: "anthropic", ModelUsed: "old-model", Status: 429, RateLimited: true},
+		{CreatedAt: at, Provider: "anthropic", ModelUsed: "current-model", Status: 200, Success: true, In: ip(120)},
+	} {
+		if _, err := db.RecordUsageEvent(e); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	m := getJSON(t, &Server{db: db}, "/api/usage/windows?provider=anthropic&limit=1")
+	ws := m["windows"].([]interface{})
+	if len(ws) != 1 {
+		t.Fatalf("windows = %d, want 1", len(ws))
+	}
+	open := ws[0].(map[string]interface{})
+	if open["ended_at"] != nil || open["in_tokens"] != float64(120) {
+		t.Fatalf("expected current open window, got %v", open)
+	}
+	models, ok := open["per_model"].([]interface{})
+	if !ok || len(models) != 1 {
+		t.Fatalf("expected current model breakdown, got %v", open["per_model"])
+	}
+	model := models[0].(map[string]interface{})
+	if model["model"] != "current-model" || model["in_tokens"] != float64(120) {
+		t.Errorf("wrong model breakdown: %v", model)
+	}
+}
+
 func TestUsageAPI_Totals(t *testing.T) {
 	db := newUsageTestDB(t)
 	now := time.Now().UTC()

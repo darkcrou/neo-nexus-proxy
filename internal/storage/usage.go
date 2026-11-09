@@ -357,8 +357,12 @@ func (db *DB) GetUsageWindows(provider string, window time.Duration, dimension s
 		windows[0].EndReason = EndUnknown
 	}
 
-	// Most recent first, bounded by limit. Stable sort: derivation order is
-	// oldest-first and two windows can share a second-precision start.
+	// Derivation is oldest-first. Reverse it before the stable timestamp sort
+	// so windows with the same second-precision start stay newest-first too.
+	// This must happen before applying the limit, or an open window can be lost.
+	for i, j := 0, len(windows)-1; i < j; i, j = i+1, j-1 {
+		windows[i], windows[j] = windows[j], windows[i]
+	}
 	sort.SliceStable(windows, func(i, j int) bool { return windows[i].StartedAt.After(windows[j].StartedAt) })
 	if limit > 0 && len(windows) > limit {
 		windows = windows[:limit]

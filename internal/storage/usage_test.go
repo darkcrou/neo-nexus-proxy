@@ -744,6 +744,43 @@ func TestUsageWindowsLimitMostRecentFirst(t *testing.T) {
 	}
 }
 
+func TestUsageWindowsSameSecondMostRecentFirst(t *testing.T) {
+	db := newTestDB(t)
+	at := ago(1)
+
+	for _, model := range []string{"oldest", "middle"} {
+		recordAt(t, db, "zai", at, func(e *UsageEvent) { e.ModelUsed = model })
+		recordAt(t, db, "zai", at, func(e *UsageEvent) {
+			e.Status, e.Success, e.RateLimited = 429, false, true
+		})
+	}
+	recordAt(t, db, "zai", at, func(e *UsageEvent) {
+		e.ModelUsed, e.In = "current", intPtr(300)
+	})
+
+	ws, err := db.GetUsageWindows("zai", 5*time.Hour, "5h", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ws) != 3 {
+		t.Fatalf("expected 3 windows, got %d", len(ws))
+	}
+	if ws[0].EndedAt != nil || ws[0].InTokens != 300 || len(ws[0].PerModel) != 1 || ws[0].PerModel[0].Model != "current" {
+		t.Errorf("current window should be first: %+v", ws[0])
+	}
+	if ws[1].EndedAt == nil || ws[1].PerModel[0].Model != "middle" || ws[2].EndedAt == nil || ws[2].PerModel[0].Model != "oldest" {
+		t.Errorf("closed windows should follow in reverse derivation order: %+v", ws)
+	}
+
+	limited, err := db.GetUsageWindows("zai", 5*time.Hour, "5h", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(limited) != 1 || limited[0].EndedAt != nil || limited[0].InTokens != 300 {
+		t.Errorf("limit=1 should retain the current window: %+v", limited)
+	}
+}
+
 // ─── U2: aggregations ───────────────────────────────────────────────────────
 
 func TestUsageTotals(t *testing.T) {
