@@ -2,8 +2,9 @@
 
 - **Usage window details:** history now lists completed windows. Selecting a
   row expands the provider's totals and per-model request/token breakdown
-  directly beneath that row, using the selected window's data. Open windows
-  remain in provider cards. Refresh closes expanded details before reloading.
+  directly beneath that row, using the selected window's data. Open provider
+  cards always show the same breakdown for their current windows. Refresh
+  closes expanded historical details before reloading.
 
 ## v0.8.1
 

@@ -571,7 +571,7 @@
     </div>
   </div>
 
-  <!-- ══ Usage windows: open provider windows + historical model breakdowns ══ -->
+  <!-- ══ Usage windows: open provider windows + historical windows ══ -->
   {#if $usageError}
     <div class="panel usage-panel">
       {#if !$usageWindows.length}
@@ -635,6 +635,10 @@
               {:else}
                 <div class="uw-noquota">no provider quota</div>
               {/if}
+              <div class="uw-card-detail" role="region"
+                   aria-label="Current usage details for {w.provider}, since {fmtWinTime(w.started_at)}">
+                <UsageWindowDetails window={w} />
+              </div>
             </div>
           {/each}
         </div>
@@ -944,8 +948,8 @@
   .usage-refresh:hover { color: #e2e8f0; border-color: #2a2150; }
   .usage-refresh:disabled { opacity: 0.5; cursor: default; }
 
-  .uw-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px; margin-bottom: 14px; }
-  .uw-card { display: flex; flex-direction: column; gap: 7px; background: #11182f; border: 1px solid #1a2035; border-radius: 7px; padding: 10px 12px; }
+  .uw-cards { display: grid; grid-template-columns: minmax(0, 1fr); gap: 10px; margin-bottom: 14px; }
+  .uw-card { display: flex; flex-direction: column; gap: 7px; min-width: 0; background: #11182f; border: 1px solid #1a2035; border-radius: 7px; padding: 10px 12px; }
   .uw-card-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
   .uw-prov { color: #06b6d4; font-weight: 600; }
   .uw-card-head .muted { color: #64748b; font-size: 11px; }
@@ -961,6 +965,7 @@
   .uw-fill { height: 100%; border-radius: 3px; transition: width 0.3s ease; }
   .uw-reset { font-size: 11px; color: #64748b; }
   .uw-noquota { font-size: 11px; color: #64748b; }
+  .uw-card-detail { min-width: 0; border-top: 1px solid #1a2035; margin-top: 3px; padding-top: 10px; }
 
   .uw-history-title { color: #64748b; font-size: 11px; margin-bottom: 8px; }
   .uw-history-empty { color: #64748b; font-size: 12px; padding: 4px 0; }
