@@ -189,13 +189,16 @@ type modelListEntry struct {
 // whenever discovery has produced nothing. The ladder therefore collapses to
 // snapshot → seed → stub. The seed also registers itself with the router, which is
 // what keeps those ids routable.
+// The stub is returned as a copy because the ids are also handed to callers
+// outside the endpoint (a picker, the CLI): one of them sorting or appending in
+// place must not corrupt the process-wide fallback.
 func (h *Handler) modelIDs() []string {
 	if h.catalog != nil {
 		if ids := h.catalog.snapshot(); len(ids) > 0 {
 			return ids
 		}
 	}
-	return stubModelIDs
+	return append([]string(nil), stubModelIDs...)
 }
 
 // HandleModels serves GET /v1/models (some OpenAI clients query it on startup).

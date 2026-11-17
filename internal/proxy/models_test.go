@@ -30,14 +30,32 @@ type fakeModelProvider struct {
 	ids    []string
 	chat   atomic.Int64
 	listed atomic.Int64
+	// listStatus, when non-zero, is answered by /models instead of the id list: the
+	// provider is up, its listing endpoint is not.
+	listStatus int
 }
 
 func newFakeModelProvider(t *testing.T, ids ...string) *fakeModelProvider {
 	t.Helper()
-	f := &fakeModelProvider{ids: ids}
+	return startFakeModelProvider(t, &fakeModelProvider{ids: ids})
+}
+
+// newUnlistableModelProvider is a fake whose /models always answers 500 while chat
+// keeps working, so a failed listing can be told apart from an unreachable provider.
+func newUnlistableModelProvider(t *testing.T) *fakeModelProvider {
+	t.Helper()
+	return startFakeModelProvider(t, &fakeModelProvider{listStatus: http.StatusInternalServerError})
+}
+
+func startFakeModelProvider(t *testing.T, f *fakeModelProvider) *fakeModelProvider {
+	t.Helper()
 	f.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, "/models") {
 			f.listed.Add(1)
+			if f.listStatus != 0 {
+				w.WriteHeader(f.listStatus)
+				return
+			}
 			data := make([]map[string]string, 0, len(f.ids))
 			for _, id := range f.ids {
 				data = append(data, map[string]string{"id": id, "object": "model"})
@@ -240,6 +258,26 @@ func TestModels_FallsBackToTheStubClaudeIDsWhenNothingIsDiscovered(t *testing.T)
 	}
 }
 
+func TestModels_FailedListingFallsThroughToTheStubList(t *testing.T) {
+	// The plan's ladder criterion: a provider whose listing fails must not take the
+	// endpoint down with it. Warming is off and the entry declares no models, so the
+	// seed is empty too and the stub is the only rung left — but the listing has to
+	// have been attempted, or this test would pass by never running discovery at all.
+	f := newUnlistableModelProvider(t)
+	h := newModelsHandler(t, "auto", modelsProvider{name: "custom", url: f.srv.URL, tier: "standard"})
+
+	discover(t, h)
+
+	if got := f.listed.Load(); got != 1 {
+		t.Fatalf("listing requests = %d, want 1 — discovery must have run and failed", got)
+	}
+	ids, _ := modelsList(t, h)
+	want := []string{"claude-opus-4-5", "claude-sonnet-4-6", "claude-haiku-4-5"}
+	if !reflect.DeepEqual(ids, want) {
+		t.Errorf("ids = %v, want the stub fallback %v — a failed listing must not empty the list", ids, want)
+	}
+}
+
 func TestModels_ServesFromCacheWithoutContactingAnyProvider(t *testing.T) {
 	// The endpoint carries no authentication, so a request must not be able to force
 	// a keyed upstream call (D-8). It answers from the catalog and nothing else.
@@ -263,6 +301,11 @@ var allComplexities = []router.Complexity{
 	router.ComplexityCritical,
 }
 
+// allStrategies is every routing strategy RouteChain can be configured with, so the
+// routability guard proves the partition holds under each of them rather than the
+// two that happen to be tested by hand.
+var allStrategies = []string{"auto", "direct", "cheapest", "fastest", "manual"}
+
 func chainNames(chain []*router.Provider) []string {
 	out := make([]string, len(chain))
 	for i, p := range chain {
@@ -276,7 +319,7 @@ func TestModels_EveryAdvertisedModelIsRoutableUnderEveryStrategy(t *testing.T) {
 	// reach a provider that serves it, or the client sees a 404 the proxy invented.
 	// The head is checked through Router.ProviderServes — never by reading a
 	// Provider's model map — so the assertion stays race-free against discovery.
-	for _, strategy := range []string{"auto", "direct"} {
+	for _, strategy := range allStrategies {
 		t.Run(strategy, func(t *testing.T) {
 			free := newFakeModelProvider(t, "free-only", "shared-model")
 			premium := newFakeModelProvider(t, "premium-only", "shared-model")

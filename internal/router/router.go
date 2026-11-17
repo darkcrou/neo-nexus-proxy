@@ -365,9 +365,10 @@ func (r *Router) byTierSpeed() []*Provider {
 //
 // This partition fixes only the model-serving preference within the chain the
 // router returns; it is not the final order a request is sent in. internal/proxy
-// reorders the chain again after RouteChain returns (sticky provider selection,
-// tier filtering, forced pins), and those steps can still move a non-serving
-// provider ahead of a serving one.
+// may still narrow the chain afterwards — the tier and budget filters drop
+// candidates, and a forced provider pin replaces it outright — so a non-serving
+// provider can end up as the only candidate left. That is explicit narrowing, not
+// a reordering of this partition.
 func preferModel(chain []*Provider, serving map[string]bool) []*Provider {
 	match := make([]*Provider, 0, len(chain))
 	rest := make([]*Provider, 0, len(chain))
