@@ -234,13 +234,7 @@ func roundIDs(name string, round int) []string {
 // names) instead of on a hand-built catalog.
 func newHandlerFromConfig(t *testing.T, tomlBody string) *Handler {
 	t.Helper()
-	// Environment discovery would add providers the test did not configure and
-	// could shadow the ones it did. The scrub is derived from the discovery list
-	// itself, so a provider family added to config.knownEnvKeys is neutralized here
-	// too instead of silently leaking an ambient key into these assertions.
-	for _, v := range config.EnvKeyVars() {
-		t.Setenv(v, "")
-	}
+	scrubProviderEnv(t)
 
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.toml")
@@ -953,6 +947,10 @@ func TestCatalogPublishesSnapshotAndRouterTogether(t *testing.T) {
 	cat, clock := buildCatalog(t, 300*time.Second, aps...)
 	cat.seed(seed)
 
+	// probeErr is written only from cat.now, which the catalog calls from the
+	// single refresh goroutine below; the reader goroutines touch neither now nor
+	// probeErr. That is what makes the unsynchronized write race-free — a second
+	// concurrent refresher would break it.
 	var probeErr error
 	cat.now = func() time.Time {
 		for i, name := range names {

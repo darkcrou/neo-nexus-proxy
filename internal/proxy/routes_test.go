@@ -16,6 +16,7 @@ import (
 // in-process mock, so every route can be exercised end-to-end through the router.
 func newServerWithMock(t *testing.T) *Server {
 	t.Helper()
+	scrubProviderEnv(t)
 	mock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
