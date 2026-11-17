@@ -743,6 +743,12 @@ func (h *Handler) HandleMessages(w http.ResponseWriter, r *http.Request) {
 	if sp, ok := h.stickyProvider(req.Model); ok {
 		chain = stickyReorder(chain, sp)
 	}
+	// D-6: sticky decides only among providers that serve the requested id. RouteChain
+	// partitioned the chain before stickyReorder ran, so a sticky provider that does
+	// not serve this id could have been moved to the front; re-applying the partition
+	// puts it back behind the providers that can actually answer. No-op when nothing
+	// serves the id or when the sticky provider does.
+	chain = h.router.PreferModel(chain, req.Model)
 
 	// Routing rules + cost guardrail need the prompt text.
 	var ptext string
@@ -798,6 +804,11 @@ func (h *Handler) HandleMessages(w http.ResponseWriter, r *http.Request) {
 	// normal failover path if every cascade candidate is unreachable.
 	if h.cascade && !bypassCascade {
 		cc := h.router.CascadeChain(complexity)
+		// The cascade picks by price, but a candidate that does not serve the requested
+		// id can only answer 404 — and at the last position that 404 is relayed to the
+		// client. Partitioning keeps the cheap-first order among the providers that can
+		// serve it and sorts the rest last (D-6).
+		cc = h.router.PreferModel(cc, req.Model)
 		if h.budget.Over() {
 			if cheap := freeLocalOnly(cc); len(cheap) > 0 {
 				cc = cheap

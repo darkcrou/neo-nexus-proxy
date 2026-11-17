@@ -30,7 +30,9 @@ func newServerWithMock(t *testing.T) *Server {
 
 	dir := t.TempDir()
 	cfgPath := filepath.Join(dir, "config.toml")
-	cfg := "[routing]\nstrategy = \"auto\"\n\n[[providers]]\nname = \"mock\"\ntype = \"openai-compatible\"\nbase_url = \"" + mock.URL + "\"\ntier = \"free\"\nmodels = [\"mock-model\"]\n"
+	// Warming is off so the id set /v1/models answers with is the config seed alone: a
+	// background discovery pass against the mock could change it mid-assertion.
+	cfg := "[catalog]\nenabled = false\n\n[routing]\nstrategy = \"auto\"\n\n[[providers]]\nname = \"mock\"\ntype = \"openai-compatible\"\nbase_url = \"" + mock.URL + "\"\ntier = \"free\"\nmodels = [\"mock-model\"]\n"
 	if err := os.WriteFile(cfgPath, []byte(cfg), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -77,6 +79,18 @@ func TestRoutes_AllProxyEndpoints(t *testing.T) {
 		rec := do("GET", "/v1/models", "")
 		if rec.Code != 200 || !strings.Contains(rec.Body.String(), `"object":"list"`) {
 			t.Errorf("got %d %s", rec.Code, rec.Body.String())
+		}
+		// The configured provider's models are the catalog's seed, so they are what the
+		// endpoint advertises when discovery has nothing newer.
+		if !strings.Contains(rec.Body.String(), `"id":"mock-model"`) {
+			t.Errorf("configured model missing from the list: %s", rec.Body.String())
+		}
+	})
+
+	t.Run("models rejects POST with the catch-all 404", func(t *testing.T) {
+		rec := do("POST", "/v1/models", "")
+		if rec.Code != 404 {
+			t.Errorf("POST /v1/models = %d, want the catch-all 404 — GET is the only accepted method", rec.Code)
 		}
 	})
 

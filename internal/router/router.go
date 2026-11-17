@@ -262,6 +262,17 @@ func (r *Router) servingSet(id string) map[string]bool {
 	return serving
 }
 
+// PreferModel returns chain reordered so providers that serve id come first,
+// preserving the relative order of both groups. It is the post-stickyReorder
+// half of D-6: callers that already applied sticky selection re-apply this so a
+// sticky provider that does not serve id cannot outrank one that does.
+//
+// RouteChain already applies the same stable partition, so calling this on its
+// output is a no-op. It exists for callers that reorder the chain afterwards.
+func (r *Router) PreferModel(chain []*Provider, id string) []*Provider {
+	return preferModel(chain, r.servingSet(id))
+}
+
 // CascadeChain orders healthy providers cheapest-first (local → free → standard
 // → premium) for the cheap-first cascade: try the cheapest capable model, verify
 // its output, and escalate only on failure. Critical requests stay premium-first

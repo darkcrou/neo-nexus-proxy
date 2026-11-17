@@ -162,15 +162,55 @@ func (h *Handler) HandleChatCompletions(w http.ResponseWriter, r *http.Request) 
 	h.writeOpenAIError(w, http.StatusBadGateway, "all providers unreachable")
 }
 
-// HandleModels serves GET /v1/models (some OpenAI clients query it on startup).
-func (h *Handler) HandleModels(w http.ResponseWriter, r *http.Request) {
-	models := []map[string]interface{}{}
-	seen := map[string]bool{}
-	for _, id := range []string{"claude-opus-4-5", "claude-sonnet-4-6", "claude-haiku-4-5"} {
-		models = append(models, map[string]interface{}{"id": id, "object": "model", "owned_by": "nexus"})
-		seen[id] = true
+// stubModelIDs is the list /v1/models served before the catalog existed: the three
+// Claude ids Claude Code asks for. It is the last rung of the fallback ladder, so a
+// client never sees an empty list even with no provider configured at all.
+var stubModelIDs = []string{"claude-opus-4-5", "claude-sonnet-4-6", "claude-haiku-4-5"}
+
+// modelListEntry is one entry of the OpenAI-shaped model list. There is
+// deliberately no created field: NEXUS knows no honest creation time for a
+// discovered id, and inventing one would be fabricated metadata (D-10). owned_by
+// is "nexus" because the deduplicated entry names a capability the proxy offers,
+// not the provider that happens to serve it.
+type modelListEntry struct {
+	ID      string `json:"id"`
+	Object  string `json:"object"`
+	OwnedBy string `json:"owned_by"`
+}
+
+// modelIDs is the one place the model-listing fallback ladder lives, so any future
+// caller (the dashboard picker, the CLI) shares it with /v1/models.
+//
+// The documented ladder (D-9) is: discovered ids, then the configured
+// [[providers]] models, then providers.DefaultModels(name) per provider, then the
+// stub Claude ids. Rungs two and three are not re-walked here: NewHandler folds
+// them into the catalog's seed — seedFor[name] is pc.Models when non-empty, else
+// providers.DefaultModels(name) — so the snapshot already answers with them
+// whenever discovery has produced nothing. The ladder therefore collapses to
+// snapshot → seed → stub. The seed also registers itself with the router, which is
+// what keeps those ids routable.
+func (h *Handler) modelIDs() []string {
+	if h.catalog != nil {
+		if ids := h.catalog.snapshot(); len(ids) > 0 {
+			return ids
+		}
 	}
-	writeJSONStatus(w, http.StatusOK, map[string]interface{}{"object": "list", "data": models})
+	return stubModelIDs
+}
+
+// HandleModels serves GET /v1/models (some OpenAI clients query it on startup).
+//
+// The answer is the catalog snapshot: the deduplicated union of the ids the
+// configured providers last reported, in the catalog's stable order. It is served
+// from cache and never triggers discovery — the endpoint is unauthenticated, so a
+// request must not be able to force keyed upstream calls (D-8).
+func (h *Handler) HandleModels(w http.ResponseWriter, r *http.Request) {
+	ids := h.modelIDs()
+	data := make([]modelListEntry, 0, len(ids))
+	for _, id := range ids {
+		data = append(data, modelListEntry{ID: id, Object: "model", OwnedBy: "nexus"})
+	}
+	writeJSONStatus(w, http.StatusOK, map[string]interface{}{"object": "list", "data": data})
 }
 
 // ─── upstream call (OpenAI pass-through) ────────────────────────────────────

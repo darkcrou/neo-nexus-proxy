@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -366,16 +367,16 @@ func TestGateway_AnthropicProviderToOpenAI(t *testing.T) {
 }
 
 func TestGateway_Models(t *testing.T) {
+	// No catalog wired, so this is the last rung of the fallback ladder: the three
+	// Claude ids the endpoint served before discovery existed.
 	h := buildTestHandler(t, nil)
-	rec := httptest.NewRecorder()
-	h.HandleModels(rec, httptest.NewRequest("GET", "/v1/models", nil))
-	var resp map[string]interface{}
-	json.Unmarshal(rec.Body.Bytes(), &resp)
-	if resp["object"] != "list" {
-		t.Errorf("object = %v, want list", resp["object"])
+	ids, entries := modelsList(t, h)
+	want := []string{"claude-opus-4-5", "claude-sonnet-4-6", "claude-haiku-4-5"}
+	if !reflect.DeepEqual(ids, want) {
+		t.Errorf("ids = %v, want %v", ids, want)
 	}
-	if data, _ := resp["data"].([]interface{}); len(data) == 0 {
-		t.Error("models list is empty")
+	if len(entries) != len(want) {
+		t.Fatalf("entries = %d, want %d", len(entries), len(want))
 	}
 }
 

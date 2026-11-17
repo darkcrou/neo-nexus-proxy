@@ -302,6 +302,120 @@ func TestProviderServes_ConcurrentWithSetProviderModelsIsRaceFree(t *testing.T) 
 	wg.Wait()
 }
 
+// PreferModel is the post-stickyReorder half of D-6: sticky selection may have
+// moved a provider that does not serve the requested id to the front, and the
+// serving provider must still outrank it.
+func TestPreferModel_MovesServingProviderAheadOfAStickyNonServingOne(t *testing.T) {
+	r := New(StrategyAuto)
+	sticky := &Provider{Name: "sticky", Tier: "free", Healthy: true}
+	serving := &Provider{Name: "serving", Tier: "premium", Healthy: true, Models: serves(requestedModelID)}
+	r.AddProvider(sticky)
+	r.AddProvider(serving)
+
+	// stickyReorder(chain, "sticky") leaves exactly this chain.
+	got := providerNames(r.PreferModel([]*Provider{sticky, serving}, requestedModelID))
+	want := []string{"serving", "sticky"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("chain = %v, want %v", got, want)
+	}
+}
+
+func TestPreferModel_PutsServingProvidersFirstAndKeepsGroupOrder(t *testing.T) {
+	r := New(StrategyAuto)
+	layout := []struct {
+		name    string
+		serving bool
+	}{
+		{"p0", false},
+		{"p1", true},
+		{"p2", false},
+		{"p3", true},
+	}
+	chain := make([]*Provider, 0, len(layout))
+	for _, l := range layout {
+		p := &Provider{Name: l.name, Tier: "standard", Healthy: true}
+		if l.serving {
+			p.Models = serves(requestedModelID)
+		}
+		r.AddProvider(p)
+		chain = append(chain, p)
+	}
+
+	got := providerNames(r.PreferModel(chain, requestedModelID))
+	want := []string{"p1", "p3", "p0", "p2"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("chain = %v, want %v", got, want)
+	}
+}
+
+func TestPreferModel_IsIdempotent(t *testing.T) {
+	r := New(StrategyAuto)
+	r.AddProvider(&Provider{Name: "sticky", Tier: "free", Healthy: true})
+	r.AddProvider(&Provider{Name: "serving", Tier: "premium", Healthy: true, Models: serves(requestedModelID)})
+
+	once := r.PreferModel(r.RouteChain(requestedModelID, ComplexitySimple), requestedModelID)
+	twice := r.PreferModel(once, requestedModelID)
+
+	if want := []string{"serving", "sticky"}; !reflect.DeepEqual(providerNames(once), want) {
+		t.Fatalf("first application = %v, want %v", providerNames(once), want)
+	}
+	if !reflect.DeepEqual(providerNames(twice), providerNames(once)) {
+		t.Errorf("second application = %v, want the same as the first (%v) — re-applying a stable partition must change nothing",
+			providerNames(twice), providerNames(once))
+	}
+}
+
+func TestPreferModel_IsANoOpWhenNoProviderServesTheModel(t *testing.T) {
+	r := New(StrategyAuto)
+	chain := []*Provider{
+		{Name: "first", Tier: "standard", Healthy: true},
+		{Name: "second", Tier: "premium", Healthy: true},
+	}
+	for _, p := range chain {
+		r.AddProvider(p)
+	}
+
+	if got, want := providerNames(r.PreferModel(chain, "model-nobody-serves")), []string{"first", "second"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("chain = %v, want %v", got, want)
+	}
+}
+
+func TestPreferModel_IsANoOpWhenEveryProviderServesTheModel(t *testing.T) {
+	r := New(StrategyAuto)
+	chain := []*Provider{
+		{Name: "first", Tier: "standard", Healthy: true},
+		{Name: "second", Tier: "premium", Healthy: true},
+	}
+	for _, p := range chain {
+		r.AddProvider(p)
+	}
+	r.SetProviderModels("first", []string{requestedModelID})
+	r.SetProviderModels("second", []string{requestedModelID})
+
+	if got, want := providerNames(r.PreferModel(chain, requestedModelID)), []string{"first", "second"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("chain = %v, want %v", got, want)
+	}
+}
+
+func TestPreferModel_TracksModelsRegisteredAfterTheChainWasBuilt(t *testing.T) {
+	// The chain handed to PreferModel is usually built by RouteChain from the
+	// router's own state, but discovery rewrites the model maps at any time: the
+	// partition must read the maps as they are now, not as they were.
+	r := New(StrategyAuto)
+	chain := []*Provider{
+		{Name: "sticky", Tier: "free", Healthy: true},
+		{Name: "serving", Tier: "premium", Healthy: true},
+	}
+	for _, p := range chain {
+		r.AddProvider(p)
+	}
+	r.SetProviderModels("serving", []string{requestedModelID})
+
+	if got, want := providerNames(r.PreferModel(chain, requestedModelID)), []string{"serving", "sticky"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("chain = %v, want %v", got, want)
+	}
+}
+
 func TestRouteChain_HonoursModelsRegisteredThroughSetProviderModels(t *testing.T) {
 	r := New(StrategyAuto)
 	r.AddProvider(&Provider{Name: "cheap", Tier: "local", Healthy: true})
