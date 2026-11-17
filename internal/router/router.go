@@ -218,7 +218,24 @@ func (r *Router) RouteChain(requestedModel string, complexity Complexity) []*Pro
 	default: // StrategyAuto
 		chain = r.autoChain(complexity)
 	}
-	return preferModel(chain, requestedModel)
+	return preferModel(chain, r.servingSet(requestedModel))
+}
+
+// servingSet returns the names of the providers whose Models map contains id.
+// Those maps are rewritten by discovery through SetProviderModels, so they are
+// read only here, under r.mu. Callers get a set of names to test against — the
+// maps themselves never escape the lock, which keeps the partition pure and
+// avoids nesting an RLock inside the strategy helpers' own acquisitions.
+func (r *Router) servingSet(id string) map[string]bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	serving := make(map[string]bool, len(r.providers))
+	for _, p := range r.providers {
+		if _, ok := p.Models[id]; ok {
+			serving[p.Name] = true
+		}
+	}
+	return serving
 }
 
 // CascadeChain orders healthy providers cheapest-first (local → free → standard
@@ -306,15 +323,15 @@ func (r *Router) byTierSpeed() []*Provider {
 	return hp
 }
 
-// preferModel is a stable partition of an ordered chain: providers whose Models
-// map contains the requested id first, the rest after, each group keeping the
-// order it arrived in. Stability matters because sticky provider selection runs
-// on top of this chain — sorting would destroy it.
-func preferModel(chain []*Provider, requestedModel string) []*Provider {
+// preferModel is a stable partition of an ordered chain: providers whose name is
+// in serving first, the rest after, each group keeping the order it arrived in.
+// Stability matters because sticky provider selection runs on top of this chain
+// — sorting would destroy it.
+func preferModel(chain []*Provider, serving map[string]bool) []*Provider {
 	match := make([]*Provider, 0, len(chain))
 	rest := make([]*Provider, 0, len(chain))
 	for _, p := range chain {
-		if _, ok := p.Models[requestedModel]; ok {
+		if serving[p.Name] {
 			match = append(match, p)
 		} else {
 			rest = append(rest, p)

@@ -2,6 +2,7 @@ package router
 
 import (
 	"reflect"
+	"sync"
 	"testing"
 )
 
@@ -187,6 +188,39 @@ func TestSetProviderModels_ReplacesRatherThanMerges(t *testing.T) {
 	if len(models) != 1 {
 		t.Errorf("models = %v, want exactly one entry", models)
 	}
+}
+
+// The router lock must cover the Models maps: a background discovery loop
+// rewrites them while request goroutines read them inside RouteChain.
+func TestRouteChain_ConcurrentSetProviderModelsIsRaceFree(t *testing.T) {
+	r := New(StrategyAuto)
+	r.AddProvider(&Provider{Name: "local", Tier: "local", Healthy: true})
+	r.AddProvider(&Provider{Name: "standard", Tier: "standard", Healthy: true})
+	r.AddProvider(&Provider{Name: "premium", Tier: "premium", Healthy: true})
+
+	lists := [][]string{{requestedModelID}, {"another-model"}, nil}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 5000; i++ {
+			chain := r.RouteChain(requestedModelID, ComplexityStandard)
+			if len(chain) == 0 {
+				t.Error("RouteChain returned an empty chain")
+				return
+			}
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 5000; i++ {
+			r.SetProviderModels("local", lists[i%len(lists)])
+			r.SetProviderModels("standard", lists[(i+1)%len(lists)])
+			r.SetProviderModels("premium", lists[(i+2)%len(lists)])
+		}
+	}()
+	wg.Wait()
 }
 
 func TestRouteChain_HonoursModelsRegisteredThroughSetProviderModels(t *testing.T) {
