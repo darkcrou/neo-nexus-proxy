@@ -503,6 +503,121 @@ func TestCatalogUnsupportedProviderIsAttemptedOnce(t *testing.T) {
 	}
 }
 
+func TestCatalogEmptyListingKeepsSeed(t *testing.T) {
+	// A healthy endpoint that lists nothing — a local Ollama with no model pulled
+	// answers /api/tags with an empty list — is a success, so it must not be read as
+	// "the previously reported ids are gone". The seed is the documented fallback
+	// and the endpoint re-serves it, so clearing the router index here would
+	// advertise ids that nothing serves.
+	f := newFakeUpstream(t) // answers {"data":[]}
+	cat, clock := buildCatalog(t, 300*time.Second, newUpstreamProvider(t, "acme", f))
+	cat.seed(map[string][]string{"acme": {"configured-model"}})
+
+	cat.refreshAll(context.Background())
+
+	if f.requests() != 1 {
+		t.Fatalf("upstream requests = %d, want 1 — the empty listing must still be attempted", f.requests())
+	}
+	if got := cat.snapshot(); !reflect.DeepEqual(got, []string{"configured-model"}) {
+		t.Errorf("snapshot = %v, want [configured-model] — an empty listing is not evidence the seeded ids stopped existing", got)
+	}
+	if !cat.rt.ProviderServes("acme", "configured-model") {
+		t.Error("the router no longer serves the seeded id after an empty listing")
+	}
+	errText, backoff, unsupported := entryState(t, cat, "acme")
+	if errText != "" || backoff != 0 {
+		t.Errorf("after an empty listing: err = %q, backoff = %s; want both clear — it is not a failure", errText, backoff)
+	}
+	if unsupported {
+		t.Error("an empty listing is not a provider with no listing endpoint")
+	}
+
+	// The TTL cadence is unchanged: the empty answer is still a completed fetch.
+	clock.advance(299 * time.Second)
+	cat.refreshAll(context.Background())
+	if f.requests() != 1 {
+		t.Errorf("upstream requests = %d, want 1 — an empty listing must still stamp fetchedAt", f.requests())
+	}
+	clock.advance(time.Second)
+	cat.refreshAll(context.Background())
+	if f.requests() != 2 {
+		t.Errorf("upstream requests = %d, want 2 — the empty listing must not skip the next TTL refresh", f.requests())
+	}
+}
+
+func TestCatalogDuplicateRegistrationCollapsesToFirst(t *testing.T) {
+	// Two config entries of one family report the same registry name. The router
+	// keys by that name and SetProviderModels/ProviderServes stop at the first
+	// match, so a second entry would carry no models and be partitioned away. The
+	// registration loop skips it entirely: one entry everywhere, the first one.
+	h := newHandlerFromConfig(t, `
+[catalog]
+enabled = false
+
+[[providers]]
+name = "groq-us"
+type = "groq"
+api_key = "gsk-us"
+models = ["first-model"]
+
+[[providers]]
+name = "groq-eu"
+type = "groq"
+api_key = "gsk-eu"
+models = ["second-model"]
+`)
+
+	if got := len(h.providers); got != 1 {
+		t.Errorf("registered providers = %d, want 1", got)
+	}
+	if got := h.catalog.snapshot(); !reflect.DeepEqual(got, []string{"first-model"}) {
+		t.Errorf("snapshot = %v, want [first-model] — one seed, from the first entry", got)
+	}
+
+	registered := 0
+	for _, p := range h.router.Providers() {
+		if p.Name == "groq" {
+			registered++
+		}
+	}
+	if registered != 1 {
+		t.Errorf("router entries named groq = %d, want 1 — a duplicate would never receive its models", registered)
+	}
+
+	chain := h.router.RouteChain("first-model", router.ComplexitySimple)
+	if len(chain) != 1 || chain[0].Name != "groq" {
+		t.Errorf("chain = %v, want exactly one groq slot", chain)
+	}
+	if !h.router.ProviderServes("groq", "first-model") {
+		t.Error("the router does not serve the first entry's configured id")
+	}
+}
+
+func TestCatalogExhaustedKeyPoolListsOnPrimaryKey(t *testing.T) {
+	// With every key cooling, peekKey reports ok=false. Discovery still lists, on
+	// the provider's primary api_key: a listing is a cheap GET that consumes no
+	// chat quota, and a rejected key fails and backs off like any other failure.
+	f := newFakeUpstream(t, "alpha-model")
+	ap := newUpstreamProvider(t, "acme", f, "k0", "k1")
+	for i := range ap.cool {
+		ap.cool[i] = time.Now().Add(time.Hour)
+	}
+	cat, _ := buildCatalog(t, 300*time.Second, ap)
+
+	if _, _, ok := ap.peekKey(); ok {
+		t.Fatal("peekKey reports a usable key with the whole pool cooling")
+	}
+
+	cat.refreshAll(context.Background())
+
+	if got, want := f.lastAuth(), "Bearer "+ap.apiKey; got != want {
+		t.Errorf("listing authenticated as %q, want %q — an exhausted pool lists on the primary key", got, want)
+	}
+	if got := cat.snapshot(); !reflect.DeepEqual(got, []string{"alpha-model"}) {
+		t.Errorf("snapshot = %v, want [alpha-model]", got)
+	}
+}
+
 func TestCatalogSuccessReachesRouter(t *testing.T) {
 	f := newFakeUpstream(t, "alpha-model")
 	cat, _ := buildCatalog(t, 300*time.Second, newUpstreamProvider(t, "acme", f))

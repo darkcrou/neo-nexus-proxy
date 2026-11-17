@@ -189,6 +189,21 @@ func (c *modelCatalog) refreshAll(ctx context.Context) {
 		c.mu.Lock()
 		e.inflight = false
 		switch {
+		case err == nil && len(ids) == 0:
+			// A successful listing of nothing is "nothing learned", not "nothing
+			// exists". An empty list is not evidence that previously reported ids
+			// stopped existing — a local Ollama with no model pulled answers
+			// /api/tags with exactly that — and the configured seed is the documented
+			// fallback. Wiping the entry and the router index here would advertise
+			// ids nothing serves, because the endpoint re-serves the seed from the
+			// config/default ladder while the router index had been cleared. Keep both
+			// untouched, but still clear the failure state and restamp, so the TTL
+			// cadence is unchanged.
+			e.err = ""
+			e.backoff = 0
+			e.fetchedAt = c.now()
+			c.mu.Unlock()
+			log.Debug().Str("provider", name).Msg("Model listing returned no models — keeping the known models")
 		case err == nil:
 			e.models = append([]string(nil), ids...)
 			e.err = ""

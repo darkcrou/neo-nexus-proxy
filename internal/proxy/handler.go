@@ -295,9 +295,18 @@ func NewHandler(cfg *Config, db *storage.DB, broker EventPublisher) (*Handler, e
 			continue
 		}
 		name := impl.Name()
-		if _, exists := active[name]; !exists {
-			providerOrder = append(providerOrder, name)
+		if _, exists := active[name]; exists {
+			// Two entries of one family under distinct config names (`groq-us` and
+			// `groq-eu`, both type "groq") report the same registry name. Collapsing
+			// only some of the per-name state would leave the router holding a second
+			// entry that SetProviderModels/ProviderServes never reach (they stop at
+			// the first match), so the whole entry is skipped: active, seedFor,
+			// providerOrder, and the router all end up with exactly one — the first.
+			log.Warn().Str("provider", pc.Name).Str("registered_as", name).
+				Msg("Duplicate provider family — skipping this entry")
+			continue
 		}
+		providerOrder = append(providerOrder, name)
 		active[name] = &activeProvider{impl: impl, apiKey: key, keys: keys, cool: make([]time.Time, len(keys)), backoff: make([]time.Duration, len(keys))}
 		if len(pc.Models) > 0 {
 			seedFor[name] = pc.Models
