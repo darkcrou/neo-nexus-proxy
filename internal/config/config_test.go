@@ -82,3 +82,67 @@ func TestModelMapRoundtrip(t *testing.T) {
 		t.Errorf("custom fields not persisted: %+v", p)
 	}
 }
+
+// writeConfig writes a config file into a temp dir and returns its path.
+func writeConfig(t *testing.T, body string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// TestCatalogDefaultsWhenSectionAbsent pins D-11: an absent [catalog] table means
+// enabled with a 300s TTL, because polling provider endpoints must be opt-out
+// rather than opt-in for a zero-config install.
+func TestCatalogDefaultsWhenSectionAbsent(t *testing.T) {
+	cfg, err := Load(writeConfig(t, "[proxy]\nport = 3001\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Catalog.Enabled {
+		t.Error("an absent [catalog] section must mean enabled")
+	}
+	if cfg.Catalog.TTLSeconds != 300 {
+		t.Errorf("ttl_seconds = %d, want 300", cfg.Catalog.TTLSeconds)
+	}
+}
+
+func TestCatalogExplicitDisable(t *testing.T) {
+	cfg, err := Load(writeConfig(t, "[catalog]\nenabled = false\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Catalog.Enabled {
+		t.Error("enabled = false must disable the catalog")
+	}
+	if cfg.Catalog.TTLSeconds != 300 {
+		t.Errorf("ttl_seconds = %d, want the 300 default", cfg.Catalog.TTLSeconds)
+	}
+}
+
+func TestCatalogExplicitTTL(t *testing.T) {
+	cfg, err := Load(writeConfig(t, "[catalog]\nttl_seconds = 45\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Catalog.Enabled {
+		t.Error("setting ttl_seconds alone must not disable the catalog")
+	}
+	if cfg.Catalog.TTLSeconds != 45 {
+		t.Errorf("ttl_seconds = %d, want 45", cfg.Catalog.TTLSeconds)
+	}
+}
+
+func TestCatalogNonPositiveTTLUsesDefault(t *testing.T) {
+	for _, ttl := range []string{"0", "-5"} {
+		cfg, err := Load(writeConfig(t, "[catalog]\nttl_seconds = "+ttl+"\n"))
+		if err != nil {
+			t.Fatalf("ttl_seconds = %s: %v", ttl, err)
+		}
+		if cfg.Catalog.TTLSeconds != 300 {
+			t.Errorf("ttl_seconds = %s: got %d, want 300", ttl, cfg.Catalog.TTLSeconds)
+		}
+	}
+}

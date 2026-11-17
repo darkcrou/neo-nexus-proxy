@@ -85,6 +85,30 @@ func (a *activeProvider) pickKey() (key string, idx int, ok bool) {
 	return "", -1, false
 }
 
+// peekKey reports the key pickKey would return, without adopting it: it never
+// assigns a.rr. Model discovery lists with this (see catalog.go) so that a
+// listing cannot move the sticky key pointer (D-7).
+func (a *activeProvider) peekKey() (key string, idx int, ok bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	n := len(a.keys)
+	if n == 0 {
+		return a.apiKey, -1, true
+	}
+	now := time.Now()
+	cur := int(a.rr) % n
+	if a.cool[cur].Before(now) {
+		return a.keys[cur], cur, true
+	}
+	for off := 1; off < n; off++ {
+		i := (cur + off) % n
+		if a.cool[i].Before(now) {
+			return a.keys[i], i, true
+		}
+	}
+	return "", -1, false
+}
+
 // hasAvailableKey reports whether the provider currently has at least one
 // non-cooling key, without mutating the sticky selection state. An empty
 // key pool (fallback-to-apiKey case) always counts as available.
@@ -195,6 +219,7 @@ type Handler struct {
 	rules       []config.Rule  // declarative routing overrides
 	maxReqUSD   float64        // guardrail: downgrade a single request above this
 	stopHealth  chan struct{}
+	catalog     *modelCatalog // cached provider model index; seeded even when warming is off
 
 	stickyMu sync.Mutex
 	// sticky maps a requested Claude model string (e.g. "claude-sonnet-4-6")
@@ -240,6 +265,7 @@ func NewHandler(cfg *Config, db *storage.DB, broker EventPublisher) (*Handler, e
 
 	rt := router.New(router.RoutingStrategy(appCfg.Routing.Strategy))
 	active := make(map[string]*activeProvider)
+	var providerOrder []string // registration order: active is a map, snapshots need a stable order
 	for _, pc := range appCfg.Providers {
 		keys := resolveProviderKeys(pc)
 		key := keys[0]
@@ -267,6 +293,7 @@ func NewHandler(cfg *Config, db *storage.DB, broker EventPublisher) (*Handler, e
 			continue
 		}
 		active[impl.Name()] = &activeProvider{impl: impl, apiKey: key, keys: keys, cool: make([]time.Time, len(keys)), backoff: make([]time.Duration, len(keys))}
+		providerOrder = append(providerOrder, impl.Name())
 		rt.AddProvider(&router.Provider{
 			Name:    impl.Name(),
 			BaseURL: impl.BaseURL(),
@@ -341,6 +368,10 @@ func NewHandler(cfg *Config, db *storage.DB, broker EventPublisher) (*Handler, e
 	if h.maxReqUSD > 0 {
 		log.Info().Float64("max_request_usd", h.maxReqUSD).Msg("Cost guardrail enabled — pricey single requests are downgraded to free/local")
 	}
+
+	// The catalog is seeded from config before the first fetch, so it is useful
+	// immediately; the warm loop is what turns it into live discovery.
+	h.startCatalog(appCfg.Providers, appCfg.Catalog, providerOrder)
 
 	if len(active) == 0 {
 		log.Info().Msg("No providers configured — zero-config mode (forwarding directly to Anthropic)")

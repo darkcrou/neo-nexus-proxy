@@ -1,0 +1,635 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 NEXUS contributors
+
+package proxy
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"reflect"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/lynuxis2026-pixel/nexus-proxy/internal/config"
+	"github.com/lynuxis2026-pixel/nexus-proxy/internal/providers"
+	"github.com/lynuxis2026-pixel/nexus-proxy/internal/router"
+)
+
+// ─── test fixtures ──────────────────────────────────────────────────────────
+
+// fakeUpstream is an OpenAI-compatible /models endpoint whose answer the test can
+// change between fetches. It counts requests and records the last Authorization
+// header, so the TTL, backoff, and key-selection gates are asserted on observable
+// behaviour instead of on catalog internals.
+type fakeUpstream struct {
+	srv *httptest.Server
+
+	mu     sync.Mutex
+	ids    []string
+	status int
+	auth   string
+
+	hits    atomic.Int64
+	fetched chan struct{}
+}
+
+func newFakeUpstream(t *testing.T, ids ...string) *fakeUpstream {
+	t.Helper()
+	f := &fakeUpstream{ids: ids, status: http.StatusOK, fetched: make(chan struct{}, 1)}
+	f.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		f.hits.Add(1)
+		f.mu.Lock()
+		ids, status := f.ids, f.status
+		f.auth = r.Header.Get("Authorization")
+		f.mu.Unlock()
+		select {
+		case f.fetched <- struct{}{}:
+		default:
+		}
+		if status != http.StatusOK {
+			w.WriteHeader(status)
+			return
+		}
+		data := make([]map[string]string, 0, len(ids))
+		for _, id := range ids {
+			data = append(data, map[string]string{"id": id, "object": "model"})
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"object": "list", "data": data})
+	}))
+	t.Cleanup(f.srv.Close)
+	return f
+}
+
+func (f *fakeUpstream) requests() int64 { return f.hits.Load() }
+
+func (f *fakeUpstream) serveModels(ids ...string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.ids, f.status = ids, http.StatusOK
+}
+
+func (f *fakeUpstream) serveStatus(code int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.status = code
+}
+
+func (f *fakeUpstream) lastAuth() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.auth
+}
+
+// newUpstreamProvider builds a real OpenAI-compatible provider pointed at the
+// fake upstream, with an optional key pool (the sticky-key path needs more than
+// one key to be observable).
+func newUpstreamProvider(t *testing.T, name string, f *fakeUpstream, keys ...string) *activeProvider {
+	t.Helper()
+	if len(keys) == 0 {
+		keys = []string{"key-" + name}
+	}
+	impl, err := providers.New(providers.Spec{
+		Name:    name,
+		Type:    "openai-compatible",
+		BaseURL: f.srv.URL,
+		Tier:    providers.TierFree,
+	})
+	if err != nil {
+		t.Fatalf("build provider %s: %v", name, err)
+	}
+	return &activeProvider{
+		impl:    impl,
+		apiKey:  keys[0],
+		keys:    keys,
+		cool:    make([]time.Time, len(keys)),
+		backoff: make([]time.Duration, len(keys)),
+	}
+}
+
+// fakeClock drives the catalog's TTL and backoff gates deterministically, so no
+// test has to sleep.
+type fakeClock struct {
+	mu sync.Mutex
+	t  time.Time
+}
+
+func newFakeClock() *fakeClock {
+	return &fakeClock{t: time.Date(2026, 11, 17, 12, 0, 0, 0, time.UTC)}
+}
+
+func (c *fakeClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.t
+}
+
+func (c *fakeClock) advance(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.t = c.t.Add(d)
+}
+
+// buildCatalog assembles a catalog the way NewHandler does: providers registered
+// in slice order, one activeProvider each, and an injected clock.
+func buildCatalog(t *testing.T, ttl time.Duration, aps ...*activeProvider) (*modelCatalog, *fakeClock) {
+	t.Helper()
+	rt := router.New(router.StrategyAuto)
+	active := make(map[string]*activeProvider, len(aps))
+	order := make([]string, 0, len(aps))
+	for _, ap := range aps {
+		name := ap.impl.Name()
+		active[name] = ap
+		order = append(order, name)
+		rt.AddProvider(&router.Provider{Name: name, Tier: ap.impl.Tier(), Healthy: true})
+	}
+	clock := newFakeClock()
+	cat := newModelCatalog(rt, active, order, ttl)
+	cat.now = clock.Now
+	return cat, clock
+}
+
+// entryState reads one provider's catalog state under the catalog lock. Tests
+// assert on the recorded error and backoff here because the read surface
+// (snapshot) deliberately hides them.
+func entryState(t *testing.T, cat *modelCatalog, name string) (errText string, backoff time.Duration, unsupported bool) {
+	t.Helper()
+	cat.mu.RLock()
+	defer cat.mu.RUnlock()
+	e := cat.entries[name]
+	if e == nil {
+		t.Fatalf("no catalog entry for provider %q", name)
+	}
+	return e.err, e.backoff, e.unsupported
+}
+
+// ─── tests ──────────────────────────────────────────────────────────────────
+
+func TestCatalogRefreshPopulatesSnapshot(t *testing.T) {
+	f := newFakeUpstream(t, "alpha-model", "beta-model")
+	cat, _ := buildCatalog(t, 300*time.Second, newUpstreamProvider(t, "acme", f))
+
+	if got := cat.snapshot(); len(got) != 0 {
+		t.Fatalf("an unseeded catalog must start empty, got %v", got)
+	}
+
+	cat.refreshAll(context.Background())
+
+	want := []string{"alpha-model", "beta-model"}
+	if got := cat.snapshot(); !reflect.DeepEqual(got, want) {
+		t.Errorf("snapshot = %v, want %v", got, want)
+	}
+	if f.requests() != 1 {
+		t.Errorf("upstream requests = %d, want 1", f.requests())
+	}
+}
+
+func TestCatalogSkipsFetchWithinTTL(t *testing.T) {
+	f := newFakeUpstream(t, "alpha-model")
+	cat, clock := buildCatalog(t, 300*time.Second, newUpstreamProvider(t, "acme", f))
+
+	cat.refreshAll(context.Background())
+	clock.advance(299 * time.Second)
+	cat.refreshAll(context.Background())
+
+	if f.requests() != 1 {
+		t.Errorf("upstream requests = %d, want 1 — a refresh inside the TTL must not reach the provider", f.requests())
+	}
+	if got := cat.snapshot(); !reflect.DeepEqual(got, []string{"alpha-model"}) {
+		t.Errorf("snapshot = %v, want [alpha-model]", got)
+	}
+}
+
+func TestCatalogRefetchesAfterTTL(t *testing.T) {
+	f := newFakeUpstream(t, "alpha-model")
+	cat, clock := buildCatalog(t, 300*time.Second, newUpstreamProvider(t, "acme", f))
+
+	cat.refreshAll(context.Background())
+	f.serveModels("alpha-model", "gamma-model")
+	clock.advance(300 * time.Second)
+	cat.refreshAll(context.Background())
+
+	if f.requests() != 2 {
+		t.Errorf("upstream requests = %d, want 2 — a refresh past the TTL must refetch", f.requests())
+	}
+	want := []string{"alpha-model", "gamma-model"}
+	if got := cat.snapshot(); !reflect.DeepEqual(got, want) {
+		t.Errorf("snapshot = %v, want %v (the refetched list replaces the old one)", got, want)
+	}
+}
+
+func TestCatalogFailureKeepsLastGoodListAndBacksOff(t *testing.T) {
+	f := newFakeUpstream(t, "alpha-model")
+	cat, clock := buildCatalog(t, 300*time.Second, newUpstreamProvider(t, "acme", f))
+
+	cat.refreshAll(context.Background())
+	f.serveStatus(http.StatusInternalServerError)
+	clock.advance(300 * time.Second) // the TTL alone would allow a retry now
+	cat.refreshAll(context.Background())
+
+	if f.requests() != 2 {
+		t.Fatalf("upstream requests = %d, want 2", f.requests())
+	}
+	if got := cat.snapshot(); !reflect.DeepEqual(got, []string{"alpha-model"}) {
+		t.Errorf("snapshot = %v, want [alpha-model] — a failed listing keeps the last good list", got)
+	}
+	errText, backoff, unsupported := entryState(t, cat, "acme")
+	if errText == "" {
+		t.Error("a failed listing must be recorded on the entry")
+	}
+	if backoff != catalogInitialBackoff {
+		t.Errorf("backoff = %s, want %s", backoff, catalogInitialBackoff)
+	}
+	if unsupported {
+		t.Error("a failed listing is not the same as a provider with no listing endpoint")
+	}
+
+	clock.advance(catalogInitialBackoff - time.Second)
+	cat.refreshAll(context.Background())
+	if f.requests() != 2 {
+		t.Errorf("upstream requests = %d, want 2 — a failing provider must not be retried before its backoff expires", f.requests())
+	}
+
+	clock.advance(time.Second)
+	cat.refreshAll(context.Background())
+	if f.requests() != 3 {
+		t.Errorf("upstream requests = %d, want 3 — the retry must happen once the backoff expires", f.requests())
+	}
+}
+
+func TestCatalogRecoveryClearsErrorAndResetsBackoff(t *testing.T) {
+	f := newFakeUpstream(t, "alpha-model")
+	f.serveStatus(http.StatusBadGateway)
+	cat, clock := buildCatalog(t, 300*time.Second, newUpstreamProvider(t, "acme", f))
+
+	cat.refreshAll(context.Background())
+	if _, backoff, _ := entryState(t, cat, "acme"); backoff != catalogInitialBackoff {
+		t.Fatalf("backoff after the first failure = %s, want %s", backoff, catalogInitialBackoff)
+	}
+
+	f.serveModels("alpha-model")
+	clock.advance(catalogInitialBackoff)
+	cat.refreshAll(context.Background())
+
+	errText, backoff, _ := entryState(t, cat, "acme")
+	if errText != "" || backoff != 0 {
+		t.Errorf("after recovery: err = %q, backoff = %s; want both cleared", errText, backoff)
+	}
+	if got := cat.snapshot(); !reflect.DeepEqual(got, []string{"alpha-model"}) {
+		t.Errorf("snapshot = %v, want [alpha-model]", got)
+	}
+
+	// The cadence is back to the TTL: no retry before it, one retry at it.
+	requests := f.requests()
+	clock.advance(299 * time.Second)
+	cat.refreshAll(context.Background())
+	if f.requests() != requests {
+		t.Errorf("upstream requests = %d, want %d — a recovered provider waits for the TTL again", f.requests(), requests)
+	}
+	clock.advance(time.Second)
+	cat.refreshAll(context.Background())
+	if f.requests() != requests+1 {
+		t.Errorf("upstream requests = %d, want %d after the TTL", f.requests(), requests+1)
+	}
+}
+
+func TestCatalogBackoffGrowsAndCaps(t *testing.T) {
+	f := newFakeUpstream(t, "alpha-model")
+	f.serveStatus(http.StatusInternalServerError)
+	cat, clock := buildCatalog(t, 300*time.Second, newUpstreamProvider(t, "acme", f))
+
+	want := []time.Duration{
+		30 * time.Second,
+		60 * time.Second,
+		120 * time.Second,
+		240 * time.Second,
+		300 * time.Second, // capped at 5m
+		300 * time.Second,
+	}
+	for i, wait := range want {
+		cat.refreshAll(context.Background())
+		if _, backoff, _ := entryState(t, cat, "acme"); backoff != wait {
+			t.Fatalf("attempt %d: backoff = %s, want %s", i+1, backoff, wait)
+		}
+		requests := f.requests()
+		clock.advance(wait - time.Second)
+		cat.refreshAll(context.Background())
+		if f.requests() != requests {
+			t.Fatalf("attempt %d: retried %s after a %s backoff", i+1, wait-time.Second, wait)
+		}
+		clock.advance(time.Second)
+	}
+}
+
+func TestCatalogDeduplicatesSharedModelID(t *testing.T) {
+	first := newFakeUpstream(t, "shared-model", "first-only")
+	second := newFakeUpstream(t, "second-only", "shared-model")
+	cat, _ := buildCatalog(t, 300*time.Second,
+		newUpstreamProvider(t, "first", first),
+		newUpstreamProvider(t, "second", second),
+	)
+
+	cat.refreshAll(context.Background())
+
+	want := []string{"shared-model", "first-only", "second-only"}
+	if got := cat.snapshot(); !reflect.DeepEqual(got, want) {
+		t.Errorf("snapshot = %v, want %v — an id offered by two providers appears once", got, want)
+	}
+}
+
+func TestCatalogSnapshotOrderIsStable(t *testing.T) {
+	// Registration order is deliberately the reverse of both the alphabetical and
+	// the sorted-by-id order, and each list is internally unsorted, so any sorting
+	// or map iteration would show up here.
+	second := newFakeUpstream(t, "zebra", "yak")
+	first := newFakeUpstream(t, "mango", "apple")
+	cat, _ := buildCatalog(t, 300*time.Second,
+		newUpstreamProvider(t, "second", second),
+		newUpstreamProvider(t, "first", first),
+	)
+
+	cat.refreshAll(context.Background())
+
+	want := []string{"zebra", "yak", "mango", "apple"}
+	got := cat.snapshot()
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("snapshot = %v, want %v (registration order, then each provider's own list order)", got, want)
+	}
+	for i := 0; i < 5; i++ {
+		if again := cat.snapshot(); !reflect.DeepEqual(again, want) {
+			t.Fatalf("snapshot %d = %v, want %v — the order must be stable across calls", i+2, again, want)
+		}
+	}
+}
+
+func TestCatalogUnsupportedProviderIsAttemptedOnce(t *testing.T) {
+	// Perplexity publishes no listing endpoint, and Azure is Anthropic-native:
+	// ListModels reports ErrNoModelList before any request leaves the process.
+	perplexity, err := providers.New(providers.Spec{Name: "perplexity", APIKey: "pplx-key"})
+	if err != nil {
+		t.Fatalf("build perplexity: %v", err)
+	}
+	azureUpstream := newFakeUpstream(t, "unreachable")
+	azure, err := providers.New(providers.Spec{
+		Name: "azure-east", Type: "azure", BaseURL: azureUpstream.srv.URL, APIKey: "az-key",
+	})
+	if err != nil {
+		t.Fatalf("build azure: %v", err)
+	}
+	cat, clock := buildCatalog(t, 300*time.Second,
+		&activeProvider{impl: perplexity, apiKey: "pplx-key", keys: []string{"pplx-key"}, cool: make([]time.Time, 1), backoff: make([]time.Duration, 1)},
+		&activeProvider{impl: azure, apiKey: "az-key", keys: []string{"az-key"}, cool: make([]time.Time, 1), backoff: make([]time.Duration, 1)},
+	)
+
+	var attempts atomic.Int64
+	cat.listModels = func(p providers.Provider, apiKey string) ([]string, error) {
+		attempts.Add(1)
+		return providers.ListModels(p, apiKey)
+	}
+	cat.seed(map[string][]string{"perplexity": {"sonar", "sonar-pro"}, "azure-east": {"gpt-4o"}})
+
+	cat.refreshAll(context.Background())
+	clock.advance(24 * time.Hour)
+	cat.refreshAll(context.Background())
+
+	if got := attempts.Load(); got != 2 {
+		t.Errorf("listing attempts = %d, want 2 — one per unsupported provider, then never again", got)
+	}
+	if azureUpstream.requests() != 0 {
+		t.Errorf("azure upstream requests = %d, want 0 — an unsupported provider must never be probed", azureUpstream.requests())
+	}
+	for _, name := range []string{"perplexity", "azure-east"} {
+		if _, _, unsupported := entryState(t, cat, name); !unsupported {
+			t.Errorf("%s: entry is not marked unsupported", name)
+		}
+	}
+	if got := cat.snapshot(); !reflect.DeepEqual(got, []string{"sonar", "sonar-pro", "gpt-4o"}) {
+		t.Errorf("snapshot = %v, want the seeded lists of both unsupported providers", got)
+	}
+}
+
+func TestCatalogSuccessReachesRouter(t *testing.T) {
+	f := newFakeUpstream(t, "alpha-model")
+	cat, _ := buildCatalog(t, 300*time.Second, newUpstreamProvider(t, "acme", f))
+
+	cat.refreshAll(context.Background())
+
+	if !cat.rt.ProviderServes("acme", "alpha-model") {
+		t.Error("the router does not report the discovered id as served")
+	}
+	if cat.rt.ProviderServes("acme", "never-listed") {
+		t.Error("the router reports an id the provider never listed")
+	}
+}
+
+func TestCatalogDiscoveryDoesNotPerturbStickyKey(t *testing.T) {
+	f := newFakeUpstream(t, "alpha-model")
+	ap := newUpstreamProvider(t, "acme", f, "k0", "k1", "k2")
+	ap.rr = 1
+	ap.cool[1] = time.Now().Add(time.Hour) // the sticky current key is cooling
+	cat, _ := buildCatalog(t, 300*time.Second, ap)
+
+	// peekKey reports the key pickKey would adopt, without adopting it.
+	if key, idx, ok := ap.peekKey(); !ok || key != "k2" || idx != 2 {
+		t.Fatalf("peekKey = (%q, %d, %v), want (k2, 2, true)", key, idx, ok)
+	}
+	if ap.rr != 1 {
+		t.Fatalf("peekKey moved the sticky key pointer to %d, want 1", ap.rr)
+	}
+
+	cat.refreshAll(context.Background())
+
+	if ap.rr != 1 {
+		t.Errorf("sticky key pointer = %d after discovery, want 1 — listing must not change key selection", ap.rr)
+	}
+	if got := f.lastAuth(); got != "Bearer k2" {
+		t.Errorf("listing used %q, want %q — discovery must list on the key pickKey would use", got, "Bearer k2")
+	}
+}
+
+func TestCatalogConcurrentSnapshotsDuringRefresh(t *testing.T) {
+	f := newFakeUpstream(t, "alpha", "beta", "gamma")
+	cat, _ := buildCatalog(t, 300*time.Second, newUpstreamProvider(t, "acme", f))
+	cat.refreshAll(context.Background())
+
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 500; j++ {
+				cat.snapshot()
+			}
+		}()
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		cat.refreshAll(context.Background())
+	}()
+	wg.Wait()
+
+	if got := cat.snapshot(); !reflect.DeepEqual(got, []string{"alpha", "beta", "gamma"}) {
+		t.Errorf("snapshot = %v after concurrent refreshes", got)
+	}
+}
+
+func TestCatalogSeedIsVisibleBeforeFirstFetch(t *testing.T) {
+	f := newFakeUpstream(t, "live-model")
+	cat, _ := buildCatalog(t, 300*time.Second, newUpstreamProvider(t, "acme", f))
+	cat.seed(map[string][]string{"acme": {"configured-model"}})
+
+	if got := cat.snapshot(); !reflect.DeepEqual(got, []string{"configured-model"}) {
+		t.Errorf("snapshot = %v, want [configured-model] before any fetch", got)
+	}
+	if f.requests() != 0 {
+		t.Fatalf("upstream requests = %d, want 0 — seeding must not fetch", f.requests())
+	}
+
+	// The seed is a fallback, not a claim: the first tick still fetches.
+	cat.refreshAll(context.Background())
+	if f.requests() != 1 {
+		t.Errorf("upstream requests = %d, want 1 — a seeded catalog still fetches on its first tick", f.requests())
+	}
+	if got := cat.snapshot(); !reflect.DeepEqual(got, []string{"live-model"}) {
+		t.Errorf("snapshot = %v, want the discovered [live-model]", got)
+	}
+}
+
+func TestCatalogSeedFallsBackToDefaultModels(t *testing.T) {
+	seed := catalogSeed([]config.Provider{{Name: "groq", Models: []string{"configured-model"}}}, []string{"groq", "deepseek"})
+
+	if got := seed["groq"]; !reflect.DeepEqual(got, []string{"configured-model"}) {
+		t.Errorf("configured provider seed = %v, want [configured-model]", got)
+	}
+	want := providers.DefaultModels("deepseek")
+	if got := seed["deepseek"]; !reflect.DeepEqual(got, want) {
+		t.Errorf("provider without configured models seed = %v, want %v", got, want)
+	}
+}
+
+func TestCatalogDisabledStartsNoWarmLoop(t *testing.T) {
+	// The guard is the whole decision: no provider registered, or the operator
+	// switched the [catalog] section off, means no background polling.
+	if catalogWarms(false, 3) {
+		t.Error("a disabled catalog must not warm")
+	}
+	if catalogWarms(true, 0) {
+		t.Error("a catalog with no provider must not warm")
+	}
+	if !catalogWarms(true, 3) {
+		t.Error("an enabled catalog with providers must warm")
+	}
+
+	// A disabled catalog is still built and seeded, so the endpoint keeps a usable
+	// fallback — it simply never fetches.
+	f := newFakeUpstream(t, "live-model")
+	ap := newUpstreamProvider(t, "acme", f)
+	rt := router.New(router.StrategyAuto)
+	rt.AddProvider(&router.Provider{Name: "acme", Healthy: true})
+	h := &Handler{
+		router:     rt,
+		providers:  map[string]*activeProvider{"acme": ap},
+		stopHealth: make(chan struct{}),
+	}
+
+	h.startCatalog(
+		[]config.Provider{{Name: "acme", Models: []string{"configured-model"}}},
+		config.Catalog{Enabled: false, TTLSeconds: 300},
+		[]string{"acme"},
+	)
+
+	if h.catalog == nil {
+		t.Fatal("a disabled catalog must still be constructed")
+	}
+	if got := h.catalog.snapshot(); !reflect.DeepEqual(got, []string{"configured-model"}) {
+		t.Errorf("snapshot = %v, want the seeded [configured-model]", got)
+	}
+	if f.requests() != 0 {
+		t.Errorf("upstream requests = %d, want 0 — a disabled catalog must not fetch", f.requests())
+	}
+	if err := h.Close(); err != nil {
+		t.Errorf("Close: %v", err)
+	}
+}
+
+func TestCatalogWarmLoopFetchesImmediatelyAndStops(t *testing.T) {
+	f := newFakeUpstream(t, "alpha-model")
+	cat, _ := buildCatalog(t, 300*time.Second, newUpstreamProvider(t, "acme", f))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		cat.run(ctx, nil)
+	}()
+
+	select {
+	case <-f.fetched:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the warm loop did not fetch on start — it must not wait a full tick first")
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the warm loop did not stop on context cancellation")
+	}
+	if got := cat.snapshot(); !reflect.DeepEqual(got, []string{"alpha-model"}) {
+		t.Errorf("snapshot = %v, want [alpha-model]", got)
+	}
+}
+
+func TestCatalogWarmLoopStopsOnClosedStopChannel(t *testing.T) {
+	f := newFakeUpstream(t, "alpha-model")
+	cat, _ := buildCatalog(t, 300*time.Second, newUpstreamProvider(t, "acme", f))
+
+	// Close closes this channel, and run must treat a closed stop channel exactly
+	// like a cancelled context: exit without touching any provider.
+	stop := make(chan struct{})
+	close(stop)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		cat.run(context.Background(), stop)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the warm loop did not stop on the handler's stop channel")
+	}
+	if f.requests() != 0 {
+		t.Errorf("upstream requests = %d, want 0 — a stopped loop must not fetch", f.requests())
+	}
+}
+
+func TestCatalogCloseIsIdempotent(t *testing.T) {
+	f := newFakeUpstream(t, "alpha-model")
+	ap := newUpstreamProvider(t, "acme", f)
+	rt := router.New(router.StrategyAuto)
+	rt.AddProvider(&router.Provider{Name: "acme", Healthy: true})
+	h := &Handler{
+		router:     rt,
+		providers:  map[string]*activeProvider{"acme": ap},
+		stopHealth: make(chan struct{}),
+	}
+	h.startCatalog(nil, config.Catalog{Enabled: true, TTLSeconds: 300}, []string{"acme"})
+
+	if err := h.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	// A second Close must not panic: Close closes the channel once and nils it,
+	// while the warm loop only ever reads the value it captured at start.
+	if err := h.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
+	}
+	if h.catalog == nil {
+		t.Error("Close must not tear the catalog down — it is the endpoint's fallback")
+	}
+}

@@ -17,9 +17,28 @@ type Config struct {
 	Proxy     Proxy      `toml:"proxy"`
 	Dashboard Dashboard  `toml:"dashboard"`
 	Routing   Routing    `toml:"routing"`
+	Catalog   Catalog    `toml:"catalog"`
 	Providers []Provider `toml:"providers"`
 	Rules     []Rule     `toml:"rules"`
 }
+
+// Catalog configures the background model catalog: the TTL-cached index of the
+// models each configured provider currently offers, discovered from the
+// provider's own listing endpoint.
+//
+// Polling every provider endpoint is network behaviour the operator must be able
+// to switch off, so an absent [catalog] table means enabled (the zero-config
+// promise) while an explicit enabled = false disables it. A plain bool cannot
+// express that after decoding, which is why the default is seeded in Default()
+// and Load decodes on top of it.
+type Catalog struct {
+	Enabled    bool `toml:"enabled"`
+	TTLSeconds int  `toml:"ttl_seconds"`
+}
+
+// defaultCatalogTTLSeconds is the refresh interval used when ttl_seconds is
+// absent or non-positive.
+const defaultCatalogTTLSeconds = 300
 
 // Rule is a declarative routing override. When all of its (non-empty) match
 // conditions hold, the request is pinned to UseProvider or restricted to UseTier.
@@ -100,6 +119,7 @@ func Default() *Config {
 		Proxy:     Proxy{Port: 3000},
 		Dashboard: Dashboard{Port: 2222},
 		Routing:   Routing{Strategy: "auto"},
+		Catalog:   Catalog{Enabled: true, TTLSeconds: defaultCatalogTTLSeconds},
 	}
 }
 
@@ -124,6 +144,9 @@ func Load(path string) (*Config, error) {
 	}
 	if cfg.Routing.Strategy == "" {
 		cfg.Routing.Strategy = "auto"
+	}
+	if cfg.Catalog.TTLSeconds <= 0 {
+		cfg.Catalog.TTLSeconds = defaultCatalogTTLSeconds
 	}
 	return cfg, nil
 }
