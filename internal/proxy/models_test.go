@@ -283,10 +283,16 @@ func TestModels_ServesFromCacheWithoutContactingAnyProvider(t *testing.T) {
 	// a keyed upstream call (D-8). It answers from the catalog and nothing else.
 	f := newFakeModelProvider(t, "discovered-model")
 	h := newModelsHandler(t, "auto", modelsProvider{name: "acme", url: f.srv.URL, tier: "free"})
+	discover(t, h)
 
 	before := f.listed.Load()
-	modelsList(t, h)
+	ids, _ := modelsList(t, h)
 
+	// The discovered id must be what comes back: an empty cache would fall through to
+	// the stub Claude list and still leave the counter untouched.
+	if want := []string{"discovered-model"}; !reflect.DeepEqual(ids, want) {
+		t.Errorf("ids = %v, want the discovered %v — the endpoint must serve the cached snapshot", ids, want)
+	}
 	if got := f.listed.Load(); got != before {
 		t.Errorf("listing requests = %d after GET /v1/models, want %d — the endpoint must never trigger discovery", got, before)
 	}
@@ -347,6 +353,36 @@ func TestModels_EveryAdvertisedModelIsRoutableUnderEveryStrategy(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestCascade_SkipsACandidateThatDoesNotServeTheRequestedID(t *testing.T) {
+	// CascadeChain is an independent chain source (it calls autoChain/healthy
+	// directly), so the routability guard on RouteChain does not cover it: without the
+	// partition re-applied to the cascade chain, the cheap provider is tried first and
+	// can only answer 404 for an id it does not serve.
+	cheap := newFakeModelProvider(t, "cheap-model")
+	premium := newFakeModelProvider(t, "premium-model")
+	h := newModelsHandler(t, "auto",
+		modelsProvider{name: "cheap", url: cheap.srv.URL, tier: "free"},
+		modelsProvider{name: "premium", url: premium.srv.URL, tier: "premium"},
+	)
+	discover(t, h)
+	h.cascade = true
+
+	rec := doMessages(h, `{"model":"premium-model","max_tokens":100,"messages":[{"role":"user","content":"refactor this"}]}`)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("X-Nexus-Provider"); got != "premium" {
+		t.Errorf("X-Nexus-Provider = %q, want premium — the only provider that serves the id", got)
+	}
+	if got := cheap.chat.Load(); got != 0 {
+		t.Errorf("cheap handled %d requests, want 0 — a cascade candidate that cannot serve the id must not be tried", got)
+	}
+	if got := premium.chat.Load(); got != 1 {
+		t.Errorf("premium handled %d requests, want 1", got)
 	}
 }
 

@@ -734,12 +734,11 @@ func (h *Handler) HandleMessages(w http.ResponseWriter, r *http.Request) {
 
 	// Sticky provider (P3): prefer whichever provider last actually
 	// succeeded serving this exact requested model string, if it's still in
-	// this request's chain. NOTE: under the default StrategyAuto, RouteChain
-	// reorders purely by classified complexity and ignores the requested
-	// model string, so the same requested model can land in a different
-	// chain (and this sticky pointer simply won't be found) from one
-	// request to the next if its classified complexity differs — that's
-	// intentional graceful degradation, not a bug to work around here.
+	// this request's chain. NOTE: the chain composition still varies from
+	// request to request — classified complexity reorders it and the model
+	// partition groups it — so this sticky pointer can legitimately miss.
+	// That is intentional graceful degradation, not a bug to work around
+	// here.
 	if sp, ok := h.stickyProvider(req.Model); ok {
 		chain = stickyReorder(chain, sp)
 	}
