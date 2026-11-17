@@ -12,7 +12,7 @@
 
 - **Success criteria.**
   - `GET /v1/models` returns an OpenAI-shaped list whose entries are the deduplicated union of what the configured providers report, in a stable order, served from cache without blocking on upstream calls.
-  - For every id returned by `/v1/models`, a request naming that id places at least one provider that serves it at the head of the chain (`chain[0].Models[id]` is present), under every strategy including `direct`.
+  - For every id returned by `/v1/models`, a request naming that id places at least one provider that serves it at the head of the chain, as reported by the router's locked accessor `Router.ProviderServes(chain[0].Name, id)`, under every strategy including `direct`.
   - Provider listing failures never break the endpoint: the list degrades through the documented fallback ladder.
   - Routing behaviour is unchanged when the requested id is served by no provider, and when every provider serves it.
   - The catalog-unification follow-up (the dashboard's `/api/playground/models` and the `nexus models` CLI sharing one index with `/v1/models`) is captured as an intake ticket under `docs/tickets/` (item T1).
@@ -115,6 +115,7 @@ Execution begins only after the human approves this plan. The executor may be th
   - The partition must be **stable**: iterate the chain once, appending to a `match` slice or a `rest` slice, then concatenate. Do not sort; sorting would destroy the sticky order applied later.
   - `SetProviderModels` must tolerate a provider name that is not registered (log at debug and return) because discovery and registration can race at startup.
   - `Models` values are the provider model id, so set `Models[id] = id`. Discovery results are already provider ids, not Claude ids.
+  - Expose a locked read accessor, `func (r *Router) ProviderServes(name, id string) bool`, because `Models` is an exported field on an exported struct and therefore reachable without the lock from any `*Provider` returned by `RouteChain` or `Providers()`. Note on the field that external readers must use the accessor. This is what keeps P1's routability invariant race-free against C2's discovery loop.
   - Do not add a field to `Provider` for "discovered" versus "configured" ids unless a later item needs the distinction; keep the map homogeneous.
 - **Prerequisites:** None.
 - **Verify:** New tests in `internal/router/router_test.go` (or a new `partition_test.go`) covering: under `StrategyAuto`, a provider that serves the id moves ahead of one that does not; under `StrategyDirect`, `StrategyCheapest`, and `StrategyFastest`, the same; the partition is a no-op when no provider serves the id and when all do; relative order within each group is preserved; `StrategyManual` still puts serving providers first; `SetProviderModels` on an unknown name does not panic. Then `go test ./internal/router/ -v -race` and the full `make test`.
@@ -175,7 +176,7 @@ Execution begins only after the human approves this plan. The executor may be th
   - A duplicate id across two providers appears exactly once.
   - When every provider listing fails and config declares no models, the ladder still yields a non-empty list.
   - The response carries no `created` field and every entry has `object: "model"`.
-  - **Routability invariant:** for every id in the response, `RouteChain(id, complexity)` for each of `simple`, `standard`, `complex`, and `critical` returns a chain whose head has that id in its `Models` map. This is the regression guard that keeps the promise keepable.
+  - **Routability invariant:** for every id in the response, `RouteChain(id, complexity)` for each of `simple`, `standard`, `complex`, and `critical` returns a chain whose head the router reports as serving that id, checked with `Router.ProviderServes(chain[0].Name, id)` rather than by reading `Provider.Models` directly, so the assertion stays race-free while C2's discovery loop writes. This is the regression guard that keeps the promise keepable.
   - An end-to-end request naming a discovered id reaches the provider that serves it (fake upstream returns 200 only for that id) under `direct` as well as `auto`.
   - `GET` remains the only accepted method; a `POST` still falls through to the catch-all 404.
   Then `make test` and `make lint`.
