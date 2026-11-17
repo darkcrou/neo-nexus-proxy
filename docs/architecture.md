@@ -12,10 +12,11 @@ dashboard server, and the embedded web UI, sharing a local SQLite database.
 │                                                                        │
 │  Proxy :3000                                   Dashboard :2222         │
 │  ├─ POST /v1/messages          (Anthropic)     ├─ GET /  (Svelte SPA)  │
-│  └─ POST /v1/chat/completions  (OpenAI)        ├─ GET /api/*  (stats,  │
-│                                                │     requests, savings,│
-│   request pipeline (per call):                 │     report, leaderbd) │
-│   1. 🔒 privacy firewall  — mask secrets/PII   └─ GET /events  (SSE)   │
+│  ├─ POST /v1/chat/completions  (OpenAI)        ├─ GET /api/*  (stats,  │
+│  └─ GET  /v1/models            (OpenAI list)   │     requests, savings,│
+│                                                │     report, leaderbd) │
+│   request pipeline (per call):                 └─ GET /events  (SSE)   │
+│   1. 🔒 privacy firewall  — mask secrets/PII                           │
 │   2. ⚡ cache lookup      — exact + semantic                            │
 │   3. 🧭 classify          — simple/standard/complex/critical            │
 │   4. 🧩 rules / headers   — X-Nexus-Tier / X-Nexus-Provider / config    │
