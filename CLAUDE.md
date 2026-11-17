@@ -36,60 +36,84 @@ nexus/
 ├── go.mod
 ├── go.sum
 ├── Makefile
+├── CHANGELOG.md                 ← user-facing changes; promote Unreleased → vX.Y.Z when tagging
 ├── .goreleaser.yml              ← for GitHub releases (binaries)
+├── Dockerfile
+├── docker-compose.yml           ← optional container path (see docs/docker.md)
+├── install.sh / install.ps1     ← `curl | sh` installer
+├── .github/workflows/ci.yml     ← test (linux+windows) → release (on v* tag) → docker
 ├── cmd/
 │   └── nexus/
 │       └── main.go              ← CLI entrypoint (cobra)
 ├── internal/
-│   ├── proxy/
-│   │   ├── server.go            ← HTTP proxy server (port 3000)
-│   │   ├── handler.go           ← request interceptor
+│   ├── proxy/                   ← the request path (15 files)
+│   │   ├── server.go            ← mux + routes (port 3000)
+│   │   ├── handler.go           ← HandleMessages: classify → chain → cooldown → upstream (~1.7k lines)
+│   │   ├── gateway.go           ← HandleChatCompletions (OpenAI in) + HandleModels (/v1/models)
+│   │   ├── catalog.go           ← model catalog: live discovery + TTL cache
 │   │   ├── transformer.go       ← Anthropic ↔ OpenAI format conversion
-│   │   └── stream.go            ← streaming response handler
+│   │   ├── stream.go            ← streaming response handler
+│   │   └── cascade.go, semantic.go, cache.go, firewall.go, images.go,
+│   │       rules.go, usage.go, openai.go
 │   ├── router/
-│   │   ├── router.go            ← intelligent model router
-│   │   ├── classifier.go        ← task complexity classifier
-│   │   └── rules.go             ← routing rules engine
+│   │   ├── router.go            ← RouteChain, PreferModel, model partition
+│   │   └── classifier.go        ← task complexity classifier
+│   ├── providers/               ← ~30 files, one per provider family
+│   │   ├── provider.go          ← Provider interface, DefaultModels, health check
+│   │   ├── generic.go           ← config-driven provider + `overridden` wrapper
+│   │   ├── models.go            ← ListModels discovery (per-family recipes)
+│   │   └── anthropic.go, openai.go, gemini.go, ollama.go, deepseek.go, …
+│   ├── config/
+│   │   └── config.go            ← Default/Load, DiscoverFromEnv, EnvKeyVars
+│   ├── storage/
+│   │   ├── db.go                ← SQLite schema + setup
+│   │   ├── requests.go          ← request log storage
+│   │   └── usage.go             ← usage events + query-time windows
 │   ├── dashboard/
 │   │   ├── server.go            ← dashboard HTTP server (port 2222)
 │   │   ├── sse.go               ← Server-Sent Events for live updates
-│   │   └── embed.go             ← embedded Svelte build
-│   ├── storage/
-│   │   ├── db.go                ← SQLite setup
-│   │   ├── requests.go          ← request log storage
-│   │   └── stats.go             ← aggregated stats queries
-│   └── providers/
-│       ├── provider.go          ← Provider interface
-│       ├── anthropic.go         ← Anthropic provider
-│       ├── deepseek.go          ← DeepSeek provider
-│       ├── groq.go              ← Groq provider
-│       ├── gemini.go            ← Gemini provider
-│       └── ollama.go            ← Ollama (local) provider
-├── web/                         ← Svelte dashboard source
+│   │   ├── usage.go, playground.go, setup.go
+│   │   ├── embed.go             ← embeds dist/
+│   │   └── dist/                ← TRACKED build output (web/dist/ is gitignored)
+│   └── license/                 ← community-edition gating
+├── web/                         ← Svelte source (build output → internal/dashboard/dist)
 │   ├── package.json
 │   ├── vite.config.ts
-│   ├── src/
-│   │   ├── App.svelte
-│   │   ├── main.ts
-│   │   ├── components/
-│   │   │   ├── RequestFeed.svelte     ← live request stream
-│   │   │   ├── CostMeter.svelte       ← real-time costs
-│   │   │   ├── ModelBadge.svelte      ← which model was used
-│   │   │   ├── ProviderStatus.svelte  ← provider health
-│   │   │   └── StatsBar.svelte        ← total tokens/costs
-│   │   ├── stores/
-│   │   │   ├── requests.ts            ← SSE store
-│   │   │   └── stats.ts               ← stats store
-│   │   └── pages/
-│   │       ├── Dashboard.svelte
-│   │       ├── Requests.svelte
-│   │       └── Settings.svelte
-│   └── public/
+│   └── src/
+│       ├── App.svelte           ← the whole dashboard: one ~1000-line component, no pages/
+│       ├── main.ts
+│       ├── components/UsageWindowDetails.svelte
+│       └── stores/{requests,usage}.ts
+├── tools/herogif/              ← README asset generator
 └── docs/
-    ├── architecture.md
-    ├── providers.md
-    └── routing.md
+    ├── architecture.md, docker.md, agent-harnesses.md, LICENSING.md, MOBILE.md
+    ├── plans/                  ← task-plan documents
+    ├── reports/                ← completion reports
+    └── tickets/                ← ticketing-CLI items
 ```
+
+---
+
+## Where to start (navigation)
+
+Read this before grepping. Task → file:
+
+| Working on… | Start at |
+|---|---|
+| A request/response bug | `internal/proxy/handler.go` (`HandleMessages`), then `stream.go` / `transformer.go` |
+| The OpenAI gateway | `internal/proxy/gateway.go` (`HandleChatCompletions`, `HandleModels`) |
+| Provider selection, cooldown, stickiness | `handler.go` (`pickKey`/`coolKey`/`stickyProvider`) + `internal/router/router.go` (`RouteChain`, `PreferModel`) |
+| A provider's wire format | `internal/providers/<family>.go`; shared config-driven logic in `generic.go` |
+| Config keys / env discovery | `internal/config/config.go` (`Default`, `Load`, `DiscoverFromEnv`, `EnvKeyVars`) |
+| Schema or stats | `internal/storage/db.go` (schema), `usage.go` (windows/totals) |
+| Dashboard API | `internal/dashboard/server.go`; the UI is `web/src/App.svelte` (one file) |
+| CLI commands | `cmd/nexus/main.go` (cobra) |
+
+Corrections to older revisions of this file: `docs/providers.md`,
+`docs/routing.md`, `internal/router/rules.go`, `internal/storage/stats.go`,
+`web/src/pages/*` and the five per-widget Svelte components were never written
+(or were consolidated away). If you find them referenced elsewhere, that
+reference is stale — don't go looking for the files.
 
 ---
 
@@ -787,6 +811,47 @@ make build        # compile nexus binary
 make release      # GoReleaser → GitHub Release
 ```
 
+### Deploying (rpi)
+
+Production runs on `rpi` (192.168.68.54, user `rpi`, key `~/.ssh/pipi`) —
+**not** `opi` / `av-pc`:
+
+- Checkout: `/home/rpi/sources/github.com/nexus-proxy` (compose project
+  `nexus-proxy`, container `nexus`), ports 3000/2222, state in
+  `~/.nexus/{config.toml,nexus.db}` on the host.
+- Deploy = update the checkout, then `docker compose build && docker compose
+  up -d`. The Node and Go-module layers are cached, so a source-only change
+  rebuilds without network traffic.
+- Verify: `curl -s localhost:3000/health`, `curl -s localhost:3000/v1/models`,
+  and `curl -o /dev/null -w '%{http_code}\n' localhost:2222/`.
+- **rpi cannot reach `opi`.** Its clone's `origin` points at
+  `ubuntu@192.168.68.55`, but it holds no SSH key for it, so `git fetch
+  origin` fails there. Ship commits as a bundle instead: `git bundle create
+  /tmp/x.bundle <old-sha>..main vX.Y.Z`, `scp` it over, then `git fetch
+  /tmp/x.bundle 'refs/heads/main:refs/remotes/bundle/main'
+  'refs/tags/vX.Y.Z:refs/tags/vX.Y.Z'` and `git merge --ff-only bundle/main`.
+- **rpi's login shell is fish.** `ssh rpi 'a && b'` dies with `command
+  substitutions not allowed here`. Use `ssh rpi bash -s <<'REMOTE' … REMOTE`.
+- `docker compose build` passes no build args, so the deployed binary reports
+  `nexus dev (built unknown)`. CI passes `VERSION`/`BUILD_TIME`; wire them into
+  the compose file if that matters.
+
+### Local tooling reality
+
+- `golangci-lint` is **not installed** and there is no `.golangci.yml`, so
+  `make lint` cannot run — never report it as a passed check. Substitute `go
+  vet ./...` plus `gofmt -l` on the files you touched.
+- ~20 files carry **pre-existing** `gofmt` drift (`cascade_test.go`,
+  `proxy/server.go`, `transformer.go`, `internal/config/config.go`, …). Leave
+  them; reformatting them inside an unrelated change buries the real diff.
+- `make test` is `go test ./... -v -race`. Filter it — `make test 2>&1 | grep
+  -E '^(ok|FAIL|---)'` — instead of pulling the whole log into context.
+- Any `internal/proxy` fixture that builds a handler (`NewHandler`, `New`)
+  **must** call `scrubProviderEnv(t)` (see `env_test.go`). Without it the test
+  picks up the developer's ambient provider env vars and makes **live API
+  calls** with their real key. For catalog assertions, disable background
+  warming (`[catalog] enabled = false`) and drive `discover(t, h)` yourself.
+
 ### Cross-platform targets:
 - `nexus-linux-amd64`
 - `nexus-linux-arm64`
@@ -873,7 +938,7 @@ claude
 2. `internal/storage/requests.go` — request logging
 3. `internal/router/classifier.go` — complexity classifier
 4. `internal/router/router.go` — routing logic
-5. `internal/router/rules.go` — fallback chains
+5. `internal/proxy/rules.go` — fallback chains (not `internal/router/rules.go`)
 6. Test: requests go to the correct provider
 
 ### Sprint 3 — Dashboard
