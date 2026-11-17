@@ -157,6 +157,26 @@ func (r *Router) Providers() []*Provider {
 	return out
 }
 
+// SetProviderModels replaces a provider's model map, mapping each id to itself.
+// Discovery reports the provider's own model ids, so the requested id and the
+// provider id are the same string. A name that is not registered yet is ignored:
+// discovery and registration can race at startup.
+func (r *Router) SetProviderModels(name string, ids []string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, p := range r.providers {
+		if p.Name != name {
+			continue
+		}
+		models := make(map[string]string, len(ids))
+		for _, id := range ids {
+			models[id] = id
+		}
+		p.Models = models
+		return
+	}
+}
+
 // SetHealthy updates a provider's health (called by the background checker).
 func (r *Router) SetHealthy(name string, healthy bool) {
 	r.mu.Lock()
@@ -181,19 +201,24 @@ func (r *Router) Route(requestedModel string, complexity Complexity) *Provider {
 // RouteChain returns an ordered list of candidate providers to try, best first.
 // Only healthy providers are included. The caller walks the chain, failing over
 // to the next candidate on transport errors or retryable HTTP statuses.
+//
+// Whatever the strategy produced, providers that serve the requested model id
+// come first: an id the chain cannot serve is a 404 the client would see.
 func (r *Router) RouteChain(requestedModel string, complexity Complexity) []*Provider {
+	var chain []*Provider
 	switch r.strategy {
 	case StrategyCheapest:
-		return r.byCost()
+		chain = r.byCost()
 	case StrategyFastest:
-		return r.byTierSpeed()
+		chain = r.byTierSpeed()
 	case StrategyManual:
-		return r.manualChain(requestedModel)
+		chain = r.healthy() // explicit mapping: the partition alone orders the chain
 	case StrategyDirect:
-		return r.autoChain(complexity)
+		chain = r.autoChain(complexity)
 	default: // StrategyAuto
-		return r.autoChain(complexity)
+		chain = r.autoChain(complexity)
 	}
+	return preferModel(chain, requestedModel)
 }
 
 // CascadeChain orders healthy providers cheapest-first (local → free → standard
@@ -281,14 +306,22 @@ func (r *Router) byTierSpeed() []*Provider {
 	return hp
 }
 
-func (r *Router) manualChain(requestedModel string) []*Provider {
-	var match, rest []*Provider
-	for _, p := range r.healthy() {
+// preferModel is a stable partition of an ordered chain: providers whose Models
+// map contains the requested id first, the rest after, each group keeping the
+// order it arrived in. Stability matters because sticky provider selection runs
+// on top of this chain — sorting would destroy it.
+func preferModel(chain []*Provider, requestedModel string) []*Provider {
+	match := make([]*Provider, 0, len(chain))
+	rest := make([]*Provider, 0, len(chain))
+	for _, p := range chain {
 		if _, ok := p.Models[requestedModel]; ok {
 			match = append(match, p)
 		} else {
 			rest = append(rest, p)
 		}
+	}
+	if len(match) == 0 || len(rest) == 0 {
+		return chain // nothing to reorder; keep the strategy's slice untouched
 	}
 	return append(match, rest...)
 }
