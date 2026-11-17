@@ -1,4 +1,4 @@
-## Unreleased
+## v0.9.0
 
 - **Real model list and id-aware routing:** `GET /v1/models` now returns the
   models your configured providers actually offer — discovered from each
