@@ -223,6 +223,85 @@ func TestRouteChain_ConcurrentSetProviderModelsIsRaceFree(t *testing.T) {
 	wg.Wait()
 }
 
+func TestProviderServes_ReportsWhetherARegisteredProviderServesTheID(t *testing.T) {
+	r := New(StrategyAuto)
+	r.AddProvider(&Provider{Name: "serving", Tier: "standard", Healthy: true, Models: serves(requestedModelID)})
+	r.AddProvider(&Provider{Name: "other", Tier: "premium", Healthy: true, Models: serves("another-model")})
+
+	if !r.ProviderServes("serving", requestedModelID) {
+		t.Errorf("ProviderServes(serving, %q) = false, want true", requestedModelID)
+	}
+	if r.ProviderServes("other", requestedModelID) {
+		t.Errorf("ProviderServes(other, %q) = true, want false", requestedModelID)
+	}
+	if r.ProviderServes("never-registered", requestedModelID) {
+		t.Errorf("ProviderServes on an unregistered name = true, want false")
+	}
+}
+
+func TestProviderServes_ReflectsSubsequentSetProviderModels(t *testing.T) {
+	r := New(StrategyAuto)
+	r.AddProvider(&Provider{Name: "p", Tier: "standard", Healthy: true})
+
+	if r.ProviderServes("p", "old-model") {
+		t.Fatal("a provider with no models should serve nothing")
+	}
+
+	r.SetProviderModels("p", []string{"old-model"})
+	if !r.ProviderServes("p", "old-model") {
+		t.Error("old-model should be served after SetProviderModels")
+	}
+
+	r.SetProviderModels("p", []string{"new-model"})
+	if r.ProviderServes("p", "old-model") {
+		t.Error("old-model should no longer be served after a replacement")
+	}
+	if !r.ProviderServes("p", "new-model") {
+		t.Error("new-model should be served after a replacement")
+	}
+}
+
+// ProviderServes is the only sanctioned reader of a provider's model map: it
+// must stay race-free against the discovery loop rewriting that map while
+// request goroutines route.
+func TestProviderServes_ConcurrentWithSetProviderModelsIsRaceFree(t *testing.T) {
+	r := New(StrategyAuto)
+	r.AddProvider(&Provider{Name: "local", Tier: "local", Healthy: true})
+	r.AddProvider(&Provider{Name: "standard", Tier: "standard", Healthy: true})
+	r.AddProvider(&Provider{Name: "premium", Tier: "premium", Healthy: true})
+
+	lists := [][]string{{requestedModelID}, {"another-model"}, nil}
+
+	var wg sync.WaitGroup
+	wg.Add(3)
+	go func() {
+		defer wg.Done()
+		for j := 0; j < 5000; j++ {
+			r.ProviderServes("local", requestedModelID)
+			r.ProviderServes("premium", "another-model")
+			r.ProviderServes("never-registered", requestedModelID)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 5000; i++ {
+			if len(r.RouteChain(requestedModelID, ComplexityStandard)) == 0 {
+				t.Error("RouteChain returned an empty chain")
+				return
+			}
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 5000; i++ {
+			r.SetProviderModels("local", lists[i%len(lists)])
+			r.SetProviderModels("standard", lists[(i+1)%len(lists)])
+			r.SetProviderModels("premium", lists[(i+2)%len(lists)])
+		}
+	}()
+	wg.Wait()
+}
+
 func TestRouteChain_HonoursModelsRegisteredThroughSetProviderModels(t *testing.T) {
 	r := New(StrategyAuto)
 	r.AddProvider(&Provider{Name: "cheap", Tier: "local", Healthy: true})

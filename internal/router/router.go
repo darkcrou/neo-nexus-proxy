@@ -46,11 +46,17 @@ const (
 )
 
 // Provider holds provider configuration for routing
+//
+// Models is exported so callers can build a Provider, not so they can read it
+// unlocked: it is rewritten at runtime by discovery through
+// SetProviderModels. External readers must ask the router (ProviderServes,
+// RouteChain) rather than dereferencing the map of a *Provider obtained from
+// RouteChain or Providers().
 type Provider struct {
 	Name     string
 	BaseURL  string
 	APIKey   string
-	Models   map[string]string // Claude model → provider model
+	Models   map[string]string // Claude model → provider model; read only under the router lock
 	Tier     string            // free | standard | premium | local
 	Priority int               // lower = higher priority within same tier
 	Pricing  Pricing
@@ -175,6 +181,24 @@ func (r *Router) SetProviderModels(name string, ids []string) {
 		p.Models = models
 		return
 	}
+}
+
+// ProviderServes reports whether the named provider's model map contains id.
+// It is the only sanctioned way to read that map outside the router: the maps
+// are rewritten by SetProviderModels while request goroutines route, so
+// reading them off a *Provider obtained from RouteChain or Providers() would
+// race. A name that is not registered reports false.
+func (r *Router) ProviderServes(name, id string) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for _, p := range r.providers {
+		if p.Name != name {
+			continue
+		}
+		_, ok := p.Models[id]
+		return ok
+	}
+	return false
 }
 
 // SetHealthy updates a provider's health (called by the background checker).
@@ -327,6 +351,12 @@ func (r *Router) byTierSpeed() []*Provider {
 // in serving first, the rest after, each group keeping the order it arrived in.
 // Stability matters because sticky provider selection runs on top of this chain
 // — sorting would destroy it.
+//
+// This partition fixes only the model-serving preference within the chain the
+// router returns; it is not the final order a request is sent in. internal/proxy
+// reorders the chain again after RouteChain returns (sticky provider selection,
+// tier filtering, forced pins), and those steps can still move a non-serving
+// provider ahead of a serving one.
 func preferModel(chain []*Provider, serving map[string]bool) []*Provider {
 	match := make([]*Provider, 0, len(chain))
 	rest := make([]*Provider, 0, len(chain))
