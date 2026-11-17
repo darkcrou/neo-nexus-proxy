@@ -55,22 +55,23 @@ const (
 	maxKeyBackoff     = 5 * time.Minute
 )
 
-// pickKey returns the sticky current key: the same key on repeated calls
-// while it isn't cooling. Only when the current key is cooling does it scan
-// forward for the next non-cooling key and adopt that as the new current.
+// keyLocked is the single key-scan core behind pickKey and peekKey, so the two
+// cannot drift: peek reports exactly what pick would return.
+//
+// It returns the sticky current key: the same key on repeated calls while it
+// isn't cooling. Only when the current key is cooling does it scan forward for
+// the next non-cooling key, and it adopts that as the new current only when
+// adopt is set.
 //
 // With no key pool it falls back to apiKey (idx -1, ok always true — this is
 // not the exhausted case). If a pool exists but every key in it is cooling,
 // ok is false: the provider is exhausted and the caller must not attempt a
-// request with a known-cooling key.
-func (a *activeProvider) pickKey() (key string, idx int, ok bool) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
+// request with a known-cooling key. Caller holds a.mu.
+func (a *activeProvider) keyLocked(now time.Time, adopt bool) (key string, idx int, ok bool) {
 	n := len(a.keys)
 	if n == 0 {
 		return a.apiKey, -1, true
 	}
-	now := time.Now()
 	cur := int(a.rr) % n
 	if a.cool[cur].Before(now) {
 		return a.keys[cur], cur, true
@@ -78,11 +79,20 @@ func (a *activeProvider) pickKey() (key string, idx int, ok bool) {
 	for off := 1; off < n; off++ {
 		i := (cur + off) % n
 		if a.cool[i].Before(now) {
-			a.rr = uint32(i)
+			if adopt {
+				a.rr = uint32(i)
+			}
 			return a.keys[i], i, true
 		}
 	}
 	return "", -1, false
+}
+
+// pickKey returns the sticky current key and adopts any key it scans forward to.
+func (a *activeProvider) pickKey() (key string, idx int, ok bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.keyLocked(time.Now(), true)
 }
 
 // peekKey reports the key pickKey would return, without adopting it: it never
@@ -91,22 +101,7 @@ func (a *activeProvider) pickKey() (key string, idx int, ok bool) {
 func (a *activeProvider) peekKey() (key string, idx int, ok bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	n := len(a.keys)
-	if n == 0 {
-		return a.apiKey, -1, true
-	}
-	now := time.Now()
-	cur := int(a.rr) % n
-	if a.cool[cur].Before(now) {
-		return a.keys[cur], cur, true
-	}
-	for off := 1; off < n; off++ {
-		i := (cur + off) % n
-		if a.cool[i].Before(now) {
-			return a.keys[i], i, true
-		}
-	}
-	return "", -1, false
+	return a.keyLocked(time.Now(), false)
 }
 
 // hasAvailableKey reports whether the provider currently has at least one

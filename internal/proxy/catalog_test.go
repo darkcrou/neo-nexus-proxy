@@ -85,10 +85,10 @@ func (f *fakeUpstream) lastAuth() string {
 	return f.auth
 }
 
-// newUpstreamProvider builds a real OpenAI-compatible provider pointed at the
-// fake upstream, with an optional key pool (the sticky-key path needs more than
-// one key to be observable).
-func newUpstreamProvider(t *testing.T, name string, f *fakeUpstream, keys ...string) *activeProvider {
+// newProviderAt builds a real OpenAI-compatible provider pointed at baseURL, with
+// an optional key pool (the sticky-key path needs more than one key to be
+// observable).
+func newProviderAt(t *testing.T, name, baseURL string, keys ...string) *activeProvider {
 	t.Helper()
 	if len(keys) == 0 {
 		keys = []string{"key-" + name}
@@ -96,7 +96,7 @@ func newUpstreamProvider(t *testing.T, name string, f *fakeUpstream, keys ...str
 	impl, err := providers.New(providers.Spec{
 		Name:    name,
 		Type:    "openai-compatible",
-		BaseURL: f.srv.URL,
+		BaseURL: baseURL,
 		Tier:    providers.TierFree,
 	})
 	if err != nil {
@@ -109,6 +109,52 @@ func newUpstreamProvider(t *testing.T, name string, f *fakeUpstream, keys ...str
 		cool:    make([]time.Time, len(keys)),
 		backoff: make([]time.Duration, len(keys)),
 	}
+}
+
+// newUpstreamProvider builds a provider pointed at the fake upstream.
+func newUpstreamProvider(t *testing.T, name string, f *fakeUpstream, keys ...string) *activeProvider {
+	t.Helper()
+	return newProviderAt(t, name, f.srv.URL, keys...)
+}
+
+// blockingUpstream is a /models endpoint that parks every request until the test
+// releases it. It lets two refreshes be forced to overlap with channels alone,
+// instead of racing them and hoping for a window.
+type blockingUpstream struct {
+	srv     *httptest.Server
+	hits    atomic.Int64
+	started chan struct{}
+	release chan struct{}
+}
+
+func newBlockingUpstream(t *testing.T, ids ...string) *blockingUpstream {
+	t.Helper()
+	b := &blockingUpstream{started: make(chan struct{}, 1), release: make(chan struct{})}
+	b.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b.hits.Add(1)
+		select {
+		case b.started <- struct{}{}:
+		default:
+		}
+		<-b.release
+		data := make([]map[string]string, 0, len(ids))
+		for _, id := range ids {
+			data = append(data, map[string]string{"id": id, "object": "model"})
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"object": "list", "data": data})
+	}))
+	// Release before closing, so a failing test cannot hang in cleanup on a
+	// handler that is still parked.
+	t.Cleanup(func() {
+		select {
+		case <-b.release:
+		default:
+			close(b.release)
+		}
+		b.srv.Close()
+	})
+	return b
 }
 
 // fakeClock drives the catalog's TTL and backoff gates deterministically, so no
@@ -478,6 +524,55 @@ func TestCatalogConcurrentSnapshotsDuringRefresh(t *testing.T) {
 	}
 }
 
+func TestCatalogSingleFlightSkipsOverlappingRefresh(t *testing.T) {
+	up := newBlockingUpstream(t, "alpha-model")
+	cat, _ := buildCatalog(t, 300*time.Second, newProviderAt(t, "acme", up.srv.URL))
+
+	firstDone := make(chan struct{})
+	go func() {
+		defer close(firstDone)
+		cat.refreshAll(context.Background())
+	}()
+
+	// The first refresh is now parked inside the HTTP call, past the point where
+	// it marks its entry in flight.
+	select {
+	case <-up.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the first refresh never reached the upstream")
+	}
+
+	// A second, overlapping refresh must return without fetching.
+	secondDone := make(chan struct{})
+	go func() {
+		defer close(secondDone)
+		cat.refreshAll(context.Background())
+	}()
+
+	select {
+	case <-secondDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the second refresh blocked instead of skipping the in-flight provider")
+	}
+
+	if got := up.hits.Load(); got != 1 {
+		t.Errorf("upstream requests = %d while the first refresh is in flight, want 1 — single flight must prevent a stampede", got)
+	}
+
+	close(up.release)
+	select {
+	case <-firstDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the first refresh did not complete after the upstream was released")
+	}
+
+	if got := up.hits.Load(); got != 1 {
+		t.Errorf("upstream requests = %d after both refreshes, want 1 — the skipped refresh must not retry", got)
+	}
+	if got := cat.snapshot(); !reflect.DeepEqual(got, []string{"alpha-model"}) {
+		t.Errorf("snapshot = %v, want [alpha-model] — the single fetch must still populate the catalog", got)
+	}
+}
 func TestCatalogSeedIsVisibleBeforeFirstFetch(t *testing.T) {
 	f := newFakeUpstream(t, "live-model")
 	cat, _ := buildCatalog(t, 300*time.Second, newUpstreamProvider(t, "acme", f))
@@ -497,6 +592,23 @@ func TestCatalogSeedIsVisibleBeforeFirstFetch(t *testing.T) {
 	}
 	if got := cat.snapshot(); !reflect.DeepEqual(got, []string{"live-model"}) {
 		t.Errorf("snapshot = %v, want the discovered [live-model]", got)
+	}
+}
+
+func TestCatalogSeedRegistersModelsWithRouter(t *testing.T) {
+	f := newFakeUpstream(t, "live-model")
+	cat, _ := buildCatalog(t, 300*time.Second, newUpstreamProvider(t, "acme", f))
+
+	cat.seed(map[string][]string{"acme": {"configured-model"}})
+
+	if !cat.rt.ProviderServes("acme", "configured-model") {
+		t.Error("the router does not report the seeded id as served — an advertised id must be routable before the first fetch")
+	}
+	if cat.rt.ProviderServes("acme", "live-model") {
+		t.Error("the router reports an id nothing has discovered or seeded")
+	}
+	if f.requests() != 0 {
+		t.Errorf("upstream requests = %d, want 0 — registering the seed must not fetch", f.requests())
 	}
 }
 
@@ -548,6 +660,37 @@ func TestCatalogDisabledStartsNoWarmLoop(t *testing.T) {
 	}
 	if got := h.catalog.snapshot(); !reflect.DeepEqual(got, []string{"configured-model"}) {
 		t.Errorf("snapshot = %v, want the seeded [configured-model]", got)
+	}
+	if f.requests() != 0 {
+		t.Errorf("upstream requests = %d, want 0 — a disabled catalog must not fetch", f.requests())
+	}
+	if err := h.Close(); err != nil {
+		t.Errorf("Close: %v", err)
+	}
+}
+
+func TestCatalogDisabledSeedRegistersModelsWithRouter(t *testing.T) {
+	// A disabled catalog has no discovery loop, so the seed is the only id source:
+	// the ids it reports must still be routable, or the endpoint would advertise
+	// models that ProviderServes reports as served by nobody.
+	f := newFakeUpstream(t, "live-model")
+	ap := newUpstreamProvider(t, "acme", f)
+	rt := router.New(router.StrategyAuto)
+	rt.AddProvider(&router.Provider{Name: "acme", Healthy: true})
+	h := &Handler{
+		router:     rt,
+		providers:  map[string]*activeProvider{"acme": ap},
+		stopHealth: make(chan struct{}),
+	}
+
+	h.startCatalog(
+		[]config.Provider{{Name: "acme", Models: []string{"configured-model"}}},
+		config.Catalog{Enabled: false, TTLSeconds: 300},
+		[]string{"acme"},
+	)
+
+	if !rt.ProviderServes("acme", "configured-model") {
+		t.Error("the router does not report the seeded id as served with the catalog disabled")
 	}
 	if f.requests() != 0 {
 		t.Errorf("upstream requests = %d, want 0 — a disabled catalog must not fetch", f.requests())

@@ -93,9 +93,15 @@ func newModelCatalog(rt *router.Router, active map[string]*activeProvider, order
 // seed primes the catalog with a per-provider list, so it is useful before the
 // first fetch completes. fetchedAt stays zero, so the first tick still fetches:
 // the seed is a fallback, not a claim about the upstream.
+//
+// The seed is also registered with the router, because it is the only id source
+// in three states: warming disabled, before the first fetch lands, and
+// permanently for a provider that exposes no listing endpoint. Without the push
+// the catalog would advertise ids that Router.ProviderServes reports as served
+// by nobody, and a request naming one of them would 404 at the first provider.
 func (c *modelCatalog) seed(models map[string][]string) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
+	seeded := make(map[string][]string, len(c.order))
 	for _, name := range c.order {
 		e := c.entries[name]
 		if e == nil {
@@ -103,6 +109,17 @@ func (c *modelCatalog) seed(models map[string][]string) {
 			c.entries[name] = e
 		}
 		e.models = append([]string(nil), models[name]...)
+		if len(e.models) > 0 {
+			seeded[name] = append([]string(nil), e.models...)
+		}
+	}
+	c.mu.Unlock()
+
+	// SetProviderModels takes the router lock, so it is called outside c.mu.
+	for _, name := range c.order {
+		if ids := seeded[name]; len(ids) > 0 {
+			c.rt.SetProviderModels(name, ids)
+		}
 	}
 }
 
@@ -293,7 +310,7 @@ func catalogTTL(cc config.Catalog) time.Duration {
 // registered and the operator has not switched the [catalog] section off.
 // Polling every provider endpoint is network behaviour the operator must be able
 // to disable, so a disabled catalog stays seed-only.
-func catalogWarms(enabled bool, providers int) bool { return enabled && providers > 0 }
+func catalogWarms(enabled bool, providerCount int) bool { return enabled && providerCount > 0 }
 
 // catalogSeed is the catalog's pre-fetch content: the provider's configured
 // models, else the provider family's default list. It is the middle rungs of the
