@@ -6,9 +6,13 @@ package proxy
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"reflect"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -17,6 +21,7 @@ import (
 	"github.com/lynuxis2026-pixel/nexus-proxy/internal/config"
 	"github.com/lynuxis2026-pixel/nexus-proxy/internal/providers"
 	"github.com/lynuxis2026-pixel/nexus-proxy/internal/router"
+	"github.com/lynuxis2026-pixel/nexus-proxy/internal/storage"
 )
 
 // ─── test fixtures ──────────────────────────────────────────────────────────
@@ -211,6 +216,46 @@ func entryState(t *testing.T, cat *modelCatalog, name string) (errText string, b
 		t.Fatalf("no catalog entry for provider %q", name)
 	}
 	return e.err, e.backoff, e.unsupported
+}
+
+// roundIDs is the id set a provider offers at round r. Ids are only ever added, so
+// an id that has been published stays served for the rest of the test and a
+// routability check can never fail spuriously.
+func roundIDs(name string, round int) []string {
+	ids := make([]string, 0, round+1)
+	for i := 0; i <= round; i++ {
+		ids = append(ids, fmt.Sprintf("%s-m%d", name, i))
+	}
+	return ids
+}
+
+// newHandlerFromConfig builds a real Handler from a config file, so a test asserts
+// on the wiring NewHandler performs (which pairs config entries with registry
+// names) instead of on a hand-built catalog.
+func newHandlerFromConfig(t *testing.T, tomlBody string) *Handler {
+	t.Helper()
+	// Environment discovery would add providers the test did not configure and
+	// could shadow the ones it did.
+	t.Setenv("GROQ_API_KEY", "")
+	t.Setenv("DEEPSEEK_API_KEY", "")
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.toml")
+	if err := os.WriteFile(path, []byte(tomlBody), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	db, err := storage.New(filepath.Join(dir, "nexus.db"))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	h, err := NewHandler(&Config{ConfigPath: path, DisableCache: true}, db, nil)
+	if err != nil {
+		t.Fatalf("NewHandler: %v", err)
+	}
+	t.Cleanup(func() { _ = h.Close() })
+	return h
 }
 
 // ─── tests ──────────────────────────────────────────────────────────────────
@@ -573,6 +618,7 @@ func TestCatalogSingleFlightSkipsOverlappingRefresh(t *testing.T) {
 		t.Errorf("snapshot = %v, want [alpha-model] — the single fetch must still populate the catalog", got)
 	}
 }
+
 func TestCatalogSeedIsVisibleBeforeFirstFetch(t *testing.T) {
 	f := newFakeUpstream(t, "live-model")
 	cat, _ := buildCatalog(t, 300*time.Second, newUpstreamProvider(t, "acme", f))
@@ -613,14 +659,198 @@ func TestCatalogSeedRegistersModelsWithRouter(t *testing.T) {
 }
 
 func TestCatalogSeedFallsBackToDefaultModels(t *testing.T) {
-	seed := catalogSeed([]config.Provider{{Name: "groq", Models: []string{"configured-model"}}}, []string{"groq", "deepseek"})
+	// The seed is the middle rungs of the endpoint's ladder: configured models, else
+	// the provider family's default list.
+	h := newHandlerFromConfig(t, `
+[catalog]
+enabled = false
 
-	if got := seed["groq"]; !reflect.DeepEqual(got, []string{"configured-model"}) {
-		t.Errorf("configured provider seed = %v, want [configured-model]", got)
+[[providers]]
+name = "groq"
+type = "groq"
+api_key = "gsk-test"
+models = ["configured-model"]
+
+[[providers]]
+name = "deepseek"
+api_key = "sk-test"
+`)
+
+	want := append([]string{"configured-model"}, providers.DefaultModels("deepseek")...)
+	if got := h.catalog.snapshot(); !reflect.DeepEqual(got, want) {
+		t.Errorf("snapshot = %v, want %v — a provider without configured models seeds from its family defaults", got, want)
 	}
-	want := providers.DefaultModels("deepseek")
-	if got := seed["deepseek"]; !reflect.DeepEqual(got, want) {
-		t.Errorf("provider without configured models seed = %v, want %v", got, want)
+}
+
+func TestCatalogSeedKeepsModelsOfRenamedBuiltinProvider(t *testing.T) {
+	// `nexus add groq-us sk-… --type groq` is an accepted config shape: the config
+	// name differs from the registry name the family provider reports. The seed must
+	// follow the registry name and keep the configured ids; pairing the two by config
+	// name would fall through to the Groq defaults, so the catalog would advertise ids
+	// nobody configured and the configured id would not be routable.
+	h := newHandlerFromConfig(t, `
+[catalog]
+enabled = false
+
+[[providers]]
+name = "groq-us"
+type = "groq"
+api_key = "gsk-test"
+models = ["custom-model"]
+`)
+
+	if got := h.catalog.snapshot(); !reflect.DeepEqual(got, []string{"custom-model"}) {
+		t.Errorf("snapshot = %v, want [custom-model] — the configured ids must survive the name difference", got)
+	}
+	if !h.router.ProviderServes("groq", "custom-model") {
+		t.Error("the router does not report the configured id as served")
+	}
+	for _, id := range providers.DefaultModels("groq") {
+		if h.router.ProviderServes("groq", id) {
+			t.Errorf("router serves the family default %q, which nobody configured", id)
+		}
+	}
+}
+
+// roundUpstream is a /models endpoint that answers with the round the test has
+// staged and records which round it actually served. That record is what lets the
+// catalog's own clock double as a probe: when the catalog stamps a fetch, the ids
+// of the round the upstream just served must already be routable.
+type roundUpstream struct {
+	srv *httptest.Server
+	mu  sync.Mutex
+	// staged is the round the test has set; served maps a provider name to the round
+	// this endpoint last answered with.
+	staged int
+	served map[string]int
+}
+
+func newRoundUpstream(t *testing.T, name string) *roundUpstream {
+	t.Helper()
+	u := &roundUpstream{served: make(map[string]int)}
+	u.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		u.mu.Lock()
+		round := u.staged
+		u.served[name] = round
+		u.mu.Unlock()
+		data := make([]map[string]string, 0, round+1)
+		for _, id := range roundIDs(name, round) {
+			data = append(data, map[string]string{"id": id, "object": "model"})
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"object": "list", "data": data})
+	}))
+	t.Cleanup(u.srv.Close)
+	return u
+}
+
+func (u *roundUpstream) stage(round int) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.staged = round
+}
+
+func (u *roundUpstream) servedRound(name string) (int, bool) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	round, ok := u.served[name]
+	return round, ok
+}
+
+func TestCatalogPublishesSnapshotAndRouterTogether(t *testing.T) {
+	// A snapshot may only name ids the router already serves. While the entry and the
+	// router index were written in two steps, a reader could observe a provider's new
+	// list while the router still held the old one — the half-state that makes an
+	// advertised id unroutable.
+	//
+	// Two observations, one deterministic and one concurrent: the injected clock is
+	// called inside the critical section that publishes a list, so probing the router
+	// from it sees the exact contract at that instant (the racy variant alone cannot
+	// see a nanosecond-wide reorder, because a router read that starts after the entry
+	// write blocks on the pending push and returns the fresh state). Rounds only add
+	// ids, so an id observed once stays served and neither check can fail spuriously.
+	const (
+		providerCount = 3
+		rounds        = 20
+		readers       = 6
+	)
+
+	ups := make([]*roundUpstream, providerCount)
+	aps := make([]*activeProvider, providerCount)
+	seed := make(map[string][]string, providerCount)
+	names := make([]string, providerCount)
+	for i := 0; i < providerCount; i++ {
+		name := fmt.Sprintf("p%d", i)
+		names[i] = name
+		ups[i] = newRoundUpstream(t, name)
+		aps[i] = newProviderAt(t, name, ups[i].srv.URL)
+		seed[name] = roundIDs(name, 0)
+	}
+	cat, clock := buildCatalog(t, 300*time.Second, aps...)
+	cat.seed(seed)
+
+	var probeErr error
+	cat.now = func() time.Time {
+		for i, name := range names {
+			round, ok := ups[i].servedRound(name)
+			if !ok {
+				continue
+			}
+			for _, id := range roundIDs(name, round) {
+				if !cat.rt.ProviderServes(name, id) {
+					probeErr = fmt.Errorf("%q was recorded as fetched while the router did not serve it — the entry and the router index must be published together", id)
+				}
+			}
+		}
+		return clock.Now()
+	}
+
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+	for r := 0; r < readers; r++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-done:
+					return
+				default:
+				}
+				for _, id := range cat.snapshot() {
+					owner, _, ok := strings.Cut(id, "-m")
+					if !ok {
+						t.Errorf("snapshot returned a malformed id %q", id)
+						return
+					}
+					if !cat.rt.ProviderServes(owner, id) {
+						t.Errorf("snapshot advertised %q while the router did not serve it — the entry and the router index must be published together", id)
+						return
+					}
+				}
+			}
+		}()
+	}
+
+	for round := 1; round <= rounds; round++ {
+		for i := range ups {
+			ups[i].stage(round)
+		}
+		clock.advance(300 * time.Second)
+		cat.refreshAll(context.Background())
+	}
+	close(done)
+	wg.Wait()
+
+	if probeErr != nil {
+		t.Error(probeErr)
+	}
+	want := make([]string, 0, providerCount*(rounds+1))
+	for i := 0; i < providerCount; i++ {
+		want = append(want, roundIDs(names[i], rounds)...)
+	}
+	if got := cat.snapshot(); !reflect.DeepEqual(got, want) {
+		t.Errorf("snapshot = %v, want every id of the last round (%d ids)", got, len(want))
 	}
 }
 
@@ -650,7 +880,7 @@ func TestCatalogDisabledStartsNoWarmLoop(t *testing.T) {
 	}
 
 	h.startCatalog(
-		[]config.Provider{{Name: "acme", Models: []string{"configured-model"}}},
+		map[string][]string{"acme": {"configured-model"}},
 		config.Catalog{Enabled: false, TTLSeconds: 300},
 		[]string{"acme"},
 	)
@@ -684,7 +914,7 @@ func TestCatalogDisabledSeedRegistersModelsWithRouter(t *testing.T) {
 	}
 
 	h.startCatalog(
-		[]config.Provider{{Name: "acme", Models: []string{"configured-model"}}},
+		map[string][]string{"acme": {"configured-model"}},
 		config.Catalog{Enabled: false, TTLSeconds: 300},
 		[]string{"acme"},
 	)

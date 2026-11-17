@@ -261,6 +261,13 @@ func NewHandler(cfg *Config, db *storage.DB, broker EventPublisher) (*Handler, e
 	rt := router.New(router.RoutingStrategy(appCfg.Routing.Strategy))
 	active := make(map[string]*activeProvider)
 	var providerOrder []string // registration order: active is a map, snapshots need a stable order
+	// seedFor is the catalog's pre-fetch content, keyed by the registry name. It is
+	// built here because impl.Name() is the family name for a built-in provider and
+	// need not match the operator's config name (`nexus add groq-us sk-… --type
+	// groq` registers as "groq"); pairing the two by name later would lose the
+	// configured ids. Configured models win; the family defaults are the fallback
+	// rung of the endpoint's ladder.
+	seedFor := make(map[string][]string, len(appCfg.Providers))
 	for _, pc := range appCfg.Providers {
 		keys := resolveProviderKeys(pc)
 		key := keys[0]
@@ -287,10 +294,18 @@ func NewHandler(cfg *Config, db *storage.DB, broker EventPublisher) (*Handler, e
 			log.Warn().Str("provider", pc.Name).Err(err).Msg("Skipping provider")
 			continue
 		}
-		active[impl.Name()] = &activeProvider{impl: impl, apiKey: key, keys: keys, cool: make([]time.Time, len(keys)), backoff: make([]time.Duration, len(keys))}
-		providerOrder = append(providerOrder, impl.Name())
+		name := impl.Name()
+		if _, exists := active[name]; !exists {
+			providerOrder = append(providerOrder, name)
+		}
+		active[name] = &activeProvider{impl: impl, apiKey: key, keys: keys, cool: make([]time.Time, len(keys)), backoff: make([]time.Duration, len(keys))}
+		if len(pc.Models) > 0 {
+			seedFor[name] = pc.Models
+		} else {
+			seedFor[name] = providers.DefaultModels(name)
+		}
 		rt.AddProvider(&router.Provider{
-			Name:    impl.Name(),
+			Name:    name,
 			BaseURL: impl.BaseURL(),
 			APIKey:  key,
 			Tier:    impl.Tier(),
@@ -366,7 +381,7 @@ func NewHandler(cfg *Config, db *storage.DB, broker EventPublisher) (*Handler, e
 
 	// The catalog is seeded from config before the first fetch, so it is useful
 	// immediately; the warm loop is what turns it into live discovery.
-	h.startCatalog(appCfg.Providers, appCfg.Catalog, providerOrder)
+	h.startCatalog(seedFor, appCfg.Catalog, providerOrder)
 
 	if len(active) == 0 {
 		log.Info().Msg("No providers configured — zero-config mode (forwarding directly to Anthropic)")

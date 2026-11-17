@@ -6,7 +6,6 @@ package proxy
 import (
 	"context"
 	"errors"
-	"strings"
 	"sync"
 	"time"
 
@@ -99,9 +98,15 @@ func newModelCatalog(rt *router.Router, active map[string]*activeProvider, order
 // permanently for a provider that exposes no listing endpoint. Without the push
 // the catalog would advertise ids that Router.ProviderServes reports as served
 // by nobody, and a request naming one of them would 404 at the first provider.
+//
+// models is keyed by the registry name, activeProvider.impl.Name(), which is what
+// this catalog and the router are indexed by — not the operator's config name,
+// which can differ (`nexus add groq-us sk-… --type groq` registers as "groq").
+// NewHandler builds the map inside its registration loop, where both names are in
+// scope, rather than re-deriving the pairing from config later.
 func (c *modelCatalog) seed(models map[string][]string) {
 	c.mu.Lock()
-	seeded := make(map[string][]string, len(c.order))
+	defer c.mu.Unlock()
 	for _, name := range c.order {
 		e := c.entries[name]
 		if e == nil {
@@ -109,17 +114,15 @@ func (c *modelCatalog) seed(models map[string][]string) {
 			c.entries[name] = e
 		}
 		e.models = append([]string(nil), models[name]...)
-		if len(e.models) > 0 {
-			seeded[name] = append([]string(nil), e.models...)
+		if len(e.models) == 0 {
+			continue
 		}
-	}
-	c.mu.Unlock()
-
-	// SetProviderModels takes the router lock, so it is called outside c.mu.
-	for _, name := range c.order {
-		if ids := seeded[name]; len(ids) > 0 {
-			c.rt.SetProviderModels(name, ids)
-		}
+		// Lock order: modelCatalog.mu → Router.mu. Nesting is safe because no path
+		// takes c.mu while holding the router lock — the router never calls back
+		// into the catalog, and request paths take the two locks sequentially.
+		// Both writes under c.mu keep a snapshot from naming ids the router does
+		// not serve yet.
+		c.rt.SetProviderModels(name, e.models)
 	}
 }
 
@@ -188,11 +191,17 @@ func (c *modelCatalog) refreshAll(ctx context.Context) {
 		switch {
 		case err == nil:
 			e.models = append([]string(nil), ids...)
-			e.fetchedAt = c.now()
 			e.err = ""
 			e.backoff = 0
-			c.mu.Unlock()
+			// Lock order: modelCatalog.mu → Router.mu, safe for the reason given in
+			// seed. The entry and the router index are published as one unit, so a
+			// snapshot never names ids the router does not serve yet.
 			c.rt.SetProviderModels(name, ids)
+			// Stamped after the push, inside the same critical section: the recorded
+			// time then marks when the list became live, so a reader that sees these
+			// ids and this timestamp can rely on the router already serving them.
+			e.fetchedAt = c.now()
+			c.mu.Unlock()
 			log.Debug().Str("provider", name).Int("models", len(ids)).Msg("Model catalog refreshed")
 		case errors.Is(err, providers.ErrNoModelList):
 			// Nothing to fetch, ever: record it once and stop scheduling this
@@ -282,11 +291,12 @@ func (c *modelCatalog) run(ctx context.Context, stop <-chan struct{}) {
 // startCatalog builds and seeds the model catalog, then starts its warm loop when
 // warming is enabled and at least one provider is registered. A disabled catalog
 // is still built and seeded, so the endpoint keeps a usable fallback; it simply
-// never fetches. The loop stops on the handler's stopHealth channel, which Close
-// closes exactly once.
-func (h *Handler) startCatalog(cfgs []config.Provider, cc config.Catalog, order []string) {
+// never fetches. seedFor holds the pre-fetch ids per registry provider name, as
+// built by NewHandler's registration loop. The loop stops on the handler's
+// stopHealth channel, which Close closes exactly once.
+func (h *Handler) startCatalog(seedFor map[string][]string, cc config.Catalog, order []string) {
 	h.catalog = newModelCatalog(h.router, h.providers, order, catalogTTL(cc))
-	h.catalog.seed(catalogSeed(cfgs, order))
+	h.catalog.seed(seedFor)
 	if !catalogWarms(cc.Enabled, len(h.providers)) {
 		return
 	}
@@ -311,28 +321,6 @@ func catalogTTL(cc config.Catalog) time.Duration {
 // Polling every provider endpoint is network behaviour the operator must be able
 // to disable, so a disabled catalog stays seed-only.
 func catalogWarms(enabled bool, providerCount int) bool { return enabled && providerCount > 0 }
-
-// catalogSeed is the catalog's pre-fetch content: the provider's configured
-// models, else the provider family's default list. It is the middle rungs of the
-// endpoint's fallback ladder, not a claim about what the upstream currently
-// offers.
-func catalogSeed(cfgs []config.Provider, order []string) map[string][]string {
-	configured := make(map[string][]string, len(cfgs))
-	for _, pc := range cfgs {
-		if len(pc.Models) > 0 {
-			configured[strings.ToLower(pc.Name)] = pc.Models
-		}
-	}
-	seed := make(map[string][]string, len(order))
-	for _, name := range order {
-		if ids := configured[strings.ToLower(name)]; len(ids) > 0 {
-			seed[name] = ids
-			continue
-		}
-		seed[name] = providers.DefaultModels(name)
-	}
-	return seed
-}
 
 // discoveryKey returns the key a model listing should authenticate with. It uses
 // peekKey, never pickKey: pickKey adopts the key it scans forward to, and
