@@ -235,9 +235,12 @@ func roundIDs(name string, round int) []string {
 func newHandlerFromConfig(t *testing.T, tomlBody string) *Handler {
 	t.Helper()
 	// Environment discovery would add providers the test did not configure and
-	// could shadow the ones it did.
-	t.Setenv("GROQ_API_KEY", "")
-	t.Setenv("DEEPSEEK_API_KEY", "")
+	// could shadow the ones it did. The scrub is derived from the discovery list
+	// itself, so a provider family added to config.knownEnvKeys is neutralized here
+	// too instead of silently leaking an ambient key into these assertions.
+	for _, v := range config.EnvKeyVars() {
+		t.Setenv(v, "")
+	}
 
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.toml")
@@ -824,6 +827,52 @@ models = ["custom-model"]
 		if h.router.ProviderServes("groq", id) {
 			t.Errorf("router serves the family default %q, which nobody configured", id)
 		}
+	}
+}
+
+func TestCatalogTTLComesFromConfig(t *testing.T) {
+	// [catalog] ttl_seconds must reach the catalog's own refresh gate, not stop at the
+	// decoded config struct: the TTL is the only thing between the warm loop and a
+	// per-tick hammering of every provider endpoint.
+	f := newFakeUpstream(t, "alpha-model")
+	h := newHandlerFromConfig(t, fmt.Sprintf(`
+[catalog]
+enabled = false
+ttl_seconds = 90
+
+[[providers]]
+name = "acme"
+type = "openai-compatible"
+base_url = %q
+api_key = "sk-test"
+models = ["configured-model"]
+`, f.srv.URL))
+
+	// Warming is off, so the test drives the refreshes itself and the injected clock
+	// alone decides when a provider is due.
+	clock := newFakeClock()
+	h.catalog.now = clock.Now
+
+	if got, want := h.catalog.ttl, 90*time.Second; got != want {
+		t.Fatalf("catalog TTL = %s, want %s — the configured ttl_seconds must set the refresh interval", got, want)
+	}
+
+	h.catalog.refreshAll(context.Background())
+	if f.requests() != 1 {
+		t.Fatalf("upstream requests = %d, want 1", f.requests())
+	}
+	clock.advance(89 * time.Second)
+	h.catalog.refreshAll(context.Background())
+	if f.requests() != 1 {
+		t.Errorf("upstream requests = %d, want 1 — a refresh inside the configured TTL must not reach the provider", f.requests())
+	}
+	clock.advance(time.Second)
+	h.catalog.refreshAll(context.Background())
+	if f.requests() != 2 {
+		t.Errorf("upstream requests = %d, want 2 — a refresh past the configured TTL must refetch", f.requests())
+	}
+	if got := h.catalog.snapshot(); !reflect.DeepEqual(got, []string{"alpha-model"}) {
+		t.Errorf("snapshot = %v, want the discovered [alpha-model]", got)
 	}
 }
 

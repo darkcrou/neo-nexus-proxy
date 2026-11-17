@@ -59,8 +59,12 @@ type modelCatalog struct {
 
 // catalogEntry is one provider's last known state in the catalog.
 type catalogEntry struct {
-	models      []string
-	fetchedAt   time.Time // when models/err were last established — by a success or a failure
+	models    []string
+	fetchedAt time.Time // when models/err were last established — by a success or a failure
+	// err holds a retryable listing failure and nothing else: it is the marker
+	// that switches the next attempt onto the backoff window instead of the TTL.
+	// A provider with no listing endpoint is recorded in unsupported, not here,
+	// so no entry carries two meanings and dueLocked's branches stay independent.
 	err         string
 	backoff     time.Duration
 	inflight    bool
@@ -220,12 +224,15 @@ func (c *modelCatalog) refreshAll(ctx context.Context) {
 			log.Debug().Str("provider", name).Int("models", len(ids)).Msg("Model catalog refreshed")
 		case errors.Is(err, providers.ErrNoModelList):
 			// Nothing to fetch, ever: record it once and stop scheduling this
-			// provider. Its configured/seed list stays in the snapshot.
+			// provider. Its configured/seed list stays in the snapshot. The sentinel
+			// is logged, not stored in err, which is reserved for retryable failures;
+			// any earlier failure state is cleared because no retry is pending.
 			e.unsupported = true
-			e.err = err.Error()
+			e.err = ""
 			e.fetchedAt = c.now()
 			c.mu.Unlock()
-			log.Debug().Str("provider", name).Msg("Provider exposes no model listing — keeping its configured models")
+			log.Debug().Str("provider", name).Err(providers.ErrNoModelList).
+				Msg("Provider exposes no model listing — keeping its configured models")
 		default:
 			// Keep the last good list; the failure only affects the next attempt.
 			e.err = err.Error()

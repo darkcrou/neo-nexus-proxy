@@ -216,6 +216,17 @@ var knownEnvKeys = []struct {
 	{"chutes", []string{"CHUTES_API_KEY"}},
 }
 
+// EnvKeyVars returns the environment variables DiscoverFromEnv consults, so
+// callers that must not pick up ambient credentials (tests) can blank them.
+// The result is a copy: mutating it does not change what discovery scans.
+func EnvKeyVars() []string {
+	var out []string
+	for _, k := range knownEnvKeys {
+		out = append(out, k.vars...)
+	}
+	return out
+}
+
 // DiscoverFromEnv returns providers whose API keys are present in the
 // environment but not already configured. The key is stored as "env:VAR" so it
 // is resolved at runtime and never persisted. Values equal to "nexus-local"
