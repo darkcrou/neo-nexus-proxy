@@ -43,7 +43,7 @@ func ListModels(p Provider, apiKey string) ([]string, error) {
 	if p == nil {
 		return nil, errors.New("list models: nil provider")
 	}
-	spec, err := modelListSpecFor(p.Name(), p.BaseURL(), apiKey)
+	spec, err := modelListSpecFor(p, apiKey)
 	if err != nil {
 		return nil, err
 	}
@@ -61,14 +61,26 @@ type modelListSpec struct {
 	parse  func([]byte) ([]string, error)
 }
 
-// modelListSpecFor picks the listing recipe for a provider family. baseURL comes
-// from Provider.BaseURL(), so no host is hardcoded except where the provider's
-// own BaseURL() omits the API prefix (anthropic, gemini) — the same split the
-// providers' custom HealthCheck implementations already encode.
-func modelListSpecFor(name, baseURL, apiKey string) (modelListSpec, error) {
-	base := strings.TrimRight(baseURL, "/")
-	switch strings.ToLower(name) {
-	case "anthropic":
+// modelListSpecFor picks the listing recipe for a provider family.
+//
+// It switches on the concrete provider type rather than on Provider.Name(),
+// because Name() is not a family keyword for config-driven providers: the
+// enterprise constructors set it from Spec.Name (enterprise.go), and Generic
+// carries the operator's instance name. Dispatching on the name would give a
+// Bedrock provider called "prod-use1" the generic recipe (a GET on a URL that
+// can never list, so the caller backs off forever instead of keeping its
+// fallback) and would send a custom provider that happens to be called
+// "gemini" or "anthropic" to Google or Anthropic with its key.
+//
+// baseURL comes from Provider.BaseURL(), so no host is hardcoded except where
+// the provider's own BaseURL() omits the API prefix (anthropic, gemini) — the
+// same split the providers' custom HealthCheck implementations already encode.
+func modelListSpecFor(p Provider, apiKey string) (modelListSpec, error) {
+	base := strings.TrimRight(p.BaseURL(), "/")
+	// The label names the endpoint in errors; it is never a URL carrying a secret.
+	label := p.Name()
+	switch unwrapOverridden(p).(type) {
+	case *Anthropic:
 		// Anthropic.BaseURL() stops at the host; the models endpoint lives under /v1.
 		return modelListSpec{
 			url:   anthropicModelsURL,
@@ -79,7 +91,7 @@ func modelListSpecFor(name, baseURL, apiKey string) (modelListSpec, error) {
 			},
 			parse: parseOpenAIModelList,
 		}, nil
-	case "gemini":
+	case *Gemini:
 		// Gemini.BaseURL() points at the OpenAI-compat shim; the native listing
 		// endpoint takes the key as a query parameter.
 		return modelListSpec{
@@ -87,7 +99,7 @@ func modelListSpecFor(name, baseURL, apiKey string) (modelListSpec, error) {
 			label: "gemini", // the URL carries the key, so it is never echoed
 			parse: parseGeminiModelList,
 		}, nil
-	case "ollama":
+	case *Ollama:
 		// The native /api/tags endpoint is authoritative and does not depend on
 		// the OpenAI compatibility shim under /v1.
 		return modelListSpec{
@@ -95,26 +107,37 @@ func modelListSpecFor(name, baseURL, apiKey string) (modelListSpec, error) {
 			label: "ollama",
 			parse: parseOllamaModelList,
 		}, nil
-	case "groq":
+	case *Groq:
 		// Groq's BaseURL() ends at /openai, one segment short of the /v1 root its
 		// /models endpoint lives under.
 		u := base + "/v1/models"
 		return modelListSpec{url: u, label: u, apiKey: apiKey, bearer: true, parse: parseOpenAIModelList}, nil
-	case "perplexity", "azure", "vertex", "bedrock":
+	case *Perplexity, *Azure, *Vertex, *Bedrock:
 		// Perplexity publishes no listing endpoint; the enterprise providers are
 		// Anthropic-native and have no OpenAI-style /models.
-		return modelListSpec{}, fmt.Errorf("%w: %s", ErrNoModelList, name)
+		return modelListSpec{}, fmt.Errorf("%w: %s", ErrNoModelList, label)
 	default:
+		// Everything else, *Generic included, lists through its own BaseURL().
 		u := base + "/models"
 		return modelListSpec{url: u, label: u, apiKey: apiKey, bearer: true, parse: parseOpenAIModelList}, nil
 	}
+}
+
+// unwrapOverridden sees through the config-override wrapper. New applies it
+// conditionally (generic.go) and only ever wraps a built-in built by
+// FromConfig, so one level is the whole nesting it can produce.
+func unwrapOverridden(p Provider) Provider {
+	if o, ok := p.(*overridden); ok {
+		return o.Provider
+	}
+	return p
 }
 
 // fetch performs the listing request and parses the response.
 func (s modelListSpec) fetch() ([]string, error) {
 	req, err := http.NewRequest(http.MethodGet, s.url, nil)
 	if err != nil {
-		return nil, fmt.Errorf("list models: %s: %w", s.label, err)
+		return nil, fmt.Errorf("list models: %s: %w", s.label, withoutURL(err))
 	}
 	if s.bearer && s.apiKey != "" {
 		req.Header.Set("Authorization", "Bearer "+s.apiKey)
@@ -128,7 +151,7 @@ func (s modelListSpec) fetch() ([]string, error) {
 	client := &http.Client{Timeout: modelListTimeout}
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("list models: %s: %w", s.label, err)
+		return nil, fmt.Errorf("list models: %s: %w", s.label, withoutURL(err))
 	}
 	defer resp.Body.Close()
 
@@ -144,6 +167,20 @@ func (s modelListSpec) fetch() ([]string, error) {
 		return nil, fmt.Errorf("list models: %s: %w", s.label, err)
 	}
 	return cleanModelIDs(ids), nil
+}
+
+// withoutURL strips the *url.Error wrapper that http.NewRequest and
+// http.Client.Do return, keeping only its cause. That wrapper's message embeds
+// the full request URL, and the Gemini URL carries the API key, so wrapping it
+// would echo the key from a transport failure (dial error, timeout) into the
+// caller's logs — the same leak the non-2xx path already avoids by reporting
+// only the status. The cause still carries the diagnostic.
+func withoutURL(err error) error {
+	var uerr *url.Error
+	if errors.As(err, &uerr) && uerr.Err != nil {
+		return uerr.Err
+	}
+	return err
 }
 
 // parseOpenAIModelList reads the OpenAI shape: {"data":[{"id":"..."}]}.

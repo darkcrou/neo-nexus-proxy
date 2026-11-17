@@ -79,20 +79,20 @@ func TestListModelsOpenAICompatibleDefault(t *testing.T) {
 // the two providers whose BaseURL is one segment short of its OpenAI /v1 root.
 func TestModelListURLPerFamily(t *testing.T) {
 	cases := []struct {
-		name    string
-		baseURL string
-		want    string
+		name string
+		p    Provider
+		want string
 	}{
-		{"openai", "https://api.openai.com/v1", "https://api.openai.com/v1/models"},
-		{"deepseek", "https://api.deepseek.com", "https://api.deepseek.com/models"},
-		{"groq", "https://api.groq.com/openai", "https://api.groq.com/openai/v1/models"},
-		{"mistral", "https://api.mistral.ai/v1", "https://api.mistral.ai/v1/models"},
-		{"ollama", "http://localhost:11434/v1", "http://localhost:11434/api/tags"},
-		{"anthropic", "https://api.anthropic.com", anthropicModelsURL},
+		{"openai", NewOpenAI("key"), "https://api.openai.com/v1/models"},
+		{"deepseek", NewDeepSeek("key"), "https://api.deepseek.com/models"},
+		{"groq", NewGroq("key"), "https://api.groq.com/openai/v1/models"},
+		{"mistral", NewMistral("key"), "https://api.mistral.ai/v1/models"},
+		{"ollama", NewOllama("http://localhost:11434", ""), "http://localhost:11434/api/tags"},
+		{"anthropic", NewAnthropic("key"), anthropicModelsURL},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			spec, err := modelListSpecFor(tc.name, tc.baseURL, "key")
+			spec, err := modelListSpecFor(tc.p, "key")
 			if err != nil {
 				t.Fatalf("modelListSpecFor(%q): %v", tc.name, err)
 			}
@@ -109,7 +109,7 @@ func TestModelListURLPerFamily(t *testing.T) {
 func TestListModelsAnthropic(t *testing.T) {
 	srv, rec := modelServer(t, http.StatusOK, `{"data":[{"id":"claude-opus-4-6"},{"id":"claude-haiku-4-5"}]}`)
 
-	spec, err := modelListSpecFor("anthropic", NewAnthropic("sk-ant-test").BaseURL(), "sk-ant-test")
+	spec, err := modelListSpecFor(NewAnthropic("sk-ant-test"), "sk-ant-test")
 	if err != nil {
 		t.Fatalf("modelListSpecFor(anthropic): %v", err)
 	}
@@ -141,7 +141,7 @@ func TestListModelsAnthropic(t *testing.T) {
 func TestListModelsGemini(t *testing.T) {
 	srv, rec := modelServer(t, http.StatusOK, `{"models":[{"name":"models/gemini-2.0-flash"},{"name":"models/gemini-2.0-flash-lite"}]}`)
 
-	spec, err := modelListSpecFor("gemini", NewGemini("AIza-test key").BaseURL(), "AIza-test key")
+	spec, err := modelListSpecFor(NewGemini("AIza-test key"), "AIza-test key")
 	if err != nil {
 		t.Fatalf("modelListSpecFor(gemini): %v", err)
 	}
@@ -167,7 +167,7 @@ func TestListModelsGemini(t *testing.T) {
 func TestListModelsGeminiErrorHidesKey(t *testing.T) {
 	srv, _ := modelServer(t, http.StatusInternalServerError, `{}`)
 
-	spec, err := modelListSpecFor("gemini", "", "AIzaVerySecretKey")
+	spec, err := modelListSpecFor(NewGemini("AIzaVerySecretKey"), "AIzaVerySecretKey")
 	if err != nil {
 		t.Fatalf("modelListSpecFor(gemini): %v", err)
 	}
@@ -306,6 +306,101 @@ func TestListModelsCapsResultSize(t *testing.T) {
 	}
 	if want := fmt.Sprintf("model-%04d", maxListedModels-1); ids[len(ids)-1] != want {
 		t.Errorf("ids[last] = %q, want %q", ids[len(ids)-1], want)
+	}
+}
+
+// TestListModelsUnsupportedFamilyIgnoresInstanceName pins that the listing
+// recipe follows the provider type, not its instance name: an enterprise
+// provider is unsupported however the operator named it, so the caller keeps
+// its configured fallback instead of probing an endpoint that cannot work.
+func TestListModelsUnsupportedFamilyIgnoresInstanceName(t *testing.T) {
+	azure, err := New(Spec{Name: "prod-use1", Type: "azure", BaseURL: "https://acme.openai.azure.com/openai/deployments/dep", APIKey: "key"})
+	if err != nil {
+		t.Fatalf("New(azure): %v", err)
+	}
+	vertex, err := New(Spec{Name: "prod-use1", Type: "vertex", Region: "us-central1", Project: "proj"})
+	if err != nil {
+		t.Fatalf("New(vertex): %v", err)
+	}
+	bedrock, err := New(Spec{Name: "prod-use1", Type: "bedrock", Region: "us-east-1"})
+	if err != nil {
+		t.Fatalf("New(bedrock): %v", err)
+	}
+
+	cases := map[string]Provider{"azure": azure, "vertex": vertex, "bedrock": bedrock}
+	for name, p := range cases {
+		t.Run(name, func(t *testing.T) {
+			if _, err := ListModels(p, "key"); !errors.Is(err, ErrNoModelList) {
+				t.Fatalf("err = %v, want ErrNoModelList for a %s provider named prod-use1", err, name)
+			}
+		})
+	}
+}
+
+// TestListModelsInstanceNameCollisionKeepsOwnEndpoint pins the opposite
+// direction: a custom provider whose instance name collides with a family
+// keyword is still listed through its own BaseURL() with its own bearer token,
+// never through that family's fixed endpoint.
+func TestListModelsInstanceNameCollisionKeepsOwnEndpoint(t *testing.T) {
+	srv, rec := modelServer(t, http.StatusOK, `{"data":[{"id":"acme-large"}]}`)
+	p, err := New(Spec{Name: "gemini", Type: "custom", BaseURL: srv.URL, APIKey: "acme-key"})
+	if err != nil {
+		t.Fatalf("New(custom): %v", err)
+	}
+
+	ids, err := ListModels(p, "acme-key")
+	if err != nil {
+		t.Fatalf("ListModels: %v", err)
+	}
+	if want := []string{"acme-large"}; !equalIDs(ids, want) {
+		t.Errorf("ids = %v, want %v", ids, want)
+	}
+	if rec.method != http.MethodGet {
+		t.Errorf("method = %q, want GET", rec.method)
+	}
+	if rec.path != "/models" {
+		t.Errorf("path = %q, want /models on the provider's own base URL", rec.path)
+	}
+	if got := rec.header.Get("Authorization"); got != "Bearer acme-key" {
+		t.Errorf("Authorization = %q, want %q", got, "Bearer acme-key")
+	}
+}
+
+// TestListModelsTransportErrorHidesKey pins that a transport failure hides the
+// query-string key too, not only a non-2xx reply: http.Client.Do returns a
+// *url.Error whose message embeds the request URL, key included.
+func TestListModelsTransportErrorHidesKey(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	closedURL := srv.URL
+	srv.Close() // a closed listener makes every request fail at the transport layer
+
+	spec, err := modelListSpecFor(NewGemini("AIzaVerySecretKey"), "AIzaVerySecretKey")
+	if err != nil {
+		t.Fatalf("modelListSpecFor(gemini): %v", err)
+	}
+	spec.url = closedURL + "/v1beta/models?key=AIzaVerySecretKey"
+
+	_, err = spec.fetch()
+	if err == nil {
+		t.Fatal("expected an error when the listing endpoint is unreachable")
+	}
+	if strings.Contains(err.Error(), "AIzaVerySecretKey") {
+		t.Errorf("error %q leaks the api key", err)
+	}
+	if !strings.Contains(err.Error(), "gemini") {
+		t.Errorf("error %q does not name the endpoint", err)
+	}
+}
+
+// TestListModelsNilProvider pins the nil guard: a caller that has not resolved
+// a provider gets an error rather than a panic.
+func TestListModelsNilProvider(t *testing.T) {
+	ids, err := ListModels(nil, "key")
+	if err == nil {
+		t.Fatal("expected an error for a nil provider")
+	}
+	if ids != nil {
+		t.Errorf("ids = %v, want nil", ids)
 	}
 }
 
