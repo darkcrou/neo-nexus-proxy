@@ -947,10 +947,11 @@ func TestCatalogPublishesSnapshotAndRouterTogether(t *testing.T) {
 	cat, clock := buildCatalog(t, 300*time.Second, aps...)
 	cat.seed(seed)
 
-	// probeErr is written only from cat.now, which the catalog calls from the
-	// single refresh goroutine below; the reader goroutines touch neither now nor
-	// probeErr. That is what makes the unsynchronized write race-free — a second
-	// concurrent refresher would break it.
+	// probeErr is written only from cat.now, which the catalog calls solely from
+	// refreshAll — here invoked by the sequential round loop on this test's own
+	// goroutine. The reader goroutines touch neither now nor probeErr, which is
+	// what makes the unsynchronized write race-free; a second concurrent refresher
+	// would break it.
 	var probeErr error
 	cat.now = func() time.Time {
 		for i, name := range names {

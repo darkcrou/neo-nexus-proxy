@@ -15,9 +15,9 @@ import (
 // providers.DefaultModels and the router's model-id partition heads the chain
 // with them, so the test's requests — and the warm loop's ListModels calls —
 // would reach live provider APIs carrying the developer's real credentials.
-// Every fixture that builds a Handler or Server must call this first. The list
-// is derived from discovery itself, so a provider family added there is
-// neutralized here too.
+// Every fixture that goes through NewHandler or New must call this first: those
+// constructors are the only path that consults env discovery. The list is derived
+// from discovery itself, so a provider family added there is neutralized here too.
 func scrubProviderEnv(t *testing.T) {
 	t.Helper()
 	for _, v := range config.EnvKeyVars() {
