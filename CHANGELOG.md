@@ -2,18 +2,21 @@
 
 - **Real model list and id-aware routing:** `GET /v1/models` now returns the
   models your configured providers actually offer — discovered from each
-  provider's own listing endpoint and refreshed in the background, at most
-  once per provider per TTL (5 minutes by default) — instead of a fixed list
-  of three Claude ids. A local Ollama's models therefore appear and disappear
-  without restarting NEXUS, and your configured `models` still back the list
-  whenever a provider cannot be queried. A request naming one of the
-  advertised ids is now routed to a provider that serves it, so an advertised
-  model works on the first attempt instead of failing with a 404 from
+  provider's own listing endpoint and refreshed in the background, once per
+  provider per TTL (5 minutes by default), with a provider whose listing fails
+  retried sooner on a backoff that grows from 30 seconds to 5 minutes — instead
+  of a fixed list of three Claude ids. A local Ollama's models therefore appear
+  and disappear without restarting NEXUS, and your configured `models` still
+  back the list until that provider has been listed successfully once, after
+  which its last good discovered list stands in for it. A request naming one of
+  the advertised ids is now routed to a provider that serves it, so an
+  advertised model works on the first attempt instead of failing with a 404 from
   whichever provider happened to be first in the chain. Discovery is network
-  traffic you can switch off with `[catalog] enabled = false` (the endpoint
-  then keeps serving your configured models). Two `[[providers]]` entries of
-  the same provider type now collapse to the first one, with a startup
-  warning, instead of registering twice under the same name.
+  traffic you can switch off with `[catalog] enabled = false` (the endpoint then
+  keeps serving your configured models). Two `[[providers]]` entries that
+  resolve to the same registered name now collapse to the first one, with a
+  startup warning, instead of registering twice under that name; distinct custom
+  and enterprise instances are unaffected.
 - **Usage window details:** history now lists completed windows. Selecting a
   row expands the provider's totals and per-model request/token breakdown
   directly beneath that row, using the selected window's data. Open provider

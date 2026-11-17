@@ -445,9 +445,10 @@ provider ordering in `RouteChain` / `PreferModel`. Spans
 `HandleChatCompletions`),
 `internal/providers/models.go` (`ListModels`, `ErrNoModelList`),
 `internal/router/router.go` (`servingSet`, `preferModel`, `PreferModel`,
-`SetProviderModels`, `ProviderServes`), `internal/proxy/handler.go`
-(`keyLocked`/`peekKey`, the `HandleMessages` chain assembly), and
-`internal/config/config.go` (`Catalog`).
+`SetProviderModels`, `ProviderServes`, `CascadeChain`),
+`internal/proxy/handler.go` (`keyLocked`/`peekKey`, the `HandleMessages` chain
+assembly, the `NewHandler` registration loop, and the cascade chain's
+`PreferModel` call), and `internal/config/config.go` (`Catalog`).
 
 The catalog is a cache, never a request-path dependency. That one sentence is
 the whole design; the paragraphs below are the consequences of it.
@@ -466,9 +467,10 @@ the whole design; the paragraphs below are the consequences of it.
   (no `deriveUser`, no key check), so a request-triggered fetch would let
   anyone on the LAN force keyed upstream calls (D-8). Warming is the
   background loop's job alone.
-- **Why the list is discovered, not configured.** Config is a startup snapshot
-  with no reload path (`config.Load` runs once), so a configured list can only
-  describe what the operator wrote at startup. Discovery is the only mechanism
+- **Why the list is discovered, not configured.** The proxy's provider set is
+  fixed at startup — `NewHandler` registers it once from `config.Load` and
+  nothing reloads it — so a configured list can only describe what the
+  operator wrote at startup. Discovery is the only mechanism
   that reflects a provider whose catalog changes while NEXUS runs — the case
   the feature exists for is a local Ollama, where models appear and disappear
   with `ollama pull` and a restart-per-model would be absurd (D-2). The
@@ -485,14 +487,15 @@ the whole design; the paragraphs below are the consequences of it.
   opt-in (D-11). A disabled catalog is still built and seeded, so the endpoint
   keeps a usable fallback; it simply never fetches (`catalogWarms`).
 - **The fallback ladder, as it actually landed.** `Handler.modelIDs`
-  (`gateway.go`) is the one place the ladder lives: **catalog snapshot, then
-  the catalog's seed, then the three stub Claude ids** (`stubModelIDs`, the
-  pre-catalog behaviour, returned as a copy so a caller sorting it in place
-  cannot corrupt the process-wide fallback). Recorded deviation from D-9: the
-  plan words rungs two and three as a *global* gate — configured `models`
-  first, and `providers.DefaultModels` only if *no* provider declares any — but
-  `NewHandler` folds them **per provider** into the seed
-  (`seedFor[name] = pc.Models` when non-empty, else
+  (`gateway.go`) is the one place the ladder lives, and it has two rungs:
+  **the catalog snapshot — which already carries the seed until the first
+  successful fetch replaces that list wholesale — then the three stub Claude
+  ids** (`stubModelIDs`, the pre-catalog behaviour, returned as a copy so a
+  caller sorting it in place cannot corrupt the process-wide fallback).
+  Recorded deviation from D-9: the plan words rungs two and three as a *global*
+  gate — configured `models` first, and `providers.DefaultModels` only if *no*
+  provider declares any — but `NewHandler` folds them **per provider** into the
+  seed (`seedFor[name] = pc.Models` when non-empty, else
   `providers.DefaultModels(name)`), so a mixed config advertises declared ids
   *and* family defaults where the literal ladder would stop at rung two. The
   per-provider reading is the better one (it keeps every provider's fallback
@@ -505,9 +508,13 @@ the whole design; the paragraphs below are the consequences of it.
 - **Discovery mechanics.** `providers.ListModels(p, apiKey)`
   (`internal/providers/models.go`) is one package-level function with a
   per-family recipe, **not** an interface method on each of the ~30 concrete
-  provider types: the `overridden` config wrapper is applied conditionally
-  (`generic.go`), so an interface assertion would silently fail on an
-  unwrapped provider. Which families can list, and how: the default
+  provider types and **not** a method on the `overridden` config wrapper. That
+  wrapper embeds the `Provider` interface, so extra methods are not promoted
+  through it, and it is applied only conditionally (`generic.go`): a
+  wrapper-based dispatch would silently miss unwrapped providers and an
+  extra-interface assertion would silently miss wrapped ones. Hence one
+  package-level function with an explicit `unwrapOverridden` step before the
+  concrete-type switch. Which families can list, and how: the default
   OpenAI-compatible recipe is `GET <BaseURL()>/models` with a bearer token
   (`*Generic` included); `anthropic` uses `api.anthropic.com/v1/models` with
   `x-api-key` + `anthropic-version` because its `BaseURL()` stops at the host;
@@ -515,19 +522,22 @@ the whole design; the paragraphs below are the consequences of it.
   its `BaseURL()` points at the OpenAI shim; `ollama` uses the native
   `<baseURL>/api/tags`, which does not depend on the shim; `groq` needs an
   explicit `/v1/models` because its `BaseURL()` ends at `/openai`. `perplexity`
-  and the enterprise families (`azure`, `vertex`, `bedrock`, Anthropic-native)
-  have no listing endpoint and return `ErrNoModelList` — a distinguishable
-  "cannot list" that means *keep the fallback forever*, as opposed to a
-  failed listing that means *retry later*. The recipe is chosen by **concrete
-  provider type**, never by `Provider.Name()`: for config-driven providers
-  `Name()` is the operator's instance name (`nexus add groq-us … --type groq`
-  registers as `groq`), so a name switch would send a Bedrock provider called
-  `prod-use1` down the generic recipe and a custom provider called `gemini` to
-  Google with its key. A failed listing keeps the provider's last good list
-  and backs off 30s doubling to a 5m cap (`nextCatalogBackoff`), mirroring the
-  cooling-key reschedule philosophy; refreshes are single-flight per provider
-  (`catalogEntry.inflight`), so a burst of picker requests cannot stampede an
-  upstream (D-12). An **empty successful listing means "nothing learned", not
+  and the enterprise families (`azure`, `vertex`, `bedrock`), which are
+  Anthropic-native, have no listing endpoint and return `ErrNoModelList` — a
+  distinguishable "cannot list" that means *keep the fallback forever*, as
+  opposed to a failed listing that means *retry later*. The recipe is chosen by
+  **concrete provider type**, never by `Provider.Name()`: `Name()` is the family
+  keyword for built-ins — so `nexus add groq-us … --type groq` builds the
+  built-in `*Groq` and registers as `groq` — and the operator's instance name
+  for config-driven providers (`*Generic` and the enterprise types), which is
+  exactly why it is not a reliable family key. A name switch would send a
+  Bedrock provider called `prod-use1` down the generic recipe and a custom
+  provider called `gemini` to Google with its key. A failed listing keeps the
+  provider's last good list and backs off 30s doubling to a 5m cap
+  (`nextCatalogBackoff`), mirroring the cooling-key reschedule philosophy;
+  refreshes are single-flight per provider (`catalogEntry.inflight`), so a
+  burst of picker requests cannot stampede an upstream (D-12). An **empty
+  successful listing means "nothing learned", not
   "everything was withdrawn"**: it clears the failure state and restamps the
   entry but leaves both the models and the router registration untouched — a
   local Ollama with nothing pulled answers `/api/tags` with exactly that, and
@@ -560,8 +570,9 @@ the whole design; the paragraphs below are the consequences of it.
   (`gateway.go`) needs no post-step: it never calls `stickyReorder`, and its
   only later step is the budget narrowing (`freeLocalOnly`), which is an
   order-preserving filter.
-  The cascade chain (`CascadeChain`, `handler.go`) needs its own
-  `PreferModel` call because `CascadeChain` bypasses `RouteChain` entirely.
+  The cascade chain (`CascadeChain` in `internal/router/router.go`, called from
+  `handler.go`) needs its own `PreferModel` call because `CascadeChain` bypasses
+  `RouteChain` entirely.
 - **No `provider/model` prefix exists, and why** (D-1). The model id **is** the
   address: the client asks for an id, and the router resolves the destination
   from the candidates that serve it. A prefixed wire format was considered and
@@ -574,30 +585,36 @@ the whole design; the paragraphs below are the consequences of it.
   is unchanged by this whole feature: it still forwards the requested model id
   to OpenAI-compatible providers untouched (see "Direct Strategy" above); only
   *provider choice* became id-aware, never the model string.
-- **The duplicate-family rule.** Two `[[providers]]` entries of the same family
-  under distinct config names (`groq-us` and `groq-eu`, both `type = "groq"`)
-  report the same registry name from `impl.Name()`. `NewHandler` collapses them
-  to the **first** entry with a startup warning
-  (`Duplicate provider family — skipping this entry`) and skips the rest
-  entirely — `active`, `seedFor`, `providerOrder`, and the router all end up
-  with exactly one. Partial collapse would be worse than the behaviour it
-  replaces: the router keys providers by name, so a second same-named entry is
-  invisible to `SetProviderModels`/`ProviderServes` (both stop at the first
-  match) while `active` would keep only the last, and the two views would
-  silently disagree about which key and which models are in play. This is a
-  deliberate behaviour change: previously the router held two same-named
-  entries while `active` kept the last one.
+- **The duplicate-name rule.** `NewHandler` collapses entries that resolve to
+  the **same registered name** — `impl.Name()` — to the **first** one, with
+  a startup warning (`Duplicate provider family — skipping this entry`), and
+  skips the rest entirely — `active`, `seedFor`, `providerOrder`, and the
+  router all end up with exactly one. Which names collide depends on the
+  provider: for built-ins `Name()` is the family keyword, so two entries under
+  distinct config names (`groq-us` and `groq-eu`, both `type = "groq"`) do
+  collide; for config-driven providers it is the operator's instance name, so
+  two `type = "custom"` entries named `a` and `b`, or two Bedrock entries
+  `prod-use1` and `prod-eu1`, register separately and never collapse. Partial
+  collapse would be worse than the behaviour it replaces: the router keys
+  providers by name, so a second same-named entry is invisible to
+  `SetProviderModels`/`ProviderServes` (both stop at the first match) while
+  `active` would keep only the last, and the two views would silently disagree
+  about which key and which models are in play. This is a deliberate behaviour
+  change: previously the router held two same-named entries while `active` kept
+  the last one.
 - **Three surfaces, and they can disagree.** `GET /v1/models` reads the
   discovery catalog, while the dashboard picker
-  (`internal/dashboard/playground.go`, `handlePlaygroundModels`) and the
-  `nexus models` CLI (`cmd/nexus/main.go`) still read config plus
-  `providers.DefaultModels`. So a model the proxy accepts can be missing from
-  the picker and the CLI, and a config-only id the dashboard shows may not be
-  routable. That is deliberate scope control, not an oversight, and the
-  reconciliation is filed as an intake ticket
-  (`docs/tickets/catalog-single-index.md`): one index, shared by all three
-  surfaces, with its home chosen so the proxy and dashboard can both reach it
-  without an import cycle.
+  (`internal/dashboard/playground.go`, `handlePlaygroundModels`) reads each
+  entry's `models` and falls back to `providers.DefaultModels`, and the
+  `nexus models` CLI (`cmd/nexus/main.go`, `runModels`) prints the
+  config-driven Claude-tier → provider-model mapping through `MapModel`. So a
+  model the proxy accepts can be missing from the picker and the CLI, and a
+  config-only id the dashboard shows may not be routable. That is deliberate
+  scope control, not an oversight: the reconciliation is captured as the
+  follow-up item T1 in `docs/plans/2026-11-17-model-catalog-and-id-routing.md`,
+  which will file `docs/tickets/catalog-single-index.md` for one index shared by
+  all three surfaces, with its home chosen so the proxy and dashboard can both
+  reach it without an import cycle.
 
 ---
 
