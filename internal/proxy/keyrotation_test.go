@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/lynuxis2026-pixel/nexus-proxy/internal/config"
+	"github.com/lynuxis2026-pixel/nexus-proxy/internal/providers"
 )
 
 func TestPickKeySticky(t *testing.T) {
@@ -114,6 +115,45 @@ func TestKeyRotationOn429(t *testing.T) {
 				t.Fatal("the provider should remain available through its second key")
 			}
 		})
+	}
+}
+
+type testAnthropicEndpoint struct {
+	providers.Provider
+	url string
+}
+
+func (p testAnthropicEndpoint) BaseURL() string { return p.url }
+
+func TestClientAnthropicKeyLimitDoesNotCoolSharedProvider(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("x-api-key") == "good" {
+			_, _ = w.Write([]byte(`{"content":[{"type":"text","text":"ok"}]}`))
+			return
+		}
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	t.Cleanup(upstream.Close)
+	h := buildTestHandler(t, []testProv{{"anthropic", "standard", upstream.URL}})
+	ap := h.providers["anthropic"]
+	ap.impl = testAnthropicEndpoint{Provider: providers.NewAnthropic(""), url: upstream.URL}
+	ap.keys, ap.cool, ap.backoff = []string{""}, make([]time.Time, 1), make([]time.Duration, 1)
+
+	send := func(key string) int {
+		req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"claude-haiku-4-5","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}`))
+		req.Header.Set("x-api-key", key)
+		rec := httptest.NewRecorder()
+		h.HandleMessages(rec, req)
+		return rec.Code
+	}
+	if status := send("limited"); status != http.StatusTooManyRequests {
+		t.Fatalf("limited client status = %d, want 429", status)
+	}
+	if !providerHealthy(t, h, "anthropic") {
+		t.Fatal("a client's credential cooled the shared provider")
+	}
+	if status := send("good"); status != http.StatusOK {
+		t.Fatalf("another client's status = %d, want 200", status)
 	}
 }
 

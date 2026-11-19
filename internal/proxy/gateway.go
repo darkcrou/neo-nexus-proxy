@@ -138,7 +138,7 @@ func (h *Handler) HandleChatCompletions(w http.ResponseWriter, r *http.Request) 
 		var err error
 		if openAI {
 			// High-fidelity pass-through: forward the original OpenAI body (model swapped).
-			resp, att, err = h.callWithKeys(active, areq, i+1, func(key string) (*http.Response, error) {
+			resp, att, err = h.callWithKeys(active, areq, i+1, false, func(key string) (*http.Response, error) {
 				return h.callOpenAIPassthrough(r.Context(), active, rawMap, areq, key)
 			})
 		} else {
@@ -150,7 +150,7 @@ func (h *Handler) HandleChatCompletions(w http.ResponseWriter, r *http.Request) 
 			log.Warn().Str("provider", cand.Name).Err(err).Msg("Provider unreachable, trying next")
 			continue
 		}
-		if isRetryableStatus(resp.StatusCode) && i < len(chain)-1 {
+		if i < len(chain)-1 && h.shouldFailOver(resp.StatusCode, oreq.Model) {
 			h.recordUsageEvent(active, areq, oreq.Stream, resp.StatusCode, att, rawUsage{})
 			resp.Body.Close()
 			log.Warn().Str("provider", cand.Name).Int("status", resp.StatusCode).Msg("Retryable error, failing over")

@@ -172,6 +172,24 @@ func (c *modelCatalog) missing(id string) bool {
 	return true
 }
 
+// probeAlternative cycles through a provider's other advertised models if the
+// model that originally cooled a key can no longer be used for recovery.
+func (c *modelCatalog) probeAlternative(provider, exclude string, next int) string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	entry := c.entries[provider]
+	if entry == nil {
+		return ""
+	}
+	for offset := range entry.models {
+		id := entry.models[(next+offset)%len(entry.models)]
+		if id != exclude {
+			return id
+		}
+	}
+	return ""
+}
+
 // refreshAll fetches every provider whose entry is due: not in flight, not known
 // to have no listing endpoint, and past its wait window. The lock is released
 // around the network call, so a slow upstream delays only its own refresh, never

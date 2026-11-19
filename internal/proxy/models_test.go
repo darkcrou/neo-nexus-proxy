@@ -531,6 +531,57 @@ func TestModels_AutoForwardsDiscoveredIDWithoutApplyingDefaultMapping(t *testing
 	}
 }
 
+func TestModels_ProbeRecoversAProviderAfterItsLimitedModelDisappears(t *testing.T) {
+	var status atomic.Int32
+	status.Store(http.StatusPaymentRequired)
+	upstream := startFakeModelProvider(t, &fakeModelProvider{
+		ids: []string{"retired", "current"},
+		chatStatus: func(_ *http.Request, model string) int {
+			if model == "retired" {
+				return int(status.Load())
+			}
+			return http.StatusOK
+		},
+	})
+	h := newModelsHandler(t, "direct", modelsProvider{name: "provider", url: upstream.srv.URL, tier: "standard"})
+	discover(t, h)
+	if rec := doModelRequest(h, "/v1/chat/completions", "retired"); rec.Code != http.StatusPaymentRequired {
+		t.Fatalf("initial request = %d, want 402", rec.Code)
+	}
+	status.Store(http.StatusNotFound)
+	ap := h.providers["provider"]
+	ap.mu.Lock()
+	ap.cool[0] = time.Now().Add(-time.Second)
+	ap.mu.Unlock()
+	h.probeCoolingKeys()
+	if !providerHealthy(t, h, "provider") || upstream.chat.Load() != 3 {
+		t.Fatal("the retired model should fail its probe and the provider should recover through the alternate model")
+	}
+}
+
+func TestModels_FailsOverWhenAListedModelDisappearsFromOneProvider(t *testing.T) {
+	a := startFakeModelProvider(t, &fakeModelProvider{
+		ids:        []string{"shared", "other"},
+		chatStatus: func(*http.Request, string) int { return http.StatusNotFound },
+	})
+	b := newFakeModelProvider(t, "shared")
+	h := newModelsHandler(t, "direct",
+		modelsProvider{name: "a", url: a.srv.URL, tier: "standard"},
+		modelsProvider{name: "b", url: b.srv.URL, tier: "standard"},
+	)
+	discover(t, h)
+	for _, path := range []string{"/v1/chat/completions", "/v1/messages"} {
+		h.setSticky("shared", "a")
+		rec := doModelRequest(h, path, "shared")
+		if got := rec.Header().Get("X-Nexus-Provider"); rec.Code != http.StatusOK || got != "b" {
+			t.Fatalf("%s: status/provider = %d/%q, want 200/b", path, rec.Code, got)
+		}
+	}
+	if !providerHealthy(t, h, "a") || a.chat.Load() != 2 {
+		t.Fatal("the missing model should fail over without cooling the provider")
+	}
+}
+
 func TestModels_DiscoveredModelReachesTheProviderThatServesIt(t *testing.T) {
 	// End to end: neither provider declares models, so the ids the endpoint
 	// advertises are exactly the discovered ones, and each fake answers 200 only for

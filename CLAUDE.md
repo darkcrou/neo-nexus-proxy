@@ -191,7 +191,7 @@ Incoming request
 ## Provider & Key Cooldown (two-level, sticky)
 
 Both chat endpoints share key rotation and per-model provider stickiness.
-HTTP 402 and 429 put the responding key on cooldown. NEXUS first tries
+HTTP 402 and 429 put the responding configured key on cooldown. NEXUS first tries
 another usable key on the same provider. When the last key cools, the
 provider becomes unavailable for every model it serves. The current
 request can fail over to other eligible providers.
@@ -200,7 +200,9 @@ request can fail over to other eligible providers.
 request using the model associated with the cooldown. A successful probe
 restores the key and makes its provider eligible again. Failed probes
 double the delay from the initial 10 seconds up to five minutes. A key
-stays out of normal rotation until a probe succeeds.
+stays out of normal rotation until a probe succeeds. If the upstream
+rejects the probe model, the checker can try another advertised model.
+Client-supplied Anthropic credentials travel with the requesting client.
 
 `Provider.HealthCheck()` serves CLI and dashboard diagnostics. Routing
 recovery probes the chat endpoint because a model listing can succeed

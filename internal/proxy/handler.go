@@ -49,8 +49,9 @@ type activeProvider struct {
 }
 
 type probeTarget struct {
-	model  string
-	images bool
+	model           string
+	images          bool
+	nextAlternative int
 }
 
 // initialKeyBackoff is the cooldown a key gets on its first 429. keyProbeLoop
@@ -491,30 +492,47 @@ func (h *Handler) probeKey(active *activeProvider, name string, key dueKey) {
 		req.Model = key.target.model
 		req.nexusImages = key.target.images
 	}
-	body, _ := json.Marshal(req)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+	status, recovered := h.requestKeyProbe(ctx, active, key.idx, req)
+	if status == http.StatusBadRequest {
+		// Some models reject a one-token output budget.
+		req.MaxTokens = 32
+		status, recovered = h.requestKeyProbe(ctx, active, key.idx, req)
+	}
+	if h.catalog != nil && (status == http.StatusBadRequest || status == http.StatusNotFound) {
+		if model := h.catalog.probeAlternative(name, req.Model, key.target.nextAlternative); model != "" {
+			key.target.nextAlternative++
+			req.Model, req.nexusImages = model, false
+			req.MaxTokens = 32
+			_, recovered = h.requestKeyProbe(ctx, active, key.idx, req)
+		}
+	}
+	h.finishKeyProbe(active, name, key, recovered)
+}
+
+func (h *Handler) requestKeyProbe(ctx context.Context, active *activeProvider, idx int, req AnthropicRequest) (status int, recovered bool) {
+	body, _ := json.Marshal(req)
 	start := time.Now()
-	resp, err := h.callUpstreamOnce(ctx, active, req, body, http.Header{}, active.keys[key.idx])
+	resp, err := h.callUpstreamOnce(ctx, active, req, body, http.Header{}, active.keys[idx])
 	if err != nil {
 		if !errors.Is(err, errLocalPrep) {
 			h.recordUsageEvent(active, req, false, 0, &attemptInfo{
-				keyIdx: key.idx, chainPos: 0, started: start, probe: true,
+				keyIdx: idx, chainPos: 0, started: start, probe: true,
 				errText: "transport: " + err.Error(),
 			}, rawUsage{})
 		}
-		h.finishKeyProbe(active, name, key, false)
-		return
+		return 0, false
 	}
 	probeBody, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	resp.Body.Close()
 	att := &attemptInfo{
-		keyIdx: key.idx, chainPos: 0, started: start, probe: true,
+		keyIdx: idx, chainPos: 0, started: start, probe: true,
 		quota: captureQuota(resp.Header), reqID: extractRequestID(resp.Header),
 	}
 	raw := usageFromRawBody(active.impl.Name(), probeBody)
 	h.recordUsageEvent(active, req, false, resp.StatusCode, att, raw)
-	h.finishKeyProbe(active, name, key, readErr == nil && resp.StatusCode >= 200 && resp.StatusCode < 300)
+	return resp.StatusCode, readErr == nil && resp.StatusCode >= 200 && resp.StatusCode < 300
 }
 
 // coolKey marks key idx on active as cooling and, if the provider is
@@ -544,6 +562,9 @@ func (h *Handler) finishKeyProbe(active *activeProvider, name string, key dueKey
 		active.clearCooldownLocked(key.idx)
 		h.router.SetHealthy(name, true)
 	} else {
+		if key.idx < len(active.probeTargets) {
+			active.probeTargets[key.idx] = key.target
+		}
 		active.rescheduleLocked(key.idx)
 	}
 }
@@ -847,7 +868,7 @@ func (h *Handler) HandleMessages(w http.ResponseWriter, r *http.Request) {
 			log.Warn().Str("provider", cand.Name).Err(err).Msg("Provider unreachable, trying next")
 			continue
 		}
-		if isRetryableStatus(resp.StatusCode) && i < len(chain)-1 {
+		if i < len(chain)-1 && h.shouldFailOver(resp.StatusCode, req.Model) {
 			h.router.RecordOutcome(cand.Name, complexity, false)
 			// the last discarded response of the retry loop — recorded before
 			// the failover drops it
@@ -928,14 +949,16 @@ var errLocalPrep = errors.New("nexus: local request preparation failed")
 // position of this provider in the caller's chain, stamped onto every event
 // (rotations and retries of the same chain entry share its position).
 func (h *Handler) callUpstream(active *activeProvider, req AnthropicRequest, body []byte, origHeaders http.Header, chainPos int) (*http.Response, *attemptInfo, error) {
-	return h.callWithKeys(active, req, chainPos, func(key string) (*http.Response, error) {
+	_, customAuth := active.impl.(providers.Authorizer)
+	inheritsClientKey := !customAuth && !providers.IsOpenAICompatible(active.impl.Name())
+	return h.callWithKeys(active, req, chainPos, inheritsClientKey, func(key string) (*http.Response, error) {
 		return h.callUpstreamOnce(context.Background(), active, req, body, origHeaders, key)
 	})
 }
 
 // callWithKeys shares key cooldown, rotation and attempt accounting between
 // the converted request and the OpenAI gateway's raw pass-through.
-func (h *Handler) callWithKeys(active *activeProvider, req AnthropicRequest, chainPos int, call func(string) (*http.Response, error)) (*http.Response, *attemptInfo, error) {
+func (h *Handler) callWithKeys(active *activeProvider, req AnthropicRequest, chainPos int, inheritsClientKey bool, call func(string) (*http.Response, error)) (*http.Response, *attemptInfo, error) {
 	key, idx, ok := active.pickKey()
 	if !ok {
 		return nil, nil, errProviderExhausted
@@ -956,7 +979,9 @@ func (h *Handler) callWithKeys(active *activeProvider, req AnthropicRequest, cha
 			keyIdx: idx, chainPos: chainPos, started: start,
 			quota: captureQuota(resp.Header), reqID: extractRequestID(resp.Header),
 		}
-		if !isKeyLimitStatus(resp.StatusCode) || idx < 0 {
+		// Client-supplied Anthropic credentials are private to the request.
+		// They cannot quarantine the shared provider slot.
+		if !isKeyLimitStatus(resp.StatusCode) || idx < 0 || (inheritsClientKey && (key == "" || key == "nexus-local")) {
 			return resp, att, nil
 		}
 		h.coolKey(active, active.impl.Name(), idx, initialKeyBackoff, probeTarget{model: req.Model, images: req.nexusImages})
@@ -1483,6 +1508,12 @@ func isRetryableStatus(code int) bool {
 
 func isKeyLimitStatus(code int) bool {
 	return code == http.StatusPaymentRequired || code == http.StatusTooManyRequests
+}
+
+// A listed model can disappear from one upstream between catalog refreshes.
+// Try its peers on 404 without cooling the provider for all of its other models.
+func (h *Handler) shouldFailOver(status int, model string) bool {
+	return isRetryableStatus(status) || (status == http.StatusNotFound && h.router.HasModel(model))
 }
 
 // ─── Budget tracking ───────────────────────────────────────────────────────
