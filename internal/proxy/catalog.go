@@ -40,8 +40,7 @@ const (
 // It is a cache, never a request-path dependency: reads are a map scan under a
 // read lock and never touch the network, while the warm loop fetches in the
 // background. A successful fetch is pushed into the router with
-// SetProviderModels, so RouteChain can prefer a provider that actually serves
-// the requested id.
+// SetProviderModels, so RouteChain can select providers that serve the requested id.
 type modelCatalog struct {
 	mu        sync.RWMutex
 	entries   map[string]*catalogEntry // keyed by provider name
@@ -59,8 +58,9 @@ type modelCatalog struct {
 
 // catalogEntry is one provider's last known state in the catalog.
 type catalogEntry struct {
-	models    []string
-	fetchedAt time.Time // when models/err were last established — by a success or a failure
+	models     []string
+	fetchedAt  time.Time // when models/err were last established — by a success or a failure
+	discovered bool      // at least one non-empty upstream listing has been received
 	// err holds a retryable listing failure and nothing else: it is the marker
 	// that switches the next attempt onto the backoff window instead of the TTL.
 	// A provider with no listing endpoint is recorded in unsupported, not here,
@@ -155,6 +155,23 @@ func (c *modelCatalog) snapshot() []string {
 	return out
 }
 
+// missing reports absence only when every provider has a usable live listing.
+// Seeds and partial discovery are useful for routing known ids, but cannot
+// establish that an unlisted id is unavailable everywhere.
+func (c *modelCatalog) missing(id string) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if len(c.entries) == 0 || c.rt.HasModel(id) {
+		return false
+	}
+	for _, e := range c.entries {
+		if !e.discovered || e.err != "" {
+			return false
+		}
+	}
+	return true
+}
+
 // refreshAll fetches every provider whose entry is due: not in flight, not known
 // to have no listing endpoint, and past its wait window. The lock is released
 // around the network call, so a slow upstream delays only its own refresh, never
@@ -210,6 +227,7 @@ func (c *modelCatalog) refreshAll(ctx context.Context) {
 			log.Debug().Str("provider", name).Msg("Model listing returned no models — keeping the known models")
 		case err == nil:
 			e.models = append([]string(nil), ids...)
+			e.discovered = true
 			e.err = ""
 			e.backoff = 0
 			// Lock order: modelCatalog.mu → Router.mu, safe for the reason given in

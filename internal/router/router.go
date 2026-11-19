@@ -74,6 +74,7 @@ type Router struct {
 	mu        sync.RWMutex
 	strategy  RoutingStrategy
 	providers []*Provider
+	byModel   map[string]map[string]struct{} // model id → registered providers
 	adaptive  bool
 	stats     map[string]*provStat // key: provider|complexity
 }
@@ -144,6 +145,7 @@ func New(strategy RoutingStrategy) *Router {
 	return &Router{
 		strategy:  strategy,
 		providers: make([]*Provider, 0),
+		byModel:   make(map[string]map[string]struct{}),
 	}
 }
 
@@ -152,6 +154,17 @@ func (r *Router) AddProvider(p *Provider) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.providers = append(r.providers, p)
+	r.indexModels(p)
+}
+
+// indexModels adds a provider's model memberships. Caller holds r.mu.
+func (r *Router) indexModels(p *Provider) {
+	for id := range p.Models {
+		if r.byModel[id] == nil {
+			r.byModel[id] = make(map[string]struct{})
+		}
+		r.byModel[id][p.Name] = struct{}{}
+	}
 }
 
 // Providers returns all registered providers.
@@ -178,7 +191,14 @@ func (r *Router) SetProviderModels(name string, ids []string) {
 		for _, id := range ids {
 			models[id] = id
 		}
+		for id := range p.Models {
+			delete(r.byModel[id], name)
+			if len(r.byModel[id]) == 0 {
+				delete(r.byModel, id)
+			}
+		}
 		p.Models = models
+		r.indexModels(p)
 		return
 	}
 }
@@ -191,14 +211,15 @@ func (r *Router) SetProviderModels(name string, ids []string) {
 func (r *Router) ProviderServes(name, id string) bool {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	for _, p := range r.providers {
-		if p.Name != name {
-			continue
-		}
-		_, ok := p.Models[id]
-		return ok
-	}
-	return false
+	_, ok := r.byModel[id][name]
+	return ok
+}
+
+// HasModel reports catalog membership independently of provider health.
+func (r *Router) HasModel(id string) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return len(r.byModel[id]) > 0
 }
 
 // SetHealthy updates a provider's health (called by the background checker).
@@ -226,8 +247,7 @@ func (r *Router) Route(requestedModel string, complexity Complexity) *Provider {
 // Only healthy providers are included. The caller walks the chain, failing over
 // to the next candidate on transport errors or retryable HTTP statuses.
 //
-// Whatever the strategy produced, providers that serve the requested model id
-// come first: an id the chain cannot serve is a 404 the client would see.
+// When the model is known, only providers that serve it are candidates.
 func (r *Router) RouteChain(requestedModel string, complexity Complexity) []*Provider {
 	var chain []*Provider
 	switch r.strategy {
@@ -236,41 +256,32 @@ func (r *Router) RouteChain(requestedModel string, complexity Complexity) []*Pro
 	case StrategyFastest:
 		chain = r.byTierSpeed()
 	case StrategyManual:
-		chain = r.healthy() // explicit mapping: the partition alone orders the chain
+		chain = r.healthy() // explicit mapping in registration order
 	case StrategyDirect:
 		chain = r.autoChain(complexity)
 	default: // StrategyAuto
 		chain = r.autoChain(complexity)
 	}
-	return preferModel(chain, r.servingSet(requestedModel))
+	return r.ModelCandidates(chain, requestedModel)
 }
 
-// servingSet returns the names of the providers whose Models map contains id.
-// Those maps are rewritten by discovery through SetProviderModels, so they are
-// read only here, under r.mu. Callers get a set of names to test against — the
-// maps themselves never escape the lock, which keeps the partition pure and
-// avoids nesting an RLock inside the strategy helpers' own acquisitions.
-func (r *Router) servingSet(id string) map[string]bool {
+// ModelCandidates preserves the strategy order among providers that offer a
+// known id. Unlisted ids retain the strategy chain for aliases and incomplete
+// discovery. An empty result for a known id means all its providers are down.
+func (r *Router) ModelCandidates(chain []*Provider, id string) []*Provider {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	serving := make(map[string]bool, len(r.providers))
-	for _, p := range r.providers {
-		if _, ok := p.Models[id]; ok {
-			serving[p.Name] = true
+	serving := r.byModel[id]
+	if len(serving) == 0 {
+		return chain
+	}
+	candidates := make([]*Provider, 0, len(serving))
+	for _, p := range chain {
+		if _, ok := serving[p.Name]; ok {
+			candidates = append(candidates, p)
 		}
 	}
-	return serving
-}
-
-// PreferModel returns chain reordered so providers that serve id come first,
-// preserving the relative order of both groups. It is the post-stickyReorder
-// half of D-6: callers that already applied sticky selection re-apply this so a
-// sticky provider that does not serve id cannot outrank one that does.
-//
-// RouteChain already applies the same stable partition, so calling this on its
-// output is a no-op. It exists for callers that reorder the chain afterwards.
-func (r *Router) PreferModel(chain []*Provider, id string) []*Provider {
-	return preferModel(chain, r.servingSet(id))
+	return candidates
 }
 
 // CascadeChain orders healthy providers cheapest-first (local → free → standard
@@ -356,33 +367,6 @@ func (r *Router) byTierSpeed() []*Provider {
 		return pri[hp[i].Tier] < pri[hp[j].Tier]
 	})
 	return hp
-}
-
-// preferModel is a stable partition of an ordered chain: providers whose name is
-// in serving first, the rest after, each group keeping the order it arrived in.
-// Stability matters because sticky provider selection runs on top of this chain
-// — sorting would destroy it.
-//
-// This partition fixes only the model-serving preference within the chain the
-// router returns; it is not the final order a request is sent in. internal/proxy
-// may still narrow the chain afterwards — the tier and budget filters drop
-// candidates, and a forced provider pin replaces it outright — so a non-serving
-// provider can end up as the only candidate left. That is explicit narrowing, not
-// a reordering of this partition.
-func preferModel(chain []*Provider, serving map[string]bool) []*Provider {
-	match := make([]*Provider, 0, len(chain))
-	rest := make([]*Provider, 0, len(chain))
-	for _, p := range chain {
-		if serving[p.Name] {
-			match = append(match, p)
-		} else {
-			rest = append(rest, p)
-		}
-	}
-	if len(match) == 0 || len(rest) == 0 {
-		return chain // nothing to reorder; keep the strategy's slice untouched
-	}
-	return append(match, rest...)
 }
 
 // ─── Helpers ───────────────────────────────────────────────────────────────

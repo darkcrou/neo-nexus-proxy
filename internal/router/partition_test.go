@@ -26,23 +26,22 @@ func serves(ids ...string) map[string]string {
 	return m
 }
 
-func TestRouteChain_PrefersProvidersThatServeTheRequestedModel(t *testing.T) {
+func TestRouteChain_RequiresProvidersThatServeTheRequestedModel(t *testing.T) {
 	r := New(StrategyAuto)
-	// "primary" wins the tier ordering for a standard task, so only the model
-	// partition can move the serving provider ahead of it.
+	// "primary" wins the tier ordering for a standard task, but does not serve the requested model.
 	r.AddProvider(&Provider{Name: "primary", Tier: "standard", Healthy: true})
 	r.AddProvider(&Provider{Name: "serving", Tier: "premium", Healthy: true, Models: serves(requestedModelID)})
 
 	got := providerNames(r.RouteChain(requestedModelID, ComplexityStandard))
-	want := []string{"serving", "primary"}
+	want := []string{"serving"}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("chain = %v, want %v", got, want)
 	}
 }
 
-func TestRouteChain_PrefersServingProvidersUnderEveryStrategy(t *testing.T) {
+func TestRouteChain_RequiresServingProvidersUnderEveryStrategy(t *testing.T) {
 	// "preferred" wins the natural ordering of every strategy below: local tier,
-	// lowest price, highest priority. Only the model partition can reorder them.
+	// lowest price, highest priority. The model index excludes it for a model it does not serve.
 	setup := func(r *Router) {
 		r.AddProvider(&Provider{
 			Name: "preferred", Tier: "local", Healthy: true, Priority: 0,
@@ -63,7 +62,7 @@ func TestRouteChain_PrefersServingProvidersUnderEveryStrategy(t *testing.T) {
 			setup(r)
 
 			got := providerNames(r.RouteChain(requestedModelID, ComplexitySimple))
-			want := []string{"serving", "preferred"}
+			want := []string{"serving"}
 			if !reflect.DeepEqual(got, want) {
 				t.Errorf("chain = %v, want %v", got, want)
 			}
@@ -99,7 +98,7 @@ func TestRouteChain_KeepsStrategyOrderWhenEveryProviderServesTheModel(t *testing
 	}
 }
 
-func TestRouteChain_PreservesRelativeOrderWithinEachGroup(t *testing.T) {
+func TestRouteChain_PreservesStrategyOrderAmongServingProviders(t *testing.T) {
 	r := New(StrategyAuto)
 	// One tier for every provider, so the base order is Priority order:
 	// p0, p1, p2, p3. Serving and non-serving providers are interleaved.
@@ -121,20 +120,20 @@ func TestRouteChain_PreservesRelativeOrderWithinEachGroup(t *testing.T) {
 	}
 
 	got := providerNames(r.RouteChain(requestedModelID, ComplexityStandard))
-	want := []string{"p1", "p3", "p0", "p2"}
+	want := []string{"p1", "p3"}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("chain = %v, want %v", got, want)
 	}
 }
 
-func TestManualStrategy_PutsServingProvidersFirst(t *testing.T) {
+func TestManualStrategy_KeepsOnlyServingProviders(t *testing.T) {
 	r := New(StrategyManual)
 	r.AddProvider(&Provider{Name: "first", Healthy: true})
 	r.AddProvider(&Provider{Name: "serving", Healthy: true, Models: serves(requestedModelID)})
 	r.AddProvider(&Provider{Name: "third", Healthy: true})
 
 	got := providerNames(r.RouteChain(requestedModelID, ComplexityStandard))
-	want := []string{"serving", "first", "third"}
+	want := []string{"serving"}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("chain = %v, want %v", got, want)
 	}
@@ -302,10 +301,8 @@ func TestProviderServes_ConcurrentWithSetProviderModelsIsRaceFree(t *testing.T) 
 	wg.Wait()
 }
 
-// PreferModel is the post-stickyReorder half of D-6: sticky selection may have
-// moved a provider that does not serve the requested id to the front, and the
-// serving provider must still outrank it.
-func TestPreferModel_MovesServingProviderAheadOfAStickyNonServingOne(t *testing.T) {
+// A provider outside the model index is ineligible even at the head of the input chain.
+func TestModelCandidates_ExcludesStickyNonServingProvider(t *testing.T) {
 	r := New(StrategyAuto)
 	sticky := &Provider{Name: "sticky", Tier: "free", Healthy: true}
 	serving := &Provider{Name: "serving", Tier: "premium", Healthy: true, Models: serves(requestedModelID)}
@@ -313,14 +310,14 @@ func TestPreferModel_MovesServingProviderAheadOfAStickyNonServingOne(t *testing.
 	r.AddProvider(serving)
 
 	// stickyReorder(chain, "sticky") leaves exactly this chain.
-	got := providerNames(r.PreferModel([]*Provider{sticky, serving}, requestedModelID))
-	want := []string{"serving", "sticky"}
+	got := providerNames(r.ModelCandidates([]*Provider{sticky, serving}, requestedModelID))
+	want := []string{"serving"}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("chain = %v, want %v", got, want)
 	}
 }
 
-func TestPreferModel_PutsServingProvidersFirstAndKeepsGroupOrder(t *testing.T) {
+func TestModelCandidates_PreservesServingProviderOrder(t *testing.T) {
 	r := New(StrategyAuto)
 	layout := []struct {
 		name    string
@@ -341,31 +338,31 @@ func TestPreferModel_PutsServingProvidersFirstAndKeepsGroupOrder(t *testing.T) {
 		chain = append(chain, p)
 	}
 
-	got := providerNames(r.PreferModel(chain, requestedModelID))
-	want := []string{"p1", "p3", "p0", "p2"}
+	got := providerNames(r.ModelCandidates(chain, requestedModelID))
+	want := []string{"p1", "p3"}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("chain = %v, want %v", got, want)
 	}
 }
 
-func TestPreferModel_IsIdempotent(t *testing.T) {
+func TestModelCandidates_IsIdempotent(t *testing.T) {
 	r := New(StrategyAuto)
 	r.AddProvider(&Provider{Name: "sticky", Tier: "free", Healthy: true})
 	r.AddProvider(&Provider{Name: "serving", Tier: "premium", Healthy: true, Models: serves(requestedModelID)})
 
-	once := r.PreferModel(r.RouteChain(requestedModelID, ComplexitySimple), requestedModelID)
-	twice := r.PreferModel(once, requestedModelID)
+	once := r.ModelCandidates(r.RouteChain(requestedModelID, ComplexitySimple), requestedModelID)
+	twice := r.ModelCandidates(once, requestedModelID)
 
-	if want := []string{"serving", "sticky"}; !reflect.DeepEqual(providerNames(once), want) {
+	if want := []string{"serving"}; !reflect.DeepEqual(providerNames(once), want) {
 		t.Fatalf("first application = %v, want %v", providerNames(once), want)
 	}
 	if !reflect.DeepEqual(providerNames(twice), providerNames(once)) {
-		t.Errorf("second application = %v, want the same as the first (%v) — re-applying a stable partition must change nothing",
+		t.Errorf("second application = %v, want the same as the first (%v) — filtering the result again must change nothing",
 			providerNames(twice), providerNames(once))
 	}
 }
 
-func TestPreferModel_IsANoOpWhenNoProviderServesTheModel(t *testing.T) {
+func TestModelCandidates_IsANoOpWhenNoProviderServesTheModel(t *testing.T) {
 	r := New(StrategyAuto)
 	chain := []*Provider{
 		{Name: "first", Tier: "standard", Healthy: true},
@@ -375,12 +372,12 @@ func TestPreferModel_IsANoOpWhenNoProviderServesTheModel(t *testing.T) {
 		r.AddProvider(p)
 	}
 
-	if got, want := providerNames(r.PreferModel(chain, "model-nobody-serves")), []string{"first", "second"}; !reflect.DeepEqual(got, want) {
+	if got, want := providerNames(r.ModelCandidates(chain, "model-nobody-serves")), []string{"first", "second"}; !reflect.DeepEqual(got, want) {
 		t.Errorf("chain = %v, want %v", got, want)
 	}
 }
 
-func TestPreferModel_IsANoOpWhenEveryProviderServesTheModel(t *testing.T) {
+func TestModelCandidates_IsANoOpWhenEveryProviderServesTheModel(t *testing.T) {
 	r := New(StrategyAuto)
 	chain := []*Provider{
 		{Name: "first", Tier: "standard", Healthy: true},
@@ -392,15 +389,15 @@ func TestPreferModel_IsANoOpWhenEveryProviderServesTheModel(t *testing.T) {
 	r.SetProviderModels("first", []string{requestedModelID})
 	r.SetProviderModels("second", []string{requestedModelID})
 
-	if got, want := providerNames(r.PreferModel(chain, requestedModelID)), []string{"first", "second"}; !reflect.DeepEqual(got, want) {
+	if got, want := providerNames(r.ModelCandidates(chain, requestedModelID)), []string{"first", "second"}; !reflect.DeepEqual(got, want) {
 		t.Errorf("chain = %v, want %v", got, want)
 	}
 }
 
-func TestPreferModel_TracksModelsRegisteredAfterTheChainWasBuilt(t *testing.T) {
-	// The chain handed to PreferModel is usually built by RouteChain from the
+func TestModelCandidates_TracksModelsRegisteredAfterTheChainWasBuilt(t *testing.T) {
+	// The chain handed to ModelCandidates is usually built by RouteChain from the
 	// router's own state, but discovery rewrites the model maps at any time: the
-	// partition must read the maps as they are now, not as they were.
+	// filter must use the current model memberships.
 	r := New(StrategyAuto)
 	chain := []*Provider{
 		{Name: "sticky", Tier: "free", Healthy: true},
@@ -411,7 +408,7 @@ func TestPreferModel_TracksModelsRegisteredAfterTheChainWasBuilt(t *testing.T) {
 	}
 	r.SetProviderModels("serving", []string{requestedModelID})
 
-	if got, want := providerNames(r.PreferModel(chain, requestedModelID)), []string{"serving", "sticky"}; !reflect.DeepEqual(got, want) {
+	if got, want := providerNames(r.ModelCandidates(chain, requestedModelID)), []string{"serving"}; !reflect.DeepEqual(got, want) {
 		t.Errorf("chain = %v, want %v", got, want)
 	}
 }
@@ -423,7 +420,7 @@ func TestRouteChain_HonoursModelsRegisteredThroughSetProviderModels(t *testing.T
 	r.SetProviderModels("serving", []string{requestedModelID})
 
 	got := providerNames(r.RouteChain(requestedModelID, ComplexitySimple))
-	want := []string{"serving", "cheap"}
+	want := []string{"serving"}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("chain = %v, want %v", got, want)
 	}

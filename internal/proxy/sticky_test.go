@@ -119,7 +119,7 @@ func TestHandleMessages_StickyProvider_StaysOnFallbackAfterKeyCools(t *testing.T
 
 	// Cool A's only key — this is now its provider-level cooldown too (P2),
 	// so RouteChain no longer offers A at all.
-	h.coolKey(apA, "A", 0, time.Hour)
+	h.coolKey(apA, "A", 0, time.Hour, probeTarget{})
 	if apA.hasAvailableKey() {
 		t.Fatalf("A's only key should be cooling")
 	}
@@ -230,8 +230,8 @@ func TestHandleMessages_StickyProvider_NoSnapBackWhenOriginalRecovers(t *testing
 
 	// Both of A's keys cool via the real P1/P2 path -> derives A unhealthy,
 	// exactly as two real 429 responses would.
-	h.coolKey(apA, "A", 0, time.Hour)
-	h.coolKey(apA, "A", 1, time.Hour)
+	h.coolKey(apA, "A", 0, time.Hour, probeTarget{})
+	h.coolKey(apA, "A", 1, time.Hour, probeTarget{})
 	if apA.hasAvailableKey() {
 		t.Fatalf("A should have no available key")
 	}
@@ -253,7 +253,7 @@ func TestHandleMessages_StickyProvider_NoSnapBackWhenOriginalRecovers(t *testing
 	// A recovers via the real P2 recovery path (as the background probe loop
 	// would call it after a successful probe) — flips router.Provider.Healthy
 	// for A back to true.
-	h.recoverKey(apA, "A", 0)
+	h.finishKeyProbe(apA, "A", dueKey{idx: 0, deadline: apA.cool[0]}, true)
 	if !providerHealthy(t, h, "A") {
 		t.Fatalf("A should flip back to healthy once it has an available key again")
 	}

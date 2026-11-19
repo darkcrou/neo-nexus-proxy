@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/lynuxis2026-pixel/nexus-proxy/internal/router"
 )
@@ -33,6 +34,7 @@ type fakeModelProvider struct {
 	// listStatus, when non-zero, is answered by /models instead of the id list: the
 	// provider is up, its listing endpoint is not.
 	listStatus int
+	chatStatus func(*http.Request, string) int
 }
 
 func newFakeModelProvider(t *testing.T, ids ...string) *fakeModelProvider {
@@ -74,6 +76,14 @@ func startFakeModelProvider(t *testing.T, f *fakeModelProvider) *fakeModelProvid
 			w.WriteHeader(http.StatusNotFound)
 			_, _ = w.Write([]byte(`{"error":{"message":"model not found"}}`))
 			return
+		}
+		if f.chatStatus != nil {
+			if status := f.chatStatus(r, model); status != http.StatusOK {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(status)
+				_, _ = w.Write([]byte(`{"error":{"message":"upstream unavailable"}}`))
+				return
+			}
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
@@ -386,10 +396,7 @@ func TestCascade_SkipsACandidateThatDoesNotServeTheRequestedID(t *testing.T) {
 	}
 }
 
-func TestModels_StickyProviderThatDoesNotServeTheModelSortsLast(t *testing.T) {
-	// The case that motivated applying the partition after stickyReorder (D-6):
-	// "a" is the sticky provider for this requested id but does not offer it. Sticky
-	// decides only among providers that serve the id, so the request must go to "b".
+func TestModels_StickyProviderThatDoesNotServeTheModelIsExcluded(t *testing.T) {
 	a := newFakeModelProvider(t, "a-model")
 	b := newFakeModelProvider(t, "b-model")
 	h := newModelsHandler(t, "auto",
@@ -401,10 +408,126 @@ func TestModels_StickyProviderThatDoesNotServeTheModelSortsLast(t *testing.T) {
 	rec := doMessages(h, `{"model":"b-model","max_tokens":20,"messages":[{"role":"user","content":"hi"}]}`)
 
 	if got := rec.Header().Get("X-Nexus-Provider"); got != "b" {
-		t.Errorf("X-Nexus-Provider = %q, want b — a sticky provider that does not serve the id must sort last", got)
+		t.Errorf("X-Nexus-Provider = %q, want b, the only provider that serves the id", got)
 	}
 	if got := a.chat.Load(); got != 0 {
 		t.Errorf("a handled %d requests, want 0 — it does not serve the requested id", got)
+	}
+}
+
+func doModelRequest(h *Handler, path, model string) *httptest.ResponseRecorder {
+	body := fmt.Sprintf(`{"model":%q,"max_tokens":20,"messages":[{"role":"user","content":"hi"}]}`, model)
+	if path == "/v1/messages" {
+		return doMessages(h, body)
+	}
+	rec := httptest.NewRecorder()
+	h.HandleChatCompletions(rec, httptest.NewRequest(http.MethodPost, path, strings.NewReader(body)))
+	return rec
+}
+
+func TestModels_BillingFailoverSticksPerModelAcrossEndpointsAndRecovery(t *testing.T) {
+	var limited atomic.Bool
+	limited.Store(true)
+	a := startFakeModelProvider(t, &fakeModelProvider{
+		ids: []string{"shared", "other"},
+		chatStatus: func(_ *http.Request, model string) int {
+			if model == "shared" && limited.Load() {
+				return http.StatusPaymentRequired
+			}
+			return http.StatusOK
+		},
+	})
+	b := newFakeModelProvider(t, "shared", "other")
+	h := newModelsHandler(t, "direct",
+		modelsProvider{name: "a", url: a.srv.URL, tier: "standard"},
+		modelsProvider{name: "b", url: b.srv.URL, tier: "standard"},
+	)
+	discover(t, h)
+	assertProvider := func(path, model, want string) {
+		t.Helper()
+		rec := doModelRequest(h, path, model)
+		if got := rec.Header().Get("X-Nexus-Provider"); rec.Code != http.StatusOK || got != want {
+			t.Fatalf("%s %s: status/provider = %d/%q, want 200/%s. Body: %s", path, model, rec.Code, got, want, rec.Body)
+		}
+	}
+	assertProvider("/v1/chat/completions", "shared", "b")
+	if providerHealthy(t, h, "a") {
+		t.Fatal("402 on the last key should cool the provider globally")
+	}
+
+	ap := h.providers["a"]
+	expireCooldown := func() {
+		ap.mu.Lock()
+		defer ap.mu.Unlock()
+		ap.cool[0] = time.Now().Add(-time.Second)
+	}
+	expireCooldown()
+	if ap.hasAvailableKey() {
+		t.Fatal("expiry should make the key eligible for a probe")
+	}
+	h.probeCoolingKeys()
+	if providerHealthy(t, h, "a") || a.chat.Load() != 2 {
+		t.Fatal("first recovery probe should attempt the limited model and keep the provider cooling")
+	}
+	limited.Store(false)
+	expireCooldown()
+	h.probeCoolingKeys()
+	if !providerHealthy(t, h, "a") || a.chat.Load() != 3 {
+		t.Fatal("successful probe should restore the provider to all model routes")
+	}
+
+	assertProvider("/v1/messages", "shared", "b")
+	assertProvider("/v1/chat/completions", "shared", "b")
+	assertProvider("/v1/chat/completions", "other", "a")
+	if got := a.chat.Load(); got != 4 {
+		t.Errorf("provider a handled %d requests, want the original request, two probes, and other model", got)
+	}
+}
+
+func TestModels_RejectsUnlistedIDsAndSkipsNonServingProviders(t *testing.T) {
+	for _, path := range []string{"/v1/chat/completions", "/v1/messages"} {
+		t.Run(path, func(t *testing.T) {
+			owner := startFakeModelProvider(t, &fakeModelProvider{
+				ids:        []string{"known"},
+				chatStatus: func(*http.Request, string) int { return http.StatusTooManyRequests },
+			})
+			unrelated := newFakeModelProvider(t, "unrelated")
+			h := newModelsHandler(t, "direct",
+				modelsProvider{name: "owner", url: owner.srv.URL, tier: "standard"},
+				modelsProvider{name: "unrelated", url: unrelated.srv.URL, tier: "standard"},
+			)
+			discover(t, h)
+			for _, want := range []struct {
+				model string
+				code  int
+			}{
+				{"missing", http.StatusNotFound},
+				{"known", http.StatusTooManyRequests},
+				{"known", http.StatusServiceUnavailable},
+			} {
+				rec := doModelRequest(h, path, want.model)
+				if rec.Code != want.code {
+					t.Fatalf("%s: status = %d, want %d. Body: %s", want.model, rec.Code, want.code, rec.Body)
+				}
+			}
+			if owner.chat.Load() != 1 || unrelated.chat.Load() != 0 {
+				t.Fatalf("upstream hits = %d/%d, want 1/0", owner.chat.Load(), unrelated.chat.Load())
+			}
+		})
+	}
+}
+
+func TestModels_AutoForwardsDiscoveredIDWithoutApplyingDefaultMapping(t *testing.T) {
+	upstream := newFakeModelProvider(t, "default-model", "requested-model")
+	h := newModelsHandler(t, "auto", modelsProvider{
+		name: "provider", url: upstream.srv.URL, tier: "standard", models: []string{"default-model"},
+	})
+	discover(t, h)
+	for _, path := range []string{"/v1/chat/completions", "/v1/messages"} {
+		rec := doModelRequest(h, path, "requested-model")
+		if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "from requested-model") {
+			t.Fatalf("%s selected the wrong upstream model: %d %s", path, rec.Code, rec.Body)
+		}
 	}
 }
 

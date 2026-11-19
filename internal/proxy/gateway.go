@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -106,9 +107,17 @@ func (h *Handler) HandleChatCompletions(w http.ResponseWriter, r *http.Request) 
 	log.Debug().Str("model", oreq.Model).Str("complexity", complexity.String()).
 		Bool("stream", oreq.Stream).Bool("tools", hasTools).Msg("Incoming request (openai gateway)")
 
-	chain := h.router.RouteChain(oreq.Model, complexity)
-	if len(h.providers) == 0 || len(chain) == 0 {
+	if len(h.providers) == 0 {
 		h.writeOpenAIError(w, http.StatusBadGateway, "no providers configured — add one with `nexus add <provider> <key>`")
+		return
+	}
+	if h.unknownModel(oreq.Model) {
+		h.writeOpenAIError(w, http.StatusNotFound, "unknown model: "+oreq.Model)
+		return
+	}
+	chain := h.stickyChain(h.router.RouteChain(oreq.Model, complexity), oreq.Model)
+	if len(chain) == 0 {
+		h.writeOpenAIError(w, http.StatusServiceUnavailable, "no providers available for model: "+oreq.Model)
 		return
 	}
 	if h.budget.Over() {
@@ -123,30 +132,20 @@ func (h *Handler) HandleChatCompletions(w http.ResponseWriter, r *http.Request) 
 			continue
 		}
 
-		if providers.IsOpenAICompatible(active.impl.Name()) {
+		openAI := providers.IsOpenAICompatible(active.impl.Name())
+		var resp *http.Response
+		var att *attemptInfo
+		var err error
+		if openAI {
 			// High-fidelity pass-through: forward the original OpenAI body (model swapped).
-			resp, att, err := h.callOpenAIPassthrough(active, rawMap, oreq.Stream, areq.nexusImages, i+1)
-			if err != nil {
-				log.Warn().Str("provider", cand.Name).Err(err).Msg("Provider unreachable, trying next")
-				continue
-			}
-			if isRetryableStatus(resp.StatusCode) && i < len(chain)-1 {
-				h.recordUsageEvent(active, areq, oreq.Stream, resp.StatusCode, att, rawUsage{})
-				resp.Body.Close()
-				log.Warn().Str("provider", cand.Name).Int("status", resp.StatusCode).Msg("Retryable error, failing over")
-				continue
-			}
-			if oreq.Stream {
-				h.relayOpenAIPassthroughStream(w, r, active, areq, resp, startTime, complexity, att)
-			} else {
-				h.relayOpenAIPassthrough(w, active, areq, resp, startTime, complexity, att)
-			}
-			return
+			resp, att, err = h.callWithKeys(active, areq, i+1, func(key string) (*http.Response, error) {
+				return h.callOpenAIPassthrough(r.Context(), active, rawMap, areq, key)
+			})
+		} else {
+			// Anthropic-format provider: convert OpenAI → Anthropic, then back to OpenAI.
+			abody, _ := json.Marshal(areq)
+			resp, att, err = h.callUpstream(active, areq, abody, r.Header, i+1)
 		}
-
-		// Anthropic-format provider: convert OpenAI → Anthropic, then back to OpenAI.
-		abody, _ := json.Marshal(areq)
-		resp, att, err := h.callUpstream(active, areq, abody, r.Header, i+1)
 		if err != nil {
 			log.Warn().Str("provider", cand.Name).Err(err).Msg("Provider unreachable, trying next")
 			continue
@@ -154,9 +153,20 @@ func (h *Handler) HandleChatCompletions(w http.ResponseWriter, r *http.Request) 
 		if isRetryableStatus(resp.StatusCode) && i < len(chain)-1 {
 			h.recordUsageEvent(active, areq, oreq.Stream, resp.StatusCode, att, rawUsage{})
 			resp.Body.Close()
+			log.Warn().Str("provider", cand.Name).Int("status", resp.StatusCode).Msg("Retryable error, failing over")
 			continue
 		}
-		h.relayAnthropicToOpenAI(w, active, areq, oreq, resp, startTime, complexity, att)
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			h.setSticky(oreq.Model, cand.Name)
+		}
+		switch {
+		case openAI && oreq.Stream && resp.StatusCode < 400:
+			h.relayOpenAIPassthroughStream(w, r, active, areq, resp, startTime, complexity, att)
+		case openAI:
+			h.relayOpenAIPassthrough(w, active, areq, resp, startTime, complexity, att)
+		default:
+			h.relayAnthropicToOpenAI(w, active, areq, oreq, resp, startTime, complexity, att)
+		}
 		return
 	}
 	h.writeOpenAIError(w, http.StatusBadGateway, "all providers unreachable")
@@ -218,50 +228,29 @@ func (h *Handler) HandleModels(w http.ResponseWriter, r *http.Request) {
 
 // ─── upstream call (OpenAI pass-through) ────────────────────────────────────
 
-func (h *Handler) callOpenAIPassthrough(active *activeProvider, rawMap map[string]interface{}, stream, images bool, chainPos int) (*http.Response, *attemptInfo, error) {
-	key, idx, ok := active.pickKey()
-	if !ok {
-		return nil, nil, errProviderExhausted
-	}
-	start := time.Now()
+func (h *Handler) callOpenAIPassthrough(ctx context.Context, active *activeProvider, rawMap map[string]interface{}, areq AnthropicRequest, key string) (*http.Response, error) {
 	m := make(map[string]interface{}, len(rawMap)+2)
 	for k, v := range rawMap {
 		m[k] = v
 	}
-	inModel, _ := rawMap["model"].(string)
-	m["model"] = h.upstreamModel(active, inModel, images)
-	m["stream"] = stream
-	if stream {
+	m["model"] = h.upstreamModel(active, areq.Model, areq.nexusImages)
+	m["stream"] = areq.Stream
+	if areq.Stream {
 		m["stream_options"] = map[string]interface{}{"include_usage": true}
 	} else {
 		delete(m, "stream_options")
 	}
 	payload, err := json.Marshal(m)
 	if err != nil {
-		return nil, nil, fmt.Errorf("%w: %v", errLocalPrep, err)
+		return nil, fmt.Errorf("%w: %v", errLocalPrep, err)
 	}
-	req, err := http.NewRequest("POST", active.impl.ChatCompletionsURL(), bytes.NewReader(payload))
+	req, err := http.NewRequestWithContext(ctx, "POST", active.impl.ChatCompletionsURL(), bytes.NewReader(payload))
 	if err != nil {
-		return nil, nil, fmt.Errorf("%w: %v", errLocalPrep, err)
+		return nil, fmt.Errorf("%w: %v", errLocalPrep, err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	h.authorize(active, req, payload, key)
-	resp, err := h.httpClient.Do(req)
-	if err != nil {
-		// inModel is in scope; keeping model attribution on the event makes
-		// discard-site analysis consistent with every other recording site
-		// (recordUsageEvent derives model_used from upstreamModel itself, so
-		// the image flag must travel with the request)
-		h.recordUsageEvent(active, AnthropicRequest{Model: inModel, nexusImages: images}, stream, 0, &attemptInfo{
-			keyIdx: idx, chainPos: chainPos, started: start,
-			errText: "transport: " + err.Error(),
-		}, rawUsage{})
-		return nil, nil, err
-	}
-	return resp, &attemptInfo{
-		keyIdx: idx, chainPos: chainPos, started: start,
-		quota: captureQuota(resp.Header), reqID: extractRequestID(resp.Header),
-	}, nil
+	return h.httpClient.Do(req)
 }
 
 // ─── relays (OpenAI out) ────────────────────────────────────────────────────

@@ -190,68 +190,28 @@ Incoming request
 
 ## Provider & Key Cooldown (two-level, sticky)
 
-Implemented in `feat(proxy): two-level sticky provider/key cooldown`
-(commit `548f736`). All of this lives in `internal/proxy/handler.go` unless
-noted otherwise. Read this before touching provider selection, 429
-handling, or provider health — it replaced the old naive round-robin +
-generic health-ping design entirely.
+Both chat endpoints share key rotation and per-model provider stickiness.
+HTTP 402 and 429 put the responding key on cooldown. NEXUS first tries
+another usable key on the same provider. When the last key cools, the
+provider becomes unavailable for every model it serves. The current
+request can fail over to other eligible providers.
 
-**The model:** two independent cooldown levels, where level 2 is *derived*
-from level 1, not an independent timer.
+`keyProbeLoop` checks due keys every five seconds. It sends a small chat
+request using the model associated with the cooldown. A successful probe
+restores the key and makes its provider eligible again. Failed probes
+double the delay from the initial 10 seconds up to five minutes. A key
+stays out of normal rotation until a probe succeeds.
 
-- **Level 1 — key cooldown**, on `activeProvider` (a provider + its pool of
-  `api_keys`): `pickKey() (key, idx, ok)` is **sticky**, not round-robin —
-  it returns the same key on every call until that key 429s, only then
-  scanning forward to the next non-cooling key of the *same* provider.
-  `hasAvailableKey()` reports whether any key is usable right now. If
-  *every* key in the pool is cooling, `pickKey` returns `ok=false` and
-  `callUpstream` returns the sentinel `errProviderExhausted` instead of
-  trying a known-dead key.
-- **Level 2 — provider cooldown**, is **not** a separate timer. A provider
-  is available exactly when it has ≥1 non-cooling key. `coolKey`/
-  `recoverKey` keep `router.Provider.Healthy` (read by `RouteChain`)
-  in sync with real key state — `internal/router/router.go` itself was
-  **not modified**; it just gets fed a different, more accurate signal.
-- **Recovery is by active probe, not blind timer expiry.** `keyProbeLoop`
-  (background, replaces the old 30s generic `healthLoop`) periodically
-  calls `probeCoolingKeys()` → `probeKey()`, which fires one real minimal
-  chat-completion request (`MaxTokens: 1`, "ping") at a *specific cooling
-  key's actual endpoint* via `callUpstreamOnce` — not a cheap `/models`
-  ping, because a `/models` check can succeed while the chat-completions
-  endpoint that actually 429'd is still limited. A non-429 response clears
-  the key's cooldown immediately. Each key has its own exponential backoff
-  (`reschedule`: starts at 10s, doubles, capped at 5 min) so a key that's
-  out on a real daily-quota exhaustion isn't hammered for hours.
-  **`Provider.HealthCheck()`** (the interface method, generic `/models` or
-  reachability ping) still exists and is still used — but only for
-  one-off CLI/UI diagnostics (`nexus status`, `nexus doctor`, dashboard
-  onboarding in `internal/dashboard/setup.go`), never for routing-time
-  availability anymore.
-- **Sticky provider selection**, scoped **per requested Claude model**
-  (e.g. "claude-sonnet-4-6"), not global and not per-complexity:
-  `Handler.sticky map[string]string` + `stickyProvider()`/`setSticky()`,
-  and the pure helper `stickyReorder(chain, sticky)` which reprioritizes
-  `RouteChain`'s output without changing `RouteChain` itself. Updated only
-  on an actual successful response, from whichever provider produced it
-  (429-driven switch or 5xx-retry-exhaustion alike — one success-path
-  write site). Known, intentional nuance: under `StrategyAuto` (default),
-  `RouteChain` reorders by classified complexity, not by requested model —
-  so the same model string can occasionally land in a different chain
-  across requests, and the sticky pointer just won't be found that time.
-  This is graceful degradation, not a bug.
-- **Non-429 errors are a separate, unrelated mechanism**: 500/502/503/504/
-  transport errors get up to `maxProviderAttempts = 3` total attempts
-  against the *same* provider (no backoff, tight retry), then fall through
-  to the pre-existing next-provider chain-walk (`isRetryableStatus`)
-  exactly as before. This never touches cooldown state — cooldown is
-  strictly a 429/rate-limit concept.
+`Provider.HealthCheck()` serves CLI and dashboard diagnostics. Routing
+recovery probes the chat endpoint because a model listing can succeed
+while the key is still out of chat quota.
 
-**Design precedent worth repeating:** the whole rework touched only
-`internal/proxy/handler.go` (+ one `pickKey` call site in `gateway.go`) and
-added zero changes to `internal/router/router.go` — existing plumbing
-(`Healthy`/`SetHealthy`/`RouteChain`) was reused by feeding it a better
-signal, rather than building a parallel mechanism. Prefer that shape again
-for similar changes.
+Both endpoints remember the last provider to serve each requested model
+successfully. If the original provider recovers, requests stay on the
+working fallback while it remains eligible. Provider recovery and model
+discovery leave the sticky selection alone. The Anthropic endpoint also
+retries transient transport and 5xx errors up to three times within a
+provider before trying the next one.
 
 ---
 
@@ -576,27 +536,15 @@ the whole design; the paragraphs below are the consequences of it.
   is still listed on its primary `api_key`: a listing is a cheap GET that
   consumes no chat quota, and if that key is rejected the listing fails and
   backs off like any other failure.
-- **The partition and its precedence** (D-5, D-6). `router.Provider.Models`
-  (`map[string]string`, requested id → provider id) is the index;
-  `SetProviderModels` replaces it under `r.mu` and `servingSet` reads it under
-  the same lock, so the maps never escape the lock (`ProviderServes` is the
-  only sanctioned outside read — reading `Models` off a `*Provider` returned by
-  `RouteChain` would race the discovery loop). `RouteChain` applies the stable
-  `preferModel` partition to the result of **every** strategy, `direct` and
-  `manual` included, so a request naming an id the chain cannot serve no longer
-  walks a chain that will 404 at the first candidate. Stability matters:
-  sorting would destroy the sticky order applied on top. Composition order in
-  `HandleMessages` (`handler.go`) is **`RouteChain` → `stickyReorder` →
-  `PreferModel`**: `RouteChain` partitions first, sticky then moves its
-  remembered provider to the front, and the re-applied partition puts a sticky
-  provider that does not serve the requested id back behind the ones that do,
-  so sticky decides only *among serving providers*. `HandleChatCompletions`
-  (`gateway.go`) needs no post-step: it never calls `stickyReorder`, and its
-  only later step is the budget narrowing (`freeLocalOnly`), which is an
-  order-preserving filter.
-  The cascade chain (`CascadeChain` in `internal/router/router.go`, called from
-  `handler.go`) needs its own `PreferModel` call because `CascadeChain` bypasses
-  `RouteChain` entirely.
+- **Eligibility and selection.** Discovery updates the router's reverse index
+  from model ID to registered providers under its lock. The routing strategy
+  orders the eligible providers and the last successful provider for that model
+  moves to the front if it is available. Both chat endpoints share this
+  selection, including the Anthropic endpoint's cascade. If every provider for
+  a known model is cooling, the proxy returns 503. After all providers have
+  usable live listings, an unlisted exact ID returns 404. Incomplete discovery
+  keeps the fallback chain, and non-direct strategies still accept Claude
+  aliases and configured model mappings.
 - **No `provider/model` prefix exists, and why** (D-1). The model id **is** the
   address: the client asks for an id, and the router resolves the destination
   from the candidates that serve it. A prefixed wire format was considered and
@@ -604,11 +552,10 @@ the whole design; the paragraphs below are the consequences of it.
   send, and pinned the routing decision into the request string instead of
   leaving it to the candidates and their cooldown state. **Do not reintroduce
   it.** If a future session wants per-provider addressing, note that the
-  existing escape hatches are the `X-Nexus-Provider` header and config rules,
-  and that `direct` already forwards any model id verbatim. `direct`'s promise
-  is unchanged by this whole feature: it still forwards the requested model id
-  to OpenAI-compatible providers untouched (see "Direct Strategy" above); only
-  *provider choice* became id-aware, never the model string.
+  existing escape hatches on the Anthropic endpoint are the `X-Nexus-Provider`
+  header and config rules. The `direct` strategy forwards the requested ID
+  verbatim to eligible OpenAI-compatible providers. Other strategies use the
+  advertised ID by default and honor explicit model and vision overrides.
 - **The duplicate-name rule.** `NewHandler` collapses entries that resolve to
   the **same registered name** — `impl.Name()` — to the **first** one, with
   a startup warning (`Duplicate provider family — skipping this entry`), and
@@ -1026,15 +973,11 @@ claude
   config is a startup snapshot with no reload path, which would leave a local
   Ollama's models invisible until restart; config `models` and
   `providers.DefaultModels` seed the catalog and form the fallback ladder down
-  to the three stub Claude ids. `router.RouteChain` now partitions the chain
-  by the requested model id under every strategy, and `HandleMessages`
-  re-applies that partition after `stickyReorder`, so sticky decides only
-  among providers that serve the id — otherwise an advertised id would 404 at
-  the first candidate, since 404 is not retryable. There is **no
-  `provider/model` prefix**: the id is the address and the router resolves the
-  destination, which keeps the wire format unchanged and leaves `direct`'s
-  verbatim model-id passthrough intact. Discovery reads keys through
-  `peekKey`, never `pickKey`, so it cannot move the sticky key cursor. See
+  to the three stub Claude ids. The router's reverse index limits a known ID
+  to its serving providers under every strategy. Both chat endpoints apply
+  per-model stickiness within that set. The requested ID is the address, and
+  `direct` forwards it verbatim. Discovery uses `peekKey` to read the current
+  key without moving the sticky key cursor. See the
   "Model Catalog & Model-ID Routing" section above.
 
 ---

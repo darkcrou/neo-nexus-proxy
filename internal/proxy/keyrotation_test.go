@@ -29,7 +29,7 @@ func TestPickKeySticky(t *testing.T) {
 
 func TestPickKeySkipsCooling(t *testing.T) {
 	a := &activeProvider{keys: []string{"a", "b"}, cool: make([]time.Time, 2)}
-	a.penalize(0, time.Hour) // "a" is cooling
+	a.penalizeLocked(0, time.Hour) // "a" is cooling
 	for i := 0; i < 5; i++ {
 		k, idx, ok := a.pickKey()
 		if !ok || k == "a" || idx == 0 {
@@ -40,8 +40,8 @@ func TestPickKeySkipsCooling(t *testing.T) {
 
 func TestPickKeyAllCoolingReturnsNotOK(t *testing.T) {
 	a := &activeProvider{keys: []string{"a", "b"}, cool: make([]time.Time, 2)}
-	a.penalize(0, time.Hour)
-	a.penalize(1, time.Hour)
+	a.penalizeLocked(0, time.Hour)
+	a.penalizeLocked(1, time.Hour)
 	if k, idx, ok := a.pickKey(); ok {
 		t.Fatalf("expected ok=false when every key is cooling, got %q (idx %d)", k, idx)
 	}
@@ -93,19 +93,27 @@ func TestKeyRotationOn429(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	h := buildTestHandler(t, []testProv{{"p", "free", srv.URL}})
-	ap := h.providers["p"]
-	ap.keys = []string{"bad", "good"}
-	ap.cool = make([]time.Time, 2)
-	ap.rr = 0 // sticky current index — force the first pick to be index 0 ("bad")
+	for _, path := range []string{"/v1/messages", "/v1/chat/completions"} {
+		t.Run(path, func(t *testing.T) {
+			atomic.StoreInt32(&badHits, 0)
+			atomic.StoreInt32(&goodHits, 0)
+			h := buildTestHandler(t, []testProv{{"p", "free", srv.URL}})
+			ap := h.providers["p"]
+			ap.keys = []string{"bad", "good"}
+			ap.cool = make([]time.Time, 2)
+			ap.backoff = make([]time.Duration, 2)
 
-	rec := doMessages(h, `{"model":"claude-haiku-4-5","max_tokens":50,"messages":[{"role":"user","content":"hi"}]}`)
-
-	if rec.Code != 200 {
-		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
-	}
-	if badHits < 1 || goodHits != 1 {
-		t.Fatalf("bad=%d good=%d; expected a 429 on the bad key then rotation to the good key", badHits, goodHits)
+			rec := doModelRequest(h, path, "claude-haiku-4-5")
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+			}
+			if bad, good := atomic.LoadInt32(&badHits), atomic.LoadInt32(&goodHits); bad != 1 || good != 1 {
+				t.Fatalf("bad=%d good=%d; expected a 429 on the bad key then rotation to the good key", bad, good)
+			}
+			if !providerHealthy(t, h, "p") {
+				t.Fatal("the provider should remain available through its second key")
+			}
+		})
 	}
 }
 
@@ -139,7 +147,7 @@ func TestProbeCoolingKeys_RecoversAndFlipsHealthy(t *testing.T) {
 	// Cool the provider's only key exactly like a real 429 would, via the
 	// same Handler method callUpstream uses — this also drives SetHealthy
 	// false since it was the provider's last available key.
-	h.coolKey(ap, "p", 0, initialKeyBackoff)
+	h.coolKey(ap, "p", 0, initialKeyBackoff, probeTarget{})
 	if ap.hasAvailableKey() {
 		t.Fatalf("key should be cooling right after coolKey")
 	}
@@ -181,7 +189,7 @@ func TestProbeCoolingKeys_SkipsNotYetDue(t *testing.T) {
 	ap.keys = []string{"onlykey"}
 	ap.cool = make([]time.Time, 1)
 	ap.backoff = make([]time.Duration, 1)
-	h.coolKey(ap, "p", 0, initialKeyBackoff) // deadline is initialKeyBackoff in the future — not due
+	h.coolKey(ap, "p", 0, initialKeyBackoff, probeTarget{}) // deadline is initialKeyBackoff in the future — not due
 
 	h.probeCoolingKeys()
 
@@ -208,7 +216,7 @@ func TestProbeCoolingKeys_BackoffDoublesAndCaps(t *testing.T) {
 	ap.keys = []string{"onlykey"}
 	ap.cool = make([]time.Time, 1)
 	ap.backoff = make([]time.Duration, 1)
-	h.coolKey(ap, "p", 0, initialKeyBackoff) // backoff[0] = 10s
+	h.coolKey(ap, "p", 0, initialKeyBackoff, probeTarget{}) // backoff[0] = 10s
 
 	wantSequence := []time.Duration{
 		20 * time.Second,
@@ -285,7 +293,7 @@ func TestKeyStickyAcrossRequests_NoSnapBackAfterRecovery(t *testing.T) {
 	// Simulate keyA recovering on its own (its cooldown just happened to
 	// elapse) — this must NOT cause pickKey to bounce back to it, since keyB
 	// is now the sticky "current" key (a.rr).
-	ap.clearCooldown(0)
+	ap.clearCooldownLocked(0)
 	if !ap.hasAvailableKey() {
 		t.Fatalf("keyA should read as available again after clearCooldown")
 	}
@@ -308,13 +316,8 @@ func TestKeyStickyAcrossRequests_NoSnapBackAfterRecovery(t *testing.T) {
 	}
 }
 
-// TestProbeCoolingKeys_RecoversOnNon429NonSuccessStatus confirms the recovery
-// signal the probe loop (P2) uses is genuinely "non-429", per settled
-// requirement #6 — not narrowed to "2xx only" anywhere. A cooling key whose
-// probe response comes back 500 (non-429, but also not a success status) must
-// still be treated as recovered, exactly like
-// TestProbeCoolingKeys_RecoversAndFlipsHealthy's 200 case above.
-func TestProbeCoolingKeys_RecoversOnNon429NonSuccessStatus(t *testing.T) {
+// A server error does not confirm that the cooling key can serve traffic.
+func TestProbeCoolingKeys_KeepsCooldownOnServerError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError) // non-429, but also not 2xx
 		_, _ = w.Write([]byte(`{"error":{"message":"boom"}}`))
@@ -327,7 +330,7 @@ func TestProbeCoolingKeys_RecoversOnNon429NonSuccessStatus(t *testing.T) {
 	ap.cool = make([]time.Time, 1)
 	ap.backoff = make([]time.Duration, 1)
 
-	h.coolKey(ap, "p", 0, initialKeyBackoff)
+	h.coolKey(ap, "p", 0, initialKeyBackoff, probeTarget{})
 	if providerHealthy(t, h, "p") {
 		t.Fatalf("provider should be unhealthy once its only key is cooling")
 	}
@@ -335,13 +338,13 @@ func TestProbeCoolingKeys_RecoversOnNon429NonSuccessStatus(t *testing.T) {
 
 	h.probeCoolingKeys()
 
-	if !ap.hasAvailableKey() {
-		t.Fatalf("a 500 (non-429) probe response should still clear the key's cooldown — recovery is non-429, not 2xx-only")
+	if ap.hasAvailableKey() {
+		t.Fatal("a 500 probe response must leave the key cooling")
 	}
-	if ap.backoff[0] != 0 {
-		t.Fatalf("backoff should reset to 0 on recovery, got %v", ap.backoff[0])
+	if ap.backoff[0] != 2*initialKeyBackoff {
+		t.Fatalf("backoff should double after a failed probe, got %v", ap.backoff[0])
 	}
-	if !providerHealthy(t, h, "p") {
-		t.Fatalf("provider should flip back to healthy once its only key recovers")
+	if providerHealthy(t, h, "p") {
+		t.Fatal("provider should remain unavailable after a failed probe")
 	}
 }

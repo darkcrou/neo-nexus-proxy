@@ -65,6 +65,7 @@ func (h *Handler) serveCascade(w http.ResponseWriter, r *http.Request, req Anthr
 			continue
 		}
 		h.router.RecordOutcome(active.impl.Name(), complexity, true)
+		h.setSticky(req.Model, cand.Name)
 		if !last {
 			log.Info().Str("provider", cand.Name).Str("complexity", complexity.String()).Msg("cascade: cheap model accepted ✓")
 		}

@@ -5,6 +5,7 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -35,14 +36,21 @@ type EventPublisher interface {
 // non-cooling one — so a pool of free-tier keys behaves like one larger free
 // quota, without needlessly spreading load across keys that are still fine.
 type activeProvider struct {
-	impl   providers.Provider
-	apiKey string // primary key (keys[0]) — used for health checks and single-key paths
+	impl     providers.Provider
+	apiKey   string // primary key (keys[0]) — used for health checks and single-key paths
+	modelMap map[string]string
 
-	mu      sync.Mutex
-	keys    []string
-	rr      uint32          // sticky "current key" index (not a round-robin cursor)
-	cool    []time.Time     // per-key "cooling until" timestamps
-	backoff []time.Duration // per-key current backoff duration (0 = never penalized / recovered)
+	mu           sync.Mutex
+	keys         []string
+	rr           uint32          // sticky "current key" index (not a round-robin cursor)
+	cool         []time.Time     // per-key "cooling until" timestamps
+	backoff      []time.Duration // per-key current backoff duration (0 = never penalized / recovered)
+	probeTargets []probeTarget
+}
+
+type probeTarget struct {
+	model  string
+	images bool
 }
 
 // initialKeyBackoff is the cooldown a key gets on its first 429. keyProbeLoop
@@ -67,18 +75,18 @@ const (
 // not the exhausted case). If a pool exists but every key in it is cooling,
 // ok is false: the provider is exhausted and the caller must not attempt a
 // request with a known-cooling key. Caller holds a.mu.
-func (a *activeProvider) keyLocked(now time.Time, adopt bool) (key string, idx int, ok bool) {
+func (a *activeProvider) keyLocked(adopt bool) (key string, idx int, ok bool) {
 	n := len(a.keys)
 	if n == 0 {
 		return a.apiKey, -1, true
 	}
 	cur := int(a.rr) % n
-	if a.cool[cur].Before(now) {
+	if a.cool[cur].IsZero() {
 		return a.keys[cur], cur, true
 	}
 	for off := 1; off < n; off++ {
 		i := (cur + off) % n
-		if a.cool[i].Before(now) {
+		if a.cool[i].IsZero() {
 			if adopt {
 				a.rr = uint32(i)
 			}
@@ -92,7 +100,7 @@ func (a *activeProvider) keyLocked(now time.Time, adopt bool) (key string, idx i
 func (a *activeProvider) pickKey() (key string, idx int, ok bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	return a.keyLocked(time.Now(), true)
+	return a.keyLocked(true)
 }
 
 // peekKey reports the key pickKey would return, without adopting it: it never
@@ -101,40 +109,23 @@ func (a *activeProvider) pickKey() (key string, idx int, ok bool) {
 func (a *activeProvider) peekKey() (key string, idx int, ok bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	return a.keyLocked(time.Now(), false)
+	return a.keyLocked(false)
 }
 
 // hasAvailableKey reports whether the provider currently has at least one
 // non-cooling key, without mutating the sticky selection state. An empty
 // key pool (fallback-to-apiKey case) always counts as available.
 func (a *activeProvider) hasAvailableKey() bool {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if len(a.keys) == 0 {
-		return true
-	}
-	now := time.Now()
-	for _, c := range a.cool {
-		if c.Before(now) {
-			return true
-		}
-	}
-	return false
+	_, _, ok := a.peekKey()
+	return ok
 }
 
 // penalize puts a key on cooldown after a rate-limit response and records d
 // as its current backoff, so a later recovery-probe retry (see reschedule)
 // knows what to double from. This stays the single place that marks a key
 // cooling.
-func (a *activeProvider) penalize(idx int, d time.Duration) {
-	if idx < 0 {
-		return
-	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if idx < len(a.cool) {
-		a.cool[idx] = time.Now().Add(d)
-	}
+func (a *activeProvider) penalizeLocked(idx int, d time.Duration) {
+	a.cool[idx] = time.Now().Add(d)
 	if idx < len(a.backoff) {
 		a.backoff[idx] = d
 	}
@@ -143,15 +134,8 @@ func (a *activeProvider) penalize(idx int, d time.Duration) {
 // clearCooldown resets a key's cooldown/backoff after a successful recovery
 // probe: it's immediately eligible for sticky selection again, and starts
 // fresh at initialKeyBackoff on its next 429.
-func (a *activeProvider) clearCooldown(idx int) {
-	if idx < 0 {
-		return
-	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if idx < len(a.cool) {
-		a.cool[idx] = time.Time{}
-	}
+func (a *activeProvider) clearCooldownLocked(idx int) {
+	a.cool[idx] = time.Time{}
 	if idx < len(a.backoff) {
 		a.backoff[idx] = 0
 	}
@@ -160,39 +144,39 @@ func (a *activeProvider) clearCooldown(idx int) {
 // reschedule doubles a cooling key's backoff (capped at maxKeyBackoff) after
 // a recovery probe finds it still failing, and pushes its cooldown deadline
 // out by the new backoff.
-func (a *activeProvider) reschedule(idx int) {
-	if idx < 0 {
-		return
-	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if idx >= len(a.backoff) {
-		return
-	}
+func (a *activeProvider) rescheduleLocked(idx int) {
 	next := a.backoff[idx] * 2
 	if next <= 0 || next > maxKeyBackoff {
 		next = maxKeyBackoff
 	}
 	a.backoff[idx] = next
-	if idx < len(a.cool) {
-		a.cool[idx] = time.Now().Add(next)
-	}
+	a.cool[idx] = time.Now().Add(next)
+}
+
+type dueKey struct {
+	idx      int
+	deadline time.Time
+	target   probeTarget
 }
 
 // dueKeys returns the indices of keys that currently carry a cooldown
 // (backoff[idx] != 0, i.e. penalized and not yet recovered) whose deadline
 // has passed — keys due for a recovery probe. A key that was never penalized
 // (or was already cleared) is never "due".
-func (a *activeProvider) dueKeys(now time.Time) []int {
+func (a *activeProvider) dueKeys(now time.Time) []dueKey {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	var out []int
+	var out []dueKey
 	for i := range a.cool {
 		if i >= len(a.backoff) || a.backoff[i] == 0 {
 			continue
 		}
 		if !a.cool[i].After(now) {
-			out = append(out, i)
+			key := dueKey{idx: i, deadline: a.cool[i]}
+			if i < len(a.probeTargets) {
+				key.target = a.probeTargets[i]
+			}
+			out = append(out, key)
 		}
 	}
 	return out
@@ -307,7 +291,11 @@ func NewHandler(cfg *Config, db *storage.DB, broker EventPublisher) (*Handler, e
 			continue
 		}
 		providerOrder = append(providerOrder, name)
-		active[name] = &activeProvider{impl: impl, apiKey: key, keys: keys, cool: make([]time.Time, len(keys)), backoff: make([]time.Duration, len(keys))}
+		active[name] = &activeProvider{
+			impl: impl, apiKey: key, modelMap: pc.ModelMap, keys: keys,
+			cool: make([]time.Time, len(keys)), backoff: make([]time.Duration, len(keys)),
+			probeTargets: make([]probeTarget, len(keys)),
+		}
 		if len(pc.Models) > 0 {
 			seedFor[name] = pc.Models
 		} else {
@@ -435,29 +423,15 @@ func (h *Handler) CacheEnabled() bool { return h.cache != nil }
 // promptly a newly-due key gets picked up.
 const probeTickInterval = 5 * time.Second
 
-// probeModel is the representative Claude model name used to build the
-// synthetic recovery-probe request below. Every provider's MapModel /
-// AnthropicNative path accepts any Claude Code model string, so one constant
-// works uniformly across providers — the probe only cares whether the key
-// itself is accepted, not which model tier answers it.
+// probeModel is the fallback if the throttled request supplied no model.
 const probeModel = "claude-haiku-4-5"
 
-// probeRequest and probeRequestBody are the synthetic minimal chat-completion
-// request keyProbeLoop fires at a cooling key to test whether it has actually
-// recovered. Built once since the payload never varies.
+// probeRequest is the minimal request sent to a cooling key's model.
 var probeRequest = AnthropicRequest{
 	Model:     probeModel,
 	MaxTokens: 1,
 	Messages:  []Message{{Role: "user", Content: "ping"}},
 }
-
-var probeRequestBody = func() []byte {
-	b, err := json.Marshal(probeRequest)
-	if err != nil {
-		panic(fmt.Sprintf("nexus: failed to marshal static probe request: %v", err))
-	}
-	return b
-}()
 
 // keyProbeLoop replaces the old generic healthLoop. Instead of pinging a
 // /models-style endpoint on each provider's primary key on a fixed interval —
@@ -496,13 +470,10 @@ func (h *Handler) probeCoolingKeys() {
 			continue
 		}
 		wg.Add(1)
-		go func(name string, active *activeProvider, due []int) {
+		go func(name string, active *activeProvider, due []dueKey) {
 			defer wg.Done()
-			for _, idx := range due {
-				if idx < 0 || idx >= len(active.keys) {
-					continue
-				}
-				h.probeKey(active, name, idx, active.keys[idx])
+			for _, key := range due {
+				h.probeKey(active, name, key)
 			}
 		}(name, active, due)
 	}
@@ -512,76 +483,68 @@ func (h *Handler) probeCoolingKeys() {
 // probeKey fires one minimal real chat-completion request at a specific
 // cooling key via the same request-building path real traffic uses
 // (callUpstreamOnce), so recovery is verified against the actual endpoint the
-// key was rate-limited on. A non-429 response (or, symmetrically, any
-// response at all — a transport error is treated the same as "still no
-// evidence of recovery" as a 429) decides the outcome: non-429 clears the
-// key's cooldown, anything else doubles its backoff and reschedules the next
-// probe. Every probe is a real upstream attempt, so each outcome (transport
-// error, 429, recovery) records a probe-flagged usage event; probes are
-// excluded from quota windows/totals by default but stay queryable.
-func (h *Handler) probeKey(active *activeProvider, name string, idx int, key string) {
+// key was limited on. A successful response clears cooldown. Failed probes
+// are recorded separately and rescheduled with exponential backoff.
+func (h *Handler) probeKey(active *activeProvider, name string, key dueKey) {
+	req := probeRequest
+	if key.target.model != "" {
+		req.Model = key.target.model
+		req.nexusImages = key.target.images
+	}
+	body, _ := json.Marshal(req)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
 	start := time.Now()
-	resp, err := h.callUpstreamOnce(active, probeRequest, probeRequestBody, http.Header{}, key)
+	resp, err := h.callUpstreamOnce(ctx, active, req, body, http.Header{}, active.keys[key.idx])
 	if err != nil {
 		if !errors.Is(err, errLocalPrep) {
-			h.recordUsageEvent(active, probeRequest, false, 0, &attemptInfo{
-				keyIdx: idx, chainPos: 0, started: start, probe: true,
+			h.recordUsageEvent(active, req, false, 0, &attemptInfo{
+				keyIdx: key.idx, chainPos: 0, started: start, probe: true,
 				errText: "transport: " + err.Error(),
 			}, rawUsage{})
 		}
-		active.reschedule(idx)
+		h.finishKeyProbe(active, name, key, false)
 		return
 	}
-	probeBody, _ := io.ReadAll(resp.Body)
+	probeBody, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	resp.Body.Close()
 	att := &attemptInfo{
-		keyIdx: idx, chainPos: 0, started: start, probe: true,
+		keyIdx: key.idx, chainPos: 0, started: start, probe: true,
 		quota: captureQuota(resp.Header), reqID: extractRequestID(resp.Header),
 	}
 	raw := usageFromRawBody(active.impl.Name(), probeBody)
-	if resp.StatusCode == http.StatusTooManyRequests {
-		h.recordUsageEvent(active, probeRequest, false, resp.StatusCode, att, raw)
-		active.reschedule(idx)
-		return
-	}
-	h.recordUsageEvent(active, probeRequest, false, resp.StatusCode, att, raw)
-	h.recoverKey(active, name, idx)
-}
-
-// routerHealthy reports a provider's currently-recorded router.Provider.Healthy
-// flag — the actual gate RouteChain filters on. This is deliberately not the
-// same thing as active.hasAvailableKey(): that recomputes live off wall-clock
-// time, so a key whose backoff deadline has just elapsed already reads as
-// "available" before a recovery probe has confirmed anything, whereas
-// router.Healthy only ever changes via an explicit SetHealthy call. coolKey/
-// recoverKey below need the latter to detect a genuine transition.
-func (h *Handler) routerHealthy(name string) bool {
-	for _, p := range h.router.Providers() {
-		if p.Name == name {
-			return p.Healthy
-		}
-	}
-	return false
+	h.recordUsageEvent(active, req, false, resp.StatusCode, att, raw)
+	h.finishKeyProbe(active, name, key, readErr == nil && resp.StatusCode >= 200 && resp.StatusCode < 300)
 }
 
 // coolKey marks key idx on active as cooling and, if the provider is
 // router-healthy but is now out of available keys, flips its router entry
 // unhealthy — router.Healthy is a computed fact about the key pool, not an
 // independently-driven signal.
-func (h *Handler) coolKey(active *activeProvider, name string, idx int, d time.Duration) {
-	active.penalize(idx, d)
-	if h.routerHealthy(name) && !active.hasAvailableKey() {
-		h.router.SetHealthy(name, false)
+func (h *Handler) coolKey(active *activeProvider, name string, idx int, d time.Duration, target probeTarget) {
+	active.mu.Lock()
+	defer active.mu.Unlock()
+	active.penalizeLocked(idx, d)
+	if idx < len(active.probeTargets) {
+		active.probeTargets[idx] = target
 	}
+	_, _, available := active.keyLocked(false)
+	h.router.SetHealthy(name, available)
 }
 
-// recoverKey clears key idx's cooldown after a successful recovery probe and,
-// if the provider is currently router-unhealthy but now has an available key,
-// flips it back healthy.
-func (h *Handler) recoverKey(active *activeProvider, name string, idx int) {
-	active.clearCooldown(idx)
-	if !h.routerHealthy(name) && active.hasAvailableKey() {
+// finishKeyProbe applies the result only if the probe still refers to the
+// current cooldown. An in-flight user request can cool the same key again.
+func (h *Handler) finishKeyProbe(active *activeProvider, name string, key dueKey, recovered bool) {
+	active.mu.Lock()
+	defer active.mu.Unlock()
+	if !active.cool[key.idx].Equal(key.deadline) {
+		return
+	}
+	if recovered {
+		active.clearCooldownLocked(key.idx)
 		h.router.SetHealthy(name, true)
+	} else {
+		active.rescheduleLocked(key.idx)
 	}
 }
 
@@ -604,6 +567,30 @@ func (h *Handler) setSticky(requestedModel, provider string) {
 		h.sticky = make(map[string]string)
 	}
 	h.sticky[requestedModel] = provider
+}
+
+func (h *Handler) stickyChain(chain []*router.Provider, model string) []*router.Provider {
+	provider, _ := h.stickyProvider(model)
+	return stickyReorder(chain, provider)
+}
+
+// unknownModel validates exact ids once discovery can establish absence. Auto
+// routing also accepts Claude aliases and operator-defined model mappings.
+func (h *Handler) unknownModel(model string) bool {
+	if h.catalog == nil || !h.catalog.missing(model) {
+		return false
+	}
+	if !h.directModel {
+		if router.IsAnthropicModel(model) {
+			return false
+		}
+		for _, active := range h.providers {
+			if active.modelMap[model] != "" || active.modelMap["default"] != "" {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // stickyReorder moves the chain entry named sticky (if present) to the
@@ -725,29 +712,11 @@ func (h *Handler) HandleMessages(w http.ResponseWriter, r *http.Request) {
 		Bool("tools", hasTools).
 		Msg("Incoming request")
 
-	// Zero-config (no providers) or empty chain → forward straight to Anthropic.
-	chain := h.router.RouteChain(req.Model, complexity)
-	if len(h.providers) == 0 || len(chain) == 0 {
+	if len(h.providers) == 0 {
 		h.forwardDirectAnthropic(w, r, req, body, startTime, complexity)
 		return
 	}
-
-	// Sticky provider (P3): prefer whichever provider last actually
-	// succeeded serving this exact requested model string, if it's still in
-	// this request's chain. NOTE: the chain composition still varies from
-	// request to request — classified complexity reorders it and the model
-	// partition groups it — so this sticky pointer can legitimately miss.
-	// That is intentional graceful degradation, not a bug to work around
-	// here.
-	if sp, ok := h.stickyProvider(req.Model); ok {
-		chain = stickyReorder(chain, sp)
-	}
-	// D-6: sticky decides only among providers that serve the requested id. RouteChain
-	// partitioned the chain before stickyReorder ran, so a sticky provider that does
-	// not serve this id could have been moved to the front; re-applying the partition
-	// puts it back behind the providers that can actually answer. No-op when nothing
-	// serves the id or when the sticky provider does.
-	chain = h.router.PreferModel(chain, req.Model)
+	chain := h.stickyChain(h.router.RouteChain(req.Model, complexity), req.Model)
 
 	// Routing rules + cost guardrail need the prompt text.
 	var ptext string
@@ -784,6 +753,16 @@ func (h *Handler) HandleMessages(w http.ResponseWriter, r *http.Request) {
 		chain = filterByTier(chain, headerTier)
 		bypassCascade = true
 	}
+	if forced == "" {
+		if h.unknownModel(req.Model) {
+			h.writeError(w, http.StatusNotFound, "unknown model: "+req.Model)
+			return
+		}
+		if len(chain) == 0 {
+			h.writeError(w, http.StatusServiceUnavailable, "no providers available for model: "+req.Model)
+			return
+		}
+	}
 
 	// Cost guardrail: downgrade a single request estimated to exceed the cap.
 	if !bypassCascade && h.maxReqUSD > 0 && len(chain) > 0 {
@@ -802,12 +781,8 @@ func (h *Handler) HandleMessages(w http.ResponseWriter, r *http.Request) {
 	// and escalate to a stronger model only on failure. Falls through to the
 	// normal failover path if every cascade candidate is unreachable.
 	if h.cascade && !bypassCascade {
-		cc := h.router.CascadeChain(complexity)
-		// The cascade picks by price, but a candidate that does not serve the requested
-		// id can only answer 404 — and at the last position that 404 is relayed to the
-		// client. Partitioning keeps the cheap-first order among the providers that can
-		// serve it and sorts the rest last (D-6).
-		cc = h.router.PreferModel(cc, req.Model)
+		cc := h.router.ModelCandidates(h.router.CascadeChain(complexity), req.Model)
+		cc = h.stickyChain(cc, req.Model)
 		if h.budget.Over() {
 			if cheap := freeLocalOnly(cc); len(cheap) > 0 {
 				cc = cheap
@@ -843,16 +818,14 @@ func (h *Handler) HandleMessages(w http.ResponseWriter, r *http.Request) {
 		// retryable statuses (500/502/503/504) and transport errors are
 		// retried here, with no backoff — a tight retry, same sticky key
 		// each time since callUpstream/pickKey keep returning it as long as
-		// it isn't cooling. 429 is untouched: it breaks out immediately and
-		// is handled by the unchanged failover logic right below, since a
-		// 429 reaching here already means callUpstream's own same-provider
-		// key rotation (P1) is exhausted.
+		// it isn't cooling. A billing or rate-limit response means the
+		// provider's key rotation is exhausted.
 		var resp *http.Response
 		var att *attemptInfo
 		var err error
 		for attempt := 1; attempt <= maxProviderAttempts; attempt++ {
 			resp, att, err = h.callUpstream(active, req, body, r.Header, i+1)
-			if err == nil && (resp.StatusCode == http.StatusTooManyRequests || !isRetryableStatus(resp.StatusCode)) {
+			if errors.Is(err, errProviderExhausted) || (err == nil && (isKeyLimitStatus(resp.StatusCode) || !isRetryableStatus(resp.StatusCode))) {
 				break
 			}
 			if attempt == maxProviderAttempts {
@@ -883,7 +856,7 @@ func (h *Handler) HandleMessages(w http.ResponseWriter, r *http.Request) {
 			log.Warn().Str("provider", cand.Name).Int("status", resp.StatusCode).Msg("Retryable error, failing over to next provider")
 			continue
 		}
-		succeeded := resp.StatusCode < 400
+		succeeded := resp.StatusCode >= 200 && resp.StatusCode < 300
 		h.router.RecordOutcome(cand.Name, complexity, succeeded)
 		if succeeded {
 			// P3: this is the provider the walk actually succeeded on —
@@ -955,19 +928,21 @@ var errLocalPrep = errors.New("nexus: local request preparation failed")
 // position of this provider in the caller's chain, stamped onto every event
 // (rotations and retries of the same chain entry share its position).
 func (h *Handler) callUpstream(active *activeProvider, req AnthropicRequest, body []byte, origHeaders http.Header, chainPos int) (*http.Response, *attemptInfo, error) {
-	attempts := len(active.keys)
-	if attempts < 1 {
-		attempts = 1
+	return h.callWithKeys(active, req, chainPos, func(key string) (*http.Response, error) {
+		return h.callUpstreamOnce(context.Background(), active, req, body, origHeaders, key)
+	})
+}
+
+// callWithKeys shares key cooldown, rotation and attempt accounting between
+// the converted request and the OpenAI gateway's raw pass-through.
+func (h *Handler) callWithKeys(active *activeProvider, req AnthropicRequest, chainPos int, call func(string) (*http.Response, error)) (*http.Response, *attemptInfo, error) {
+	key, idx, ok := active.pickKey()
+	if !ok {
+		return nil, nil, errProviderExhausted
 	}
-	var resp *http.Response
-	var err error
-	for i := 0; i < attempts; i++ {
-		key, idx, ok := active.pickKey()
-		if !ok {
-			return nil, nil, errProviderExhausted
-		}
+	for attempt := 1; ; attempt++ {
 		start := time.Now()
-		resp, err = h.callUpstreamOnce(active, req, body, origHeaders, key)
+		resp, err := call(key)
 		if err != nil {
 			if !errors.Is(err, errLocalPrep) {
 				h.recordUsageEvent(active, req, req.Stream, 0, &attemptInfo{
@@ -977,25 +952,25 @@ func (h *Handler) callUpstream(active *activeProvider, req AnthropicRequest, bod
 			}
 			return resp, nil, err
 		}
-		if resp.StatusCode == http.StatusTooManyRequests && i < attempts-1 {
-			// This 429 never reaches the client — record it before the body
-			// closes, transcribing the rate-limit headers it carried.
-			att := &attemptInfo{
-				keyIdx: idx, chainPos: chainPos, started: start,
-				quota: captureQuota(resp.Header), reqID: extractRequestID(resp.Header),
-			}
-			h.coolKey(active, active.impl.Name(), idx, initialKeyBackoff)
-			resp.Body.Close()
-			h.recordUsageEvent(active, req, req.Stream, resp.StatusCode, att, rawUsage{})
-			log.Warn().Str("provider", active.impl.Name()).Msg("key rate-limited (429), rotating to next key")
-			continue
-		}
-		return resp, &attemptInfo{
+		att := &attemptInfo{
 			keyIdx: idx, chainPos: chainPos, started: start,
 			quota: captureQuota(resp.Header), reqID: extractRequestID(resp.Header),
-		}, nil
+		}
+		if !isKeyLimitStatus(resp.StatusCode) || idx < 0 {
+			return resp, att, nil
+		}
+		h.coolKey(active, active.impl.Name(), idx, initialKeyBackoff, probeTarget{model: req.Model, images: req.nexusImages})
+		if attempt >= len(active.keys) {
+			return resp, att, nil
+		}
+		key, idx, ok = active.pickKey()
+		if !ok {
+			return resp, att, nil
+		}
+		resp.Body.Close()
+		h.recordUsageEvent(active, req, req.Stream, resp.StatusCode, att, rawUsage{})
+		log.Warn().Str("provider", active.impl.Name()).Int("status", resp.StatusCode).Msg("Key limited, rotating to next key")
 	}
-	return resp, nil, err
 }
 
 // mappedModel resolves the provider-facing model id for logging/dashboard
@@ -1006,6 +981,9 @@ func (h *Handler) callUpstream(active *activeProvider, req AnthropicRequest, bod
 // upstreamModel for the model id that is actually sent upstream.
 func (h *Handler) mappedModel(active *activeProvider, requestedModel string) string {
 	if h.directModel {
+		return requestedModel
+	}
+	if h.router != nil && h.router.ProviderServes(active.impl.Name(), requestedModel) && active.modelMap[requestedModel] == "" {
 		return requestedModel
 	}
 	return active.impl.MapModel(requestedModel)
@@ -1036,7 +1014,7 @@ func (h *Handler) upstreamModel(active *activeProvider, requestedModel string, i
 }
 
 // callUpstreamOnce performs a single upstream request with a specific API key.
-func (h *Handler) callUpstreamOnce(active *activeProvider, req AnthropicRequest, body []byte, origHeaders http.Header, key string) (*http.Response, error) {
+func (h *Handler) callUpstreamOnce(ctx context.Context, active *activeProvider, req AnthropicRequest, body []byte, origHeaders http.Header, key string) (*http.Response, error) {
 	if providers.IsOpenAICompatible(active.impl.Name()) {
 		oaiReq, err := TransformToOpenAI(req, h.upstreamModel(active, req.Model, req.nexusImages))
 		if err != nil {
@@ -1050,7 +1028,7 @@ func (h *Handler) callUpstreamOnce(active *activeProvider, req AnthropicRequest,
 		if err != nil {
 			return nil, fmt.Errorf("%w: %v", errLocalPrep, err)
 		}
-		httpReq, err := http.NewRequest("POST", active.impl.ChatCompletionsURL(), bytes.NewReader(payload))
+		httpReq, err := http.NewRequestWithContext(ctx, "POST", active.impl.ChatCompletionsURL(), bytes.NewReader(payload))
 		if err != nil {
 			return nil, fmt.Errorf("%w: %v", errLocalPrep, err)
 		}
@@ -1066,7 +1044,7 @@ func (h *Handler) callUpstreamOnce(active *activeProvider, req AnthropicRequest,
 		url = an.MessagesURL(req.Model)
 		sendBody = an.PrepareBody(body, req.Model)
 	}
-	httpReq, err := http.NewRequest("POST", url, bytes.NewReader(sendBody))
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(sendBody))
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", errLocalPrep, err)
 	}
@@ -1490,15 +1468,21 @@ const maxProviderAttempts = 3
 // isRetryableStatus reports whether an upstream HTTP status should trigger
 // failover to the next provider in the chain (rate-limit / transient errors).
 func isRetryableStatus(code int) bool {
+	if isKeyLimitStatus(code) {
+		return true
+	}
 	switch code {
-	case http.StatusTooManyRequests, // 429
-		http.StatusInternalServerError, // 500
-		http.StatusBadGateway,          // 502
-		http.StatusServiceUnavailable,  // 503
-		http.StatusGatewayTimeout:      // 504
+	case http.StatusInternalServerError, // 500
+		http.StatusBadGateway,         // 502
+		http.StatusServiceUnavailable, // 503
+		http.StatusGatewayTimeout:     // 504
 		return true
 	}
 	return false
+}
+
+func isKeyLimitStatus(code int) bool {
+	return code == http.StatusPaymentRequired || code == http.StatusTooManyRequests
 }
 
 // ─── Budget tracking ───────────────────────────────────────────────────────

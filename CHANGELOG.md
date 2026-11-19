@@ -1,3 +1,10 @@
+## Unreleased
+
+- Fixed sticky failover for both chat endpoints. Known models route only to
+  providers that offer them. HTTP 402 and 429 rotate or cool the responding
+  key, and a successful fallback stays selected for that model after another
+  provider recovers.
+
 ## v0.9.0
 
 - **Real model list and id-aware routing:** `GET /v1/models` now returns the

@@ -350,7 +350,7 @@ func TestUsageEvent_ProbeSuccessAnd429(t *testing.T) {
 		ap.keys = []string{"onlykey"}
 		ap.cool = make([]time.Time, 1)
 		ap.backoff = make([]time.Duration, 1)
-		h.coolKey(ap, name, 0, initialKeyBackoff)
+		h.coolKey(ap, name, 0, initialKeyBackoff, probeTarget{})
 		ap.cool[0] = time.Now().Add(-time.Millisecond) // due for a probe
 	}
 
@@ -405,7 +405,7 @@ func TestUsageEvent_ProbeTransportError(t *testing.T) {
 	ap.keys = []string{"onlykey"}
 	ap.cool = make([]time.Time, 1)
 	ap.backoff = make([]time.Duration, 1)
-	h.coolKey(ap, "dead", 0, initialKeyBackoff)
+	h.coolKey(ap, "dead", 0, initialKeyBackoff, probeTarget{})
 	ap.cool[0] = time.Now().Add(-time.Millisecond)
 
 	h.probeCoolingKeys()
