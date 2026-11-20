@@ -4,6 +4,7 @@
 package providers
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -43,9 +44,12 @@ const (
 // provider's own order, trimmed, without blanks, and capped at maxListedModels.
 //
 // A provider that cannot list its models returns ErrNoModelList; any other
-// error means the listing was attempted and failed. ListModels does not retry
-// or cache — the caller owns both.
+// error means the listing failed. The caller owns caching and scheduling.
 func ListModels(p Provider, apiKey string) ([]string, error) {
+	return ListModelsContext(context.Background(), p, apiKey)
+}
+
+func ListModelsContext(ctx context.Context, p Provider, apiKey string) ([]string, error) {
 	if p == nil {
 		return nil, errors.New("list models: nil provider")
 	}
@@ -53,7 +57,11 @@ func ListModels(p Provider, apiKey string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	return spec.fetch()
+	spec.source = BearerSourceFor(p)
+	if spec.source != nil {
+		spec.origin = p.BaseURL()
+	}
+	return spec.fetch(ctx)
 }
 
 // modelListSpec is one provider family's listing recipe: where to ask, how to
@@ -66,6 +74,8 @@ type modelListSpec struct {
 	header map[string]string // family-specific auth headers
 	paging *pagination       // nil for a family that answers in one page
 	parse  func([]byte) (modelPage, error)
+	source BearerSource
+	origin string
 }
 
 // pagination describes how a paginated family continues past its first page.
@@ -190,10 +200,10 @@ func unwrapOverridden(p Provider) Provider {
 // fetch performs the listing and returns its ids. A single-page family makes
 // exactly one request; a paginated family walks its cursor under the bounds
 // documented on fetchPages.
-func (s modelListSpec) fetch() ([]string, error) {
+func (s modelListSpec) fetch(ctx context.Context) ([]string, error) {
 	client := &http.Client{Timeout: modelListTimeout}
 	if s.paging == nil {
-		body, err := s.get(client, s.url)
+		body, err := s.get(ctx, client, s.url)
 		if err != nil {
 			return nil, err
 		}
@@ -203,14 +213,14 @@ func (s modelListSpec) fetch() ([]string, error) {
 		}
 		return cleanModelIDs(page.ids), nil
 	}
-	return s.fetchPages(client)
+	return s.fetchPages(ctx, client)
 }
 
 // fetchPages walks a paginated listing. The walk is bounded three ways so a
 // misbehaving endpoint cannot loop forever: at most maxModelListPages requests,
 // at most maxListedModels ids, and a stop as soon as a page contributes no id
 // it has not already returned or its cursor does not advance.
-func (s modelListSpec) fetchPages(client *http.Client) ([]string, error) {
+func (s modelListSpec) fetchPages(ctx context.Context, client *http.Client) ([]string, error) {
 	var (
 		out  []string
 		seen = make(map[string]struct{})
@@ -221,7 +231,7 @@ func (s modelListSpec) fetchPages(client *http.Client) ([]string, error) {
 		if err != nil {
 			return nil, fmt.Errorf("list models: %s: %w", s.label, withoutURL(err))
 		}
-		body, err := s.get(client, pageURL)
+		body, err := s.get(ctx, client, pageURL)
 		if err != nil {
 			return nil, err
 		}
@@ -244,8 +254,8 @@ func (s modelListSpec) fetchPages(client *http.Client) ([]string, error) {
 
 // get performs one listing request and returns its body, read under
 // maxModelListBytes per response.
-func (s modelListSpec) get(client *http.Client, u string) ([]byte, error) {
-	req, err := http.NewRequest(http.MethodGet, u, nil)
+func (s modelListSpec) get(ctx context.Context, client *http.Client, u string) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return nil, fmt.Errorf("list models: %s: %w", s.label, withoutURL(err))
 	}
@@ -258,7 +268,16 @@ func (s modelListSpec) get(client *http.Client, u string) ([]byte, error) {
 		}
 	}
 
-	resp, err := client.Do(req)
+	var resp *http.Response
+	if s.source != nil {
+		resp, err = CallWithBearer(ctx, s.source, func(token string) (*http.Response, error) {
+			authorized := req.Clone(ctx)
+			authorized.Header.Set("Authorization", "Bearer "+token)
+			return DoRenewableRequest(client, s.origin, authorized)
+		}, nil)
+	} else {
+		resp, err = client.Do(req)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("list models: %s: %w", s.label, withoutURL(err))
 	}

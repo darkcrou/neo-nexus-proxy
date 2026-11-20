@@ -59,6 +59,7 @@ type modelCatalog struct {
 // catalogEntry is one provider's last known state in the catalog.
 type catalogEntry struct {
 	models     []string
+	revision   string    // login that supplied this subscription catalog
 	fetchedAt  time.Time // when models/err were last established — by a success or a failure
 	discovered bool      // at least one non-empty upstream listing has been received
 	// err holds a retryable listing failure and nothing else: it is the marker
@@ -203,12 +204,27 @@ func (c *modelCatalog) refreshAll(ctx context.Context) {
 		if ap == nil {
 			continue
 		}
+		var revision string
+		if ap.qwenSession != nil {
+			status, err := ap.qwenSession.Status(ctx)
+			if err != nil {
+				log.Warn().Str("provider", name).Err(err).Msg("Could not read session for model discovery")
+				continue
+			}
+			revision = status.Revision
+		}
 
 		c.mu.Lock()
 		e := c.entries[name]
 		if e == nil {
 			e = &catalogEntry{}
 			c.entries[name] = e
+		}
+		if !e.inflight && ap.qwenSession != nil && revision != e.revision {
+			// A new login supplies a different catalog. Token rotation leaves
+			// the revision and last good listing intact.
+			*e = catalogEntry{revision: revision}
+			c.rt.SetProviderModels(name, nil)
 		}
 		if !c.dueLocked(e, c.now()) {
 			c.mu.Unlock()
@@ -224,6 +240,15 @@ func (c *modelCatalog) refreshAll(ctx context.Context) {
 		// listing fails and backs off like any other failure.
 		key := ap.discoveryKey()
 		ids, err := c.listModels(ap.impl, key)
+		if ap.qwenSession != nil {
+			status, readErr := ap.qwenSession.Status(ctx)
+			if readErr != nil || status.Revision != revision {
+				c.mu.Lock()
+				e.inflight = false
+				c.mu.Unlock()
+				continue
+			}
+		}
 
 		c.mu.Lock()
 		e.inflight = false

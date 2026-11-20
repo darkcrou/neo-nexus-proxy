@@ -12,6 +12,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -20,6 +21,7 @@ import (
 
 	"github.com/lynuxis2026-pixel/nexus-proxy/internal/config"
 	"github.com/lynuxis2026-pixel/nexus-proxy/internal/providers"
+	"github.com/lynuxis2026-pixel/nexus-proxy/internal/qwen"
 	"github.com/lynuxis2026-pixel/nexus-proxy/internal/router"
 	"github.com/lynuxis2026-pixel/nexus-proxy/internal/storage"
 )
@@ -36,9 +38,10 @@ type EventPublisher interface {
 // non-cooling one — so a pool of free-tier keys behaves like one larger free
 // quota, without needlessly spreading load across keys that are still fine.
 type activeProvider struct {
-	impl     providers.Provider
-	apiKey   string // primary key (keys[0]) — used for health checks and single-key paths
-	modelMap map[string]string
+	impl        providers.Provider
+	apiKey      string // primary key (keys[0]) — used for health checks and single-key paths
+	modelMap    map[string]string
+	qwenSession *qwen.Service
 
 	mu           sync.Mutex
 	keys         []string
@@ -199,6 +202,7 @@ type Handler struct {
 	rules       []config.Rule  // declarative routing overrides
 	maxReqUSD   float64        // guardrail: downgrade a single request above this
 	stopHealth  chan struct{}
+	ownedQwen   *qwen.Service
 	catalog     *modelCatalog // cached provider model index; seeded even when warming is off
 
 	stickyMu sync.Mutex
@@ -253,9 +257,32 @@ func NewHandler(cfg *Config, db *storage.DB, broker EventPublisher) (*Handler, e
 	// configured ids. Configured models win; the family defaults are the fallback
 	// rung of the endpoint's ladder.
 	seedFor := make(map[string][]string, len(appCfg.Providers))
+	session := cfg.QwenSession
+	var ownedQwen *qwen.Service
 	for _, pc := range appCfg.Providers {
 		keys := resolveProviderKeys(pc)
 		key := keys[0]
+		var source providers.BearerSource
+		var subscription *qwen.Service
+		if strings.EqualFold(pc.Type, qwen.ProviderType) {
+			if pc.APIKey != "" || len(pc.APIKeys) != 0 || pc.BaseURL != "" {
+				log.Warn().Str("provider", pc.Name).Msg("Qwen subscription uses its own credentials and endpoint; remove api_key, api_keys and base_url")
+				continue
+			}
+			if session == nil {
+				path := cfg.ConfigPath
+				if path == "" {
+					path = config.DefaultPath()
+				}
+				session, err = qwen.Open(filepath.Dir(path))
+				if err != nil {
+					log.Warn().Err(err).Msg("Cannot open Qwen session; skipping provider")
+					continue
+				}
+				ownedQwen = session
+			}
+			subscription, source = session, session
+		}
 		impl, err := providers.New(providers.Spec{
 			Name:               pc.Name,
 			Type:               pc.Type,
@@ -274,6 +301,7 @@ func NewHandler(cfg *Config, db *storage.DB, broker EventPublisher) (*Handler, e
 			Region:             pc.Region,
 			Project:            pc.Project,
 			APIVersion:         pc.APIVersion,
+			QwenTokens:         source,
 		})
 		if err != nil {
 			log.Warn().Str("provider", pc.Name).Err(err).Msg("Skipping provider")
@@ -295,7 +323,7 @@ func NewHandler(cfg *Config, db *storage.DB, broker EventPublisher) (*Handler, e
 		active[name] = &activeProvider{
 			impl: impl, apiKey: key, modelMap: pc.ModelMap, keys: keys,
 			cool: make([]time.Time, len(keys)), backoff: make([]time.Duration, len(keys)),
-			probeTargets: make([]probeTarget, len(keys)),
+			probeTargets: make([]probeTarget, len(keys)), qwenSession: subscription,
 		}
 		if len(pc.Models) > 0 {
 			seedFor[name] = pc.Models
@@ -337,6 +365,7 @@ func NewHandler(cfg *Config, db *storage.DB, broker EventPublisher) (*Handler, e
 		broker:     broker,
 		budget:     newBudgetTracker(budgetLimit, spentToday, alertWebhook, alertThreshold),
 		stopHealth: make(chan struct{}),
+		ownedQwen:  ownedQwen,
 	}
 	if !cfg.DisableCache {
 		semantic := cfg.SemanticCache || appCfg.Routing.SemanticCache
@@ -407,6 +436,11 @@ func (h *Handler) Close() error {
 	if h.stopHealth != nil {
 		close(h.stopHealth)
 		h.stopHealth = nil
+	}
+	if h.ownedQwen != nil {
+		err := h.ownedQwen.Close()
+		h.ownedQwen = nil
+		return err
 	}
 	return nil
 }
@@ -514,9 +548,11 @@ func (h *Handler) probeKey(active *activeProvider, name string, key dueKey) {
 func (h *Handler) requestKeyProbe(ctx context.Context, active *activeProvider, idx int, req AnthropicRequest) (status int, recovered bool) {
 	body, _ := json.Marshal(req)
 	start := time.Now()
-	resp, err := h.callUpstreamOnce(ctx, active, req, body, http.Header{}, active.keys[idx])
+	resp, err := h.sendToProvider(ctx, active, req, idx, 0, true, active.keys[idx], func(key string) (*http.Response, error) {
+		return h.callUpstreamOnce(ctx, active, req, body, http.Header{}, key)
+	})
 	if err != nil {
-		if !errors.Is(err, errLocalPrep) {
+		if !errors.Is(err, errLocalPrep) && !isQwenCredentialError(err) {
 			h.recordUsageEvent(active, req, false, 0, &attemptInfo{
 				keyIdx: idx, chainPos: 0, started: start, probe: true,
 				errText: "transport: " + err.Error(),
@@ -798,6 +834,7 @@ func (h *Handler) HandleMessages(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	var credentialError error
 	// Cheap-first cascade: try the cheapest capable provider, verify its output,
 	// and escalate to a stronger model only on failure. Falls through to the
 	// normal failover path if every cascade candidate is unreachable.
@@ -809,8 +846,12 @@ func (h *Handler) HandleMessages(w http.ResponseWriter, r *http.Request) {
 				cc = cheap
 			}
 		}
-		if len(cc) > 0 && h.serveCascade(w, r, req, body, startTime, complexity, cc) {
-			return
+		if len(cc) > 0 {
+			served, err := h.serveCascade(w, r, req, body, startTime, complexity, cc)
+			if served {
+				return
+			}
+			credentialError = err
 		}
 	}
 
@@ -824,12 +865,13 @@ func (h *Handler) HandleMessages(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	skipQwen := credentialError != nil
 	// Walk the chain, failing over to the next provider on transport errors and
 	// on retryable HTTP statuses (rate-limit / server errors). A provider's own
 	// 4xx (e.g. 401 bad key) is relayed to the client as-is.
 	for i, cand := range chain {
 		active := h.providers[cand.Name]
-		if active == nil {
+		if active == nil || (skipQwen && cand.Name == qwen.ProviderType) {
 			continue
 		}
 
@@ -845,8 +887,8 @@ func (h *Handler) HandleMessages(w http.ResponseWriter, r *http.Request) {
 		var att *attemptInfo
 		var err error
 		for attempt := 1; attempt <= maxProviderAttempts; attempt++ {
-			resp, att, err = h.callUpstream(active, req, body, r.Header, i+1)
-			if errors.Is(err, errProviderExhausted) || (err == nil && (isKeyLimitStatus(resp.StatusCode) || !isRetryableStatus(resp.StatusCode))) {
+			resp, att, err = h.callUpstream(r.Context(), active, req, body, r.Header, i+1)
+			if errors.Is(err, errProviderExhausted) || isQwenCredentialError(err) || (err == nil && (isKeyLimitStatus(resp.StatusCode) || !isRetryableStatus(resp.StatusCode))) {
 				break
 			}
 			if attempt == maxProviderAttempts {
@@ -865,6 +907,9 @@ func (h *Handler) HandleMessages(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if err != nil {
+			if isQwenCredentialError(err) {
+				credentialError = err
+			}
 			log.Warn().Str("provider", cand.Name).Err(err).Msg("Provider unreachable, trying next")
 			continue
 		}
@@ -905,6 +950,10 @@ func (h *Handler) HandleMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if credentialError != nil {
+		h.writeError(w, http.StatusServiceUnavailable, qwenCredentialMessage(credentialError))
+		return
+	}
 	h.writeError(w, http.StatusBadGateway, "all providers unreachable")
 }
 
@@ -948,26 +997,26 @@ var errLocalPrep = errors.New("nexus: local request preparation failed")
 // usage events here because no caller ever sees them. chainPos is the 1-based
 // position of this provider in the caller's chain, stamped onto every event
 // (rotations and retries of the same chain entry share its position).
-func (h *Handler) callUpstream(active *activeProvider, req AnthropicRequest, body []byte, origHeaders http.Header, chainPos int) (*http.Response, *attemptInfo, error) {
+func (h *Handler) callUpstream(ctx context.Context, active *activeProvider, req AnthropicRequest, body []byte, origHeaders http.Header, chainPos int) (*http.Response, *attemptInfo, error) {
 	_, customAuth := active.impl.(providers.Authorizer)
 	inheritsClientKey := !customAuth && !providers.IsOpenAICompatible(active.impl.Name())
-	return h.callWithKeys(active, req, chainPos, inheritsClientKey, func(key string) (*http.Response, error) {
-		return h.callUpstreamOnce(context.Background(), active, req, body, origHeaders, key)
+	return h.callWithKeys(ctx, active, req, chainPos, inheritsClientKey, func(key string) (*http.Response, error) {
+		return h.callUpstreamOnce(ctx, active, req, body, origHeaders, key)
 	})
 }
 
 // callWithKeys shares key cooldown, rotation and attempt accounting between
 // the converted request and the OpenAI gateway's raw pass-through.
-func (h *Handler) callWithKeys(active *activeProvider, req AnthropicRequest, chainPos int, inheritsClientKey bool, call func(string) (*http.Response, error)) (*http.Response, *attemptInfo, error) {
+func (h *Handler) callWithKeys(ctx context.Context, active *activeProvider, req AnthropicRequest, chainPos int, inheritsClientKey bool, call func(string) (*http.Response, error)) (*http.Response, *attemptInfo, error) {
 	key, idx, ok := active.pickKey()
 	if !ok {
 		return nil, nil, errProviderExhausted
 	}
 	for attempt := 1; ; attempt++ {
 		start := time.Now()
-		resp, err := call(key)
+		resp, err := h.sendToProvider(ctx, active, req, idx, chainPos, false, key, call)
 		if err != nil {
-			if !errors.Is(err, errLocalPrep) {
+			if !errors.Is(err, errLocalPrep) && !isQwenCredentialError(err) {
 				h.recordUsageEvent(active, req, req.Stream, 0, &attemptInfo{
 					keyIdx: idx, chainPos: chainPos, started: start,
 					errText: "transport: " + err.Error(),
@@ -1059,7 +1108,7 @@ func (h *Handler) callUpstreamOnce(ctx context.Context, active *activeProvider, 
 		}
 		httpReq.Header.Set("Content-Type", "application/json")
 		h.authorize(active, httpReq, payload, key)
-		return h.httpClient.Do(httpReq)
+		return h.doProviderRequest(active, httpReq)
 	}
 
 	// Anthropic-format providers (Anthropic, plus Bedrock/Vertex via AnthropicNative).
@@ -1105,7 +1154,7 @@ func (h *Handler) authorize(active *activeProvider, req *http.Request, body []by
 // client's (or the server env's) key, exactly like Sprint 1.
 func (h *Handler) forwardDirectAnthropic(w http.ResponseWriter, r *http.Request, req AnthropicRequest, body []byte, startTime time.Time, complexity router.Complexity) {
 	active := &activeProvider{impl: providers.NewAnthropic(""), apiKey: ""}
-	resp, att, err := h.callUpstream(active, req, body, r.Header, 1)
+	resp, att, err := h.callUpstream(r.Context(), active, req, body, r.Header, 1)
 	if err != nil {
 		log.Error().Err(err).Msg("Provider request failed")
 		h.writeError(w, http.StatusBadGateway, fmt.Sprintf("provider error: %v", err))

@@ -9,6 +9,7 @@ import (
 	"github.com/gorilla/mux"
 	"github.com/rs/zerolog/log"
 
+	"github.com/lynuxis2026-pixel/nexus-proxy/internal/qwen"
 	"github.com/lynuxis2026-pixel/nexus-proxy/internal/storage"
 )
 
@@ -29,6 +30,8 @@ type Config struct {
 	AlertWebhook   string  // Slack/Discord/generic webhook for budget alerts
 	AlertThreshold float64 // fraction of budget that triggers a warning (0 ⇒ 0.8)
 	MaxRequestUSD  float64 // guardrail: downgrade a single request estimated above this to free/local
+
+	QwenSession *qwen.Service
 }
 
 // Server is the main proxy server

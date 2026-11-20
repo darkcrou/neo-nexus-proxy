@@ -4,6 +4,7 @@
 package providers
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -150,7 +151,7 @@ func TestListModelsAnthropic(t *testing.T) {
 	}
 	spec.url = srv.URL
 
-	ids, err := spec.fetch()
+	ids, err := spec.fetch(context.Background())
 	if err != nil {
 		t.Fatalf("fetch: %v", err)
 	}
@@ -182,7 +183,7 @@ func TestListModelsGemini(t *testing.T) {
 	}
 	spec.url = srv.URL
 
-	ids, err := spec.fetch()
+	ids, err := spec.fetch(context.Background())
 	if err != nil {
 		t.Fatalf("fetch: %v", err)
 	}
@@ -232,7 +233,7 @@ func TestListModelsAnthropicPaginates(t *testing.T) {
 	}
 	spec.url = srv.URL
 
-	ids, err := spec.fetch()
+	ids, err := spec.fetch(context.Background())
 	if err != nil {
 		t.Fatalf("fetch: %v", err)
 	}
@@ -270,7 +271,7 @@ func TestListModelsGeminiPaginates(t *testing.T) {
 	}
 	spec.url = srv.URL + "?key=AIza-test+key"
 
-	ids, err := spec.fetch()
+	ids, err := spec.fetch(context.Background())
 	if err != nil {
 		t.Fatalf("fetch: %v", err)
 	}
@@ -302,7 +303,7 @@ func TestListModelsPaginationStopsOnRepeatedCursor(t *testing.T) {
 	}
 	spec.url = srv.URL
 
-	ids, err := spec.fetch()
+	ids, err := spec.fetch(context.Background())
 	if err != nil {
 		t.Fatalf("fetch: %v", err)
 	}
@@ -326,7 +327,7 @@ func TestListModelsPaginationStopsOnRepeatedIDs(t *testing.T) {
 	}
 	spec.url = srv.URL
 
-	ids, err := spec.fetch()
+	ids, err := spec.fetch(context.Background())
 	if err != nil {
 		t.Fatalf("fetch: %v", err)
 	}
@@ -350,7 +351,7 @@ func TestListModelsPaginationCapsPages(t *testing.T) {
 	}
 	spec.url = srv.URL
 
-	ids, err := spec.fetch()
+	ids, err := spec.fetch(context.Background())
 	if err != nil {
 		t.Fatalf("fetch: %v", err)
 	}
@@ -383,7 +384,7 @@ func TestListModelsPaginationCapsTotal(t *testing.T) {
 	}
 	spec.url = srv.URL
 
-	ids, err := spec.fetch()
+	ids, err := spec.fetch(context.Background())
 	if err != nil {
 		t.Fatalf("fetch: %v", err)
 	}
@@ -429,7 +430,7 @@ func TestListModelsSinglePageFamiliesSendNoPagingParams(t *testing.T) {
 	}
 	t.Run("groq", func(t *testing.T) {
 		before := len(requests())
-		if _, err := groqSpec.fetch(); err != nil {
+		if _, err := groqSpec.fetch(context.Background()); err != nil {
 			t.Fatalf("fetch: %v", err)
 		}
 		reqs := requests()[before:]
@@ -456,7 +457,7 @@ func TestListModelsGeminiErrorHidesKey(t *testing.T) {
 	}
 	spec.url = srv.URL + "?key=AIzaVerySecretKey"
 
-	_, err = spec.fetch()
+	_, err = spec.fetch(context.Background())
 	if err == nil {
 		t.Fatal("expected an error for a 500 response")
 	}
@@ -689,7 +690,7 @@ func TestListModelsTransportErrorHidesKey(t *testing.T) {
 	}
 	spec.url = closedURL + "/v1beta/models?key=AIzaVerySecretKey"
 
-	_, err = spec.fetch()
+	_, err = spec.fetch(context.Background())
 	if err == nil {
 		t.Fatal("expected an error when the listing endpoint is unreachable")
 	}

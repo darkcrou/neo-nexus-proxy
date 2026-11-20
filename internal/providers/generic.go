@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+
+	"github.com/lynuxis2026-pixel/nexus-proxy/internal/qwen"
 )
 
 // Spec is a fully-described provider built from configuration.
@@ -23,9 +25,10 @@ type Spec struct {
 	OffPeakOutputPer1M float64
 	OffPeakStartUTC    int
 	OffPeakEndUTC      int
-	Region      string // AWS Bedrock / Google Vertex
-	Project     string // Google Vertex
-	APIVersion  string // Azure OpenAI
+	Region             string // AWS Bedrock / Google Vertex
+	Project            string // Google Vertex
+	APIVersion         string // Azure OpenAI
+	QwenTokens         BearerSource
 }
 
 // hasOffPeak reports whether the spec defines an off-peak window.
@@ -77,6 +80,12 @@ func New(spec Spec) (Provider, error) {
 		return newVertex(spec)
 	case "bedrock":
 		return newBedrock(spec)
+	case qwen.ProviderType:
+		if spec.APIKey != "" || spec.BaseURL != "" {
+			return nil, fmt.Errorf("%s uses its own session and gateway; remove api_key, api_keys and base_url", qwen.ProviderType)
+		}
+		spec.Name, spec.BaseURL = qwen.ProviderType, qwen.GatewayURL
+		return &qwenProvider{Generic: newGeneric(spec), tokens: spec.QwenTokens}, nil
 	}
 	if IsGenericType(spec.Type) {
 		if spec.BaseURL == "" {
@@ -97,6 +106,21 @@ func New(spec Spec) (Provider, error) {
 		return &overridden{Provider: base, spec: spec}, nil
 	}
 	return base, nil
+}
+
+type qwenProvider struct {
+	*Generic
+	tokens BearerSource
+}
+
+func (p *qwenProvider) BearerSource() BearerSource { return p.tokens }
+
+func (p *qwenProvider) HealthCheck() error {
+	if p.tokens == nil {
+		return qwen.ErrSignInRequired
+	}
+	_, err := ListModels(p, "")
+	return err
 }
 
 // ─── overridden: a built-in provider with config overrides applied ──────────

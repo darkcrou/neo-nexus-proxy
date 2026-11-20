@@ -22,10 +22,11 @@ import (
 // Upstream calls are forced non-streaming so the response can be buffered and
 // verified; if the client asked to stream, the accepted response is re-streamed
 // to it from the buffer by the standard relays.
-func (h *Handler) serveCascade(w http.ResponseWriter, r *http.Request, req AnthropicRequest, body []byte, startTime time.Time, complexity router.Complexity, chain []*router.Provider) bool {
+func (h *Handler) serveCascade(w http.ResponseWriter, r *http.Request, req AnthropicRequest, body []byte, startTime time.Time, complexity router.Complexity, chain []*router.Provider) (bool, error) {
 	ureq := req
 	ureq.Stream = false
 	noStreamBody := setStreamFalse(body)
+	var credentialError error
 
 	for i, cand := range chain {
 		active := h.providers[cand.Name]
@@ -34,8 +35,11 @@ func (h *Handler) serveCascade(w http.ResponseWriter, r *http.Request, req Anthr
 		}
 		last := i == len(chain)-1
 
-		resp, att, err := h.callUpstream(active, ureq, noStreamBody, r.Header, i+1)
+		resp, att, err := h.callUpstream(r.Context(), active, ureq, noStreamBody, r.Header, i+1)
 		if err != nil {
+			if isQwenCredentialError(err) {
+				credentialError = err
+			}
 			log.Warn().Str("provider", cand.Name).Err(err).Msg("cascade: provider unreachable, escalating")
 			continue
 		}
@@ -46,7 +50,7 @@ func (h *Handler) serveCascade(w http.ResponseWriter, r *http.Request, req Anthr
 			h.router.RecordOutcome(active.impl.Name(), complexity, false)
 			if last {
 				h.relayBuffered(w, active, req, raw, resp, startTime, complexity, att)
-				return true
+				return true, nil
 			}
 			// erroring cascade step the client never sees — its attempt is
 			// still real consumption, so record it with whatever usage it reported
@@ -70,9 +74,9 @@ func (h *Handler) serveCascade(w http.ResponseWriter, r *http.Request, req Anthr
 			log.Info().Str("provider", cand.Name).Str("complexity", complexity.String()).Msg("cascade: cheap model accepted ✓")
 		}
 		h.relayBuffered(w, active, req, raw, resp, startTime, complexity, att)
-		return true
+		return true, nil
 	}
-	return false
+	return false, credentialError
 }
 
 // relayBuffered serves a fully-buffered upstream response, reusing the standard

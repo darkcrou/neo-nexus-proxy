@@ -126,6 +126,7 @@ func (h *Handler) HandleChatCompletions(w http.ResponseWriter, r *http.Request) 
 		}
 	}
 
+	var credentialError error
 	for i, cand := range chain {
 		active := h.providers[cand.Name]
 		if active == nil {
@@ -138,15 +139,18 @@ func (h *Handler) HandleChatCompletions(w http.ResponseWriter, r *http.Request) 
 		var err error
 		if openAI {
 			// High-fidelity pass-through: forward the original OpenAI body (model swapped).
-			resp, att, err = h.callWithKeys(active, areq, i+1, false, func(key string) (*http.Response, error) {
+			resp, att, err = h.callWithKeys(r.Context(), active, areq, i+1, false, func(key string) (*http.Response, error) {
 				return h.callOpenAIPassthrough(r.Context(), active, rawMap, areq, key)
 			})
 		} else {
 			// Anthropic-format provider: convert OpenAI → Anthropic, then back to OpenAI.
 			abody, _ := json.Marshal(areq)
-			resp, att, err = h.callUpstream(active, areq, abody, r.Header, i+1)
+			resp, att, err = h.callUpstream(r.Context(), active, areq, abody, r.Header, i+1)
 		}
 		if err != nil {
+			if isQwenCredentialError(err) {
+				credentialError = err
+			}
 			log.Warn().Str("provider", cand.Name).Err(err).Msg("Provider unreachable, trying next")
 			continue
 		}
@@ -167,6 +171,10 @@ func (h *Handler) HandleChatCompletions(w http.ResponseWriter, r *http.Request) 
 		default:
 			h.relayAnthropicToOpenAI(w, active, areq, oreq, resp, startTime, complexity, att)
 		}
+		return
+	}
+	if credentialError != nil {
+		h.writeOpenAIError(w, http.StatusServiceUnavailable, qwenCredentialMessage(credentialError))
 		return
 	}
 	h.writeOpenAIError(w, http.StatusBadGateway, "all providers unreachable")
@@ -250,7 +258,7 @@ func (h *Handler) callOpenAIPassthrough(ctx context.Context, active *activeProvi
 	}
 	req.Header.Set("Content-Type", "application/json")
 	h.authorize(active, req, payload, key)
-	return h.httpClient.Do(req)
+	return h.doProviderRequest(active, req)
 }
 
 // ─── relays (OpenAI out) ────────────────────────────────────────────────────
