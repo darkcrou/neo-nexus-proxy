@@ -167,3 +167,26 @@ func TestRefreshCooldownAndDeadGrant(t *testing.T) {
 		t.Fatalf("replacement login not picked up: %v", err)
 	}
 }
+
+func TestTransientRefreshHonorsRetryAfter(t *testing.T) {
+	ctx := context.Background()
+	var calls atomic.Int32
+	server := signInServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Retry-After", "60")
+		w.WriteHeader(http.StatusServiceUnavailable)
+	})
+	s := openTestService(t, t.TempDir(), server)
+	if err := s.FinishLogin(ctx, beginForTest(t, s)); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	s.now = func() time.Time { return now }
+	if _, err := s.Token(ctx, "first-access"); !errors.Is(err, ErrRefresh) {
+		t.Fatal(err)
+	}
+	now = now.Add(30 * time.Second)
+	if _, err := s.Token(ctx, "first-access"); !errors.Is(err, ErrRefresh) || calls.Load() != 1 {
+		t.Fatalf("refresh ignored Retry-After: %v, calls %d", err, calls.Load())
+	}
+}

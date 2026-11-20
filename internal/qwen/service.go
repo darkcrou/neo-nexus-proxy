@@ -230,6 +230,9 @@ func (s *Service) recordRefreshFailure(ctx context.Context, tx *sql.Tx, cause er
 	failure, retryAt, result := "transient", s.now().Add(5*time.Second).UnixMilli(), ErrRefresh
 	var response *oauthError
 	if errors.As(cause, &response) {
+		if response.retryAfter > 0 {
+			retryAt = s.now().Add(response.retryAfter).UnixMilli()
+		}
 		switch {
 		case response.code == "invalid_grant" || response.code == "access_denied" || response.code == "expired_token":
 			failure, retryAt, result = "sign_in", int64(0), ErrSignInRequired

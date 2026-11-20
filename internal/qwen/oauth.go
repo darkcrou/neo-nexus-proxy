@@ -165,7 +165,7 @@ func (s *Service) pollDeviceCode(ctx context.Context, flow Flow) (tokenResponse,
 		}
 		switch {
 		case response.code == "authorization_pending":
-			delay = interval
+			delay = max(interval, response.retryAfter)
 		case response.code == "slow_down":
 			interval += 5 * time.Second
 			delay = max(interval, response.retryAfter)
