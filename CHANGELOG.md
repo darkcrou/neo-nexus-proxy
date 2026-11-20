@@ -1,5 +1,7 @@
 ## Unreleased
 
+- Add Qwen Code subscription sign-in from the dashboard or terminal, with
+  automatic token refresh and model discovery through the existing sticky router.
 - Fixed sticky failover for both chat endpoints. Known models route only to
   providers that offer them. HTTP 402 and 429 rotate or cool the responding
   key, and a successful fallback stays selected for that model after another

@@ -115,6 +115,43 @@ docker run --rm -v "$(pwd)/data:/home/nexus/.nexus" \
 docker compose restart nexus
 ```
 
+### Qwen Code subscription
+
+For dashboard sign-in, set `NEXUS_DASHBOARD_ADMIN_TOKEN` in the Compose `.env`
+file to a private operator secret. Recreate the service with `docker compose up -d`
+to apply the environment change. Open the dashboard and choose **Connect Qwen**.
+Enter that operator token, start Qwen sign-in, and open **Approve on Qwen** in
+your browser. Return to the dashboard to see the result. Use the dashboard over
+HTTPS or through an SSH tunnel when connecting from another machine.
+
+To sign in from a terminal, use the same NEXUS image and data mount as the service.
+Open the URL printed by the command and approve it in your browser.
+
+```bash
+docker compose run --rm nexus auth qwen-subscription
+```
+
+Both sign-in paths save the session and add `qwen-subscription` to `config.toml`
+if needed. To declare the provider yourself, use this entry and sign in through
+either path.
+
+```toml
+[[providers]]
+name = "qwen-subscription"
+type = "qwen-subscription"
+```
+
+After adding the provider for the first time, run `docker compose restart nexus`.
+The dashboard shows whether models are ready. With catalog discovery enabled,
+clients can list the subscription's model IDs at `/v1/models` and request those
+IDs through the proxy. A running proxy with Qwen loaded adopts a successful
+re-login automatically.
+
+Keep the `qwen/` subdirectory of the NEXUS data mount private. It contains the
+subscription's active credentials. NEXUS refreshes and saves those credentials
+automatically. If the session needs a new sign-in, use **Connect Qwen** or the
+same terminal command again.
+
 ## Diagnostics without a shell
 
 The final image is `distroless` — no shell, no coreutils, smaller attack
