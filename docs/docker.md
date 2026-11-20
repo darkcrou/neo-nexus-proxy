@@ -168,9 +168,9 @@ docker logs -f nexus              # live logs
 Data lives in `./data` on the host (config.toml + nexus.db), bind-mounted to
 `/home/nexus/.nexus`. Being a plain directory rather than a Docker-managed
 volume, it survives `docker compose down` / `up`, image rebuilds, container
-recreation, and even `docker compose down -v` — and it's trivial to back up
-(`cp -r data data.bak`) or put under its own version control if you want a
-history of your config changes.
+recreation, and `docker compose down -v`. Keep backups of the data directory
+private because they can contain API keys and Qwen session credentials. For
+config history, track a copy of `config.toml` with any secrets removed.
 
 Prefer a Docker-managed named volume instead (e.g. for portability across
 hosts, or to avoid the UID/GID setup above)? Swap the `volumes:` entry in
@@ -186,3 +186,6 @@ If you front NEXUS with Caddy, nginx, or similar for TLS on a home server,
 disable response buffering on the dashboard's SSE stream
 (`GET /events`) — buffering breaks live updates. For nginx:
 `proxy_buffering off;` on that location block.
+
+For dashboard Qwen sign-in behind a TLS proxy, preserve the browser-facing
+`Host` and set `X-Forwarded-Proto: https` on requests forwarded to NEXUS.
