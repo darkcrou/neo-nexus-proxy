@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte'
   import { Chart } from 'chart.js/auto'
-  import QwenConnection from './components/QwenConnection.svelte'
+  import ProvidersTab from './components/ProvidersTab.svelte'
   import UsageWindowDetails from './components/UsageWindowDetails.svelte'
   import {
     connectSSE, disconnectSSE, fetchInitial, fetchTimeseries, fetchSavings,
@@ -21,6 +21,21 @@
   $: shareUrl = `https://twitter.com/intent/tweet?text=${encodeURIComponent(shareText)}&url=${encodeURIComponent(REPO)}`
 
   const PALETTE = ['#7c3aed', '#06b6d4', '#10b981', '#f59e0b', '#ef4444', '#3b82f6', '#ec4899', '#84cc16', '#a855f7', '#14b8a6']
+
+  // ── Dashboard tabs ──
+  let tab: 'overview' | 'providers' = location.hash === '#providers' ? 'providers' : 'overview'
+  function switchTab(t: 'overview' | 'providers') {
+    tab = t
+    location.hash = t === 'providers' ? '#providers' : '#overview'
+  }
+  function syncTabFromHash() { tab = location.hash === '#providers' ? 'providers' : 'overview' }
+  function tabKey(e: KeyboardEvent) {
+    if (!['ArrowRight', 'ArrowLeft', 'Home', 'End'].includes(e.key)) return
+    e.preventDefault()
+    const next = e.key === 'Home' ? 'overview' : e.key === 'End' ? 'providers' : tab === 'overview' ? 'providers' : 'overview'
+    switchTab(next)
+    document.getElementById('tab-' + next)?.focus()
+  }
 
   // ── First-run setup wizard ──
   type Recommended = { name: string; tier: string; note: string }
@@ -93,7 +108,6 @@
   $: connectSnippet = setupStatus?.platform === 'windows'
     ? `$env:ANTHROPIC_BASE_URL = "http://localhost:${setupStatus?.proxy_port || 3000}"\n$env:ANTHROPIC_API_KEY  = "nexus-local"\nclaude`
     : `export ANTHROPIC_BASE_URL=http://localhost:${setupStatus?.proxy_port || 3000}\nexport ANTHROPIC_API_KEY=nexus-local\nclaude`
-  $: tierColor = (t: string) => ({ free: '#10b981', standard: '#06b6d4', premium: '#7c3aed' } as any)[t] || '#64748b'
 
   function copyText(t: string) { navigator.clipboard?.writeText(t) }
 
@@ -288,6 +302,7 @@
   const tickColor = '#64748b'
 
   onMount(() => {
+    window.addEventListener('hashchange', syncTabFromHash)
     loadSetup()
     fetchInitial()
     fetchUsage()
@@ -323,6 +338,7 @@
   })
 
   onDestroy(() => {
+    window.removeEventListener('hashchange', syncTabFromHash)
     disconnectSSE()
     clearInterval(poll)
     costChart?.destroy()
@@ -360,7 +376,6 @@
         <div class="setup-done">✓ Saved. Welcome to NEXUS.</div>
       {:else if setupStep === 0}
         <h2>Let's get you set up in 2 minutes</h2>
-        <QwenConnection />
         <p class="lead">
           NEXUS routes Claude Code, Cursor and aider to the cheapest capable model — without your code
           leaving your machine. Typical user saves <b style="color:#10b981">~$200+/month</b>.
@@ -370,6 +385,7 @@
           <li>🪜 Cheap-first cascade verifies cheap answers and only escalates on failure</li>
           <li>🧠 Adaptive routing learns which provider wins YOUR tasks</li>
         </ul>
+        <p class="hint">Have a Qwen Code subscription? Connect it anytime from the <b>Providers</b> tab.</p>
         <div class="setup-actions">
           <span></span>
           <button class="setup-cta" on:click={setupNext}>Let's go →</button>
@@ -449,6 +465,15 @@
 
 <header>
   <h1>NE<span>X</span>US</h1>
+  <!-- Section tabs: Overview keeps the live metrics, Providers manages the model sources -->
+  <div class="tabs" role="tablist" aria-label="Dashboard sections" tabindex="-1" on:keydown={tabKey}>
+    <button type="button" role="tab" id="tab-overview" class="tab" class:on={tab === 'overview'}
+            aria-selected={tab === 'overview'} aria-controls="panel-overview" tabindex={tab === 'overview' ? 0 : -1}
+            on:click={() => switchTab('overview')}>Overview</button>
+    <button type="button" role="tab" id="tab-providers" class="tab" class:on={tab === 'providers'}
+            aria-selected={tab === 'providers'} aria-controls="panel-providers" tabindex={tab === 'providers' ? 0 : -1}
+            on:click={() => switchTab('providers')}>Providers</button>
+  </div>
   <div class="header-right">
     <button class="pg-open" on:click={pgOpenChat} title="Pick any model and chat with it">💬 Playground</button>
     <div class="status" class:live={$connected}>
@@ -507,8 +532,11 @@
   </div>
 {/if}
 
-<main>
-  {#if !setupOpen}<QwenConnection />{/if}
+<!-- Overview stays mounted while hidden so the Chart.js canvases and their
+     resize observers survive tab switches. main doubles as the tab panel to
+     keep the page landmark. -->
+<!-- svelte-ignore a11y-no-noninteractive-element-to-interactive-role -->
+<main id="panel-overview" role="tabpanel" aria-labelledby="tab-overview" hidden={tab !== 'overview'}>
   {#if $savings.saved_usd > 0}
     <div class="savings">
       <div class="savings-msg">
@@ -713,6 +741,10 @@
   </div>
 </main>
 
+{#if tab === 'providers'}
+  <ProvidersTab />
+{/if}
+
 {#if inspecting}
   <div class="modal-bg" role="presentation" on:click={closeInspector}>
     <div class="modal" role="dialog" aria-modal="true" on:click|stopPropagation on:keydown|stopPropagation>
@@ -774,6 +806,11 @@
   header { display: flex; align-items: center; justify-content: space-between; max-width: 1100px; margin: 0 auto; padding: 28px 28px 0; }
   h1 { font-size: 34px; font-weight: 800; letter-spacing: -0.04em; color: #7c3aed; }
   h1 span { color: #06b6d4; }
+  .tabs { display: flex; gap: 4px; background: #0a0e1a; border: 1px solid #1a2035; border-radius: 8px; padding: 3px; }
+  .tab { background: transparent; border: 0; color: #64748b; font-size: 12px; font-weight: 600; padding: 6px 14px; border-radius: 6px; cursor: pointer; letter-spacing: 0.02em; }
+  .tab:hover { color: #e2e8f0; }
+  .tab.on { background: #7c3aed; color: #fff; }
+  .tab:focus-visible { outline: 2px solid #06b6d4; outline-offset: 2px; }
   .status { font-size: 11px; letter-spacing: 0.15em; color: #ef4444; display: flex; align-items: center; gap: 8px; text-transform: uppercase; }
   .status.live { color: #10b981; }
   .dot { width: 8px; height: 8px; border-radius: 50%; background: currentColor; box-shadow: 0 0 8px currentColor; }
@@ -993,6 +1030,10 @@
   .uw-detail { min-width: 0; margin: 5px 0 8px; background: #11182f; border: 1px solid #1a2035; border-radius: 6px; padding: 12px; }
 
   @media (max-width: 620px) {
+    header { flex-wrap: wrap; gap: 12px; padding: 20px 16px 0; }
+    .tabs { order: 3; width: 100%; }
+    .tab { flex: 1; min-height: 44px; }
+    main { padding: 16px 16px 32px; }
     .uw-row { grid-template-columns: 12px minmax(0, 1fr) auto auto; gap: 6px 8px; padding: 8px 10px; }
     .uw-chevron { grid-column: 1; grid-row: 1 / 4; }
     .uw-r-prov { grid-column: 2; grid-row: 1; }

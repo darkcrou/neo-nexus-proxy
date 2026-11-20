@@ -29,6 +29,16 @@ export interface ProviderStatus {
   name: string
   tier: string
   healthy: boolean
+  // Enriched fields from /api/providers (Providers tab). Optional so the
+  // overview chips keep working against the legacy shape.
+  family?: string
+  models?: string[]
+  model_source?: 'live' | 'configured' | 'defaults'
+  discovery?: 'ok' | 'pending' | 'unsupported' | 'failed' | 'off' | 'not_loaded'
+  base_url?: string
+  keys?: number
+  key_source?: 'config' | 'env' | 'none'
+  key_env?: string
 }
 
 export interface TimeBucket {

@@ -1,5 +1,12 @@
 ## Unreleased
 
+- **Providers tab:** the dashboard now has Overview / Providers tabs. The
+  Providers tab lists every configured provider with its tier, a credential
+  summary (key counts and env var names — never key values), and the models it
+  serves: live-discovered lists when available, falling back to configured
+  models and family defaults, each labeled with its source and discovery
+  state. The Qwen subscription connect button and status moved there as a
+  provider card and were removed from the overview page and the setup wizard.
 - Add Qwen Code subscription sign-in from the dashboard or terminal, with
   automatic token refresh and model discovery through the existing sticky router.
 - Fixed sticky failover for both chat endpoints. Known models route only to
