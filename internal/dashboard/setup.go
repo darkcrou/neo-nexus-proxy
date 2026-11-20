@@ -132,34 +132,36 @@ func (s *Server) handleSetupSave(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cfg := loadCfg()
 	saved := 0
 	if !req.Skip {
-		// Build a name→index map so we replace duplicates rather than appending.
-		idx := map[string]int{}
-		for i, p := range cfg.Providers {
-			idx[strings.ToLower(p.Name)] = i
-		}
-		for _, in := range req.Providers {
-			name := strings.ToLower(strings.TrimSpace(in.Name))
-			key := strings.TrimSpace(in.APIKey)
-			if name == "" || key == "" {
-				continue
+		err := config.Update("", func(cfg *config.Config) (bool, error) {
+			// Build a name→index map so we replace duplicates rather than appending.
+			idx := map[string]int{}
+			for i, p := range cfg.Providers {
+				idx[strings.ToLower(p.Name)] = i
 			}
-			// Reject unknown names so we don't silently write garbage.
-			if _, err := providers.FromConfig(name, "test", "", nil); err != nil {
-				continue
+			for _, in := range req.Providers {
+				name := strings.ToLower(strings.TrimSpace(in.Name))
+				key := strings.TrimSpace(in.APIKey)
+				if name == "" || key == "" {
+					continue
+				}
+				// Reject unknown names so we don't silently write garbage.
+				if _, err := providers.FromConfig(name, "test", "", nil); err != nil {
+					continue
+				}
+				p := config.Provider{Name: name, APIKey: key}
+				if i, ok := idx[name]; ok {
+					cfg.Providers[i] = p
+				} else {
+					cfg.Providers = append(cfg.Providers, p)
+					idx[name] = len(cfg.Providers) - 1
+				}
+				saved++
 			}
-			p := config.Provider{Name: name, APIKey: key}
-			if i, ok := idx[name]; ok {
-				cfg.Providers[i] = p
-			} else {
-				cfg.Providers = append(cfg.Providers, p)
-				idx[name] = len(cfg.Providers) - 1
-			}
-			saved++
-		}
-		if err := config.Save("", cfg); err != nil {
+			return true, nil
+		})
+		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -170,9 +172,9 @@ func (s *Server) handleSetupSave(w http.ResponseWriter, r *http.Request) {
 	_ = os.WriteFile(setupMarkerPath(), []byte("ok\n"), 0o644)
 
 	writeJSON(w, map[string]interface{}{
-		"ok":          true,
-		"saved":       saved,
-		"config_path": config.DefaultPath(),
+		"ok":           true,
+		"saved":        saved,
+		"config_path":  config.DefaultPath(),
 		"restart_hint": "restart NEXUS so the proxy picks up your new providers: `nexus start`",
 	})
 }

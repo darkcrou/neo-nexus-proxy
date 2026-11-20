@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte'
   import { Chart } from 'chart.js/auto'
+  import QwenConnection from './components/QwenConnection.svelte'
   import UsageWindowDetails from './components/UsageWindowDetails.svelte'
   import {
     connectSSE, disconnectSSE, fetchInitial, fetchTimeseries, fetchSavings,
@@ -359,6 +360,7 @@
         <div class="setup-done">✓ Saved. Welcome to NEXUS.</div>
       {:else if setupStep === 0}
         <h2>Let's get you set up in 2 minutes</h2>
+        <QwenConnection />
         <p class="lead">
           NEXUS routes Claude Code, Cursor and aider to the cheapest capable model — without your code
           leaving your machine. Typical user saves <b style="color:#10b981">~$200+/month</b>.
@@ -506,6 +508,7 @@
 {/if}
 
 <main>
+  {#if !setupOpen}<QwenConnection />{/if}
   {#if $savings.saved_usd > 0}
     <div class="savings">
       <div class="savings-msg">

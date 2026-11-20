@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -23,6 +24,7 @@ import (
 	"github.com/lynuxis2026-pixel/nexus-proxy/internal/license"
 	"github.com/lynuxis2026-pixel/nexus-proxy/internal/providers"
 	"github.com/lynuxis2026-pixel/nexus-proxy/internal/proxy"
+	"github.com/lynuxis2026-pixel/nexus-proxy/internal/qwen"
 	"github.com/lynuxis2026-pixel/nexus-proxy/internal/storage"
 )
 
@@ -182,6 +184,7 @@ func init() {
 
 	rootCmd.AddCommand(startCmd)
 	rootCmd.AddCommand(addCmd)
+	rootCmd.AddCommand(authCmd)
 	rootCmd.AddCommand(statusCmd)
 	rootCmd.AddCommand(logsCmd)
 	rootCmd.AddCommand(costCmd)
@@ -245,6 +248,17 @@ func runStart(cmd *cobra.Command, args []string) error {
 		MaxRequestUSD:     flagMaxRequestUSD,
 	}
 
+	adminToken := os.Getenv("NEXUS_DASHBOARD_ADMIN_TOKEN")
+	var qwenSession *qwen.Service
+	if !flagNoUI && adminToken != "" {
+		qwenSession, err = qwen.Open(filepath.Dir(config.DefaultPath()))
+		if err != nil {
+			log.Warn().Err(err).Msg("Dashboard Qwen sign-in unavailable")
+		} else {
+			defer qwenSession.Close()
+			cfg.QwenSession = qwenSession
+		}
+	}
 	proxySrv, err := proxy.New(cfg, db, broker)
 	if err != nil {
 		return fmt.Errorf("failed to create proxy server: %w", err)
@@ -258,6 +272,7 @@ func runStart(cmd *cobra.Command, args []string) error {
 	var dash *dashboard.Server
 	if !flagNoUI {
 		dash = dashboard.NewServer(flagDashboardPort, flagProxyPort, broker, db)
+		dash.ConfigureQwen(ctx, qwenSession, adminToken, config.DefaultPath(), proxySrv.QwenReadiness)
 		go func() {
 			if err := dash.Start(); err != nil && err != http.ErrServerClosed {
 				log.Error().Err(err).Msg("Dashboard server error")
@@ -327,12 +342,10 @@ func runAdd(cmd *cobra.Command, args []string) error {
 	}
 
 	path := config.DefaultPath()
-	cfg, err := config.Load(path)
-	if err != nil {
-		return err
-	}
-	cfg.Upsert(pc)
-	if err := config.Save(path, cfg); err != nil {
+	if err := config.Update(path, func(cfg *config.Config) (bool, error) {
+		cfg.Upsert(pc)
+		return true, nil
+	}); err != nil {
 		return err
 	}
 
@@ -361,7 +374,7 @@ func runStatus(cmd *cobra.Command, args []string) error {
 			color.Red("  ✗ %-11s %v", pc.Name, err)
 			continue
 		}
-		if herr := impl.HealthCheck(); herr != nil {
+		if herr := checkProviderHealth(pc, impl); herr != nil {
 			color.Red("  ● %-11s [%-8s] DOWN  (%v)", impl.Name(), impl.Tier(), herr)
 		} else {
 			color.Green("  ● %-11s [%-8s] OK", impl.Name(), impl.Tier())
@@ -430,7 +443,7 @@ func runDoctor(cmd *cobra.Command, args []string) error {
 			continue
 		}
 		start := time.Now()
-		hcErr := impl.HealthCheck()
+		hcErr := checkProviderHealth(pc, impl)
 		ms := time.Since(start).Milliseconds()
 		switch impl.Tier() {
 		case "free", "local":

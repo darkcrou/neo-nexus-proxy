@@ -26,6 +26,7 @@ type Server struct {
 	broker    *SSEBroker
 	db        *storage.DB
 	srv       *http.Server
+	qwen      *qwenSetup
 }
 
 // NewServer creates a new dashboard server. proxyPort is the proxy's port, used
@@ -51,6 +52,7 @@ func (s *Server) Start() error {
 // Routes builds the dashboard HTTP handler (router + CORS). Exposed for tests.
 func (s *Server) Routes() http.Handler {
 	r := mux.NewRouter()
+	s.qwen.routes(r)
 
 	// SSE endpoint — live updates.
 	if s.broker != nil {
@@ -98,6 +100,9 @@ func (s *Server) Routes() http.Handler {
 
 // Shutdown gracefully stops the dashboard server.
 func (s *Server) Shutdown() error {
+	if s.qwen != nil {
+		s.qwen.stop()
+	}
 	if s.srv == nil {
 		return nil
 	}
@@ -450,6 +455,10 @@ func writeJSONStatus(w http.ResponseWriter, status int, data interface{}) {
 
 func corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, qwenAPIPath) {
+			next.ServeHTTP(w, r)
+			return
+		}
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
