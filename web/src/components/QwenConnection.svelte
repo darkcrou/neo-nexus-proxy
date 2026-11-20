@@ -15,6 +15,7 @@
     const res = await fetch('/api/qwen/' + path, {
       method, headers: { Authorization: 'Bearer ' + token.trim() }, cache: 'no-store',
     })
+    if (res.status === 401) status = null
     if (res.status === 204) return undefined as T
     const result = await res.json()
     if (!res.ok) throw new Error(result.error || 'Could not reach the Qwen sign-in controls.')
@@ -39,7 +40,7 @@
       status = await request<Status>('status')
       if (!poll) {
         poll = setInterval(() => {
-          if (!panelOpen) return
+          if (!panelOpen || !status) return
           void act(async () => { status = await request<Status>('status') })
         }, 2500)
       }

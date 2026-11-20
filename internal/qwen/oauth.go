@@ -40,6 +40,7 @@ func (s *Service) form(ctx context.Context, path string, fields url.Values, outp
 
 func (s *Service) send(req *http.Request, output any) error {
 	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", "NEXUS")
 	resp, err := s.client.Do(req)
 	if err != nil {
 		if err := req.Context().Err(); err != nil {

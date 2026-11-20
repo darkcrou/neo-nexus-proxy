@@ -16,6 +16,10 @@ func Update(path string, edit func(*Config) (bool, error)) error {
 	if path == "" {
 		path = DefaultPath()
 	}
+	path, err := configTarget(path)
+	if err != nil {
+		return err
+	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
@@ -48,4 +52,27 @@ func Update(path string, edit func(*Config) (bool, error)) error {
 		return err
 	}
 	return os.Rename(temp.Name(), path)
+}
+
+// Follow file symlinks so an update preserves a dotfile-managed config link.
+// Stop at the final target even when the target file is still missing.
+func configTarget(path string) (string, error) {
+	for range 40 {
+		info, err := os.Lstat(path)
+		if os.IsNotExist(err) || (err == nil && info.Mode()&os.ModeSymlink == 0) {
+			return path, nil
+		}
+		if err != nil {
+			return "", err
+		}
+		target, err := os.Readlink(path)
+		if err != nil {
+			return "", err
+		}
+		if !filepath.IsAbs(target) {
+			target = filepath.Join(filepath.Dir(path), target)
+		}
+		path = target
+	}
+	return "", fmt.Errorf("too many symlinks resolving NEXUS config")
 }

@@ -190,3 +190,28 @@ func TestTransientRefreshHonorsRetryAfter(t *testing.T) {
 		t.Fatalf("refresh ignored Retry-After: %v, calls %d", err, calls.Load())
 	}
 }
+
+func TestCancelSignInKeepsExistingSession(t *testing.T) {
+	ctx := context.Background()
+	server := signInServer(t, func(http.ResponseWriter, *http.Request) {
+		t.Error("cancelled sign-in must not refresh credentials")
+	})
+	s := openTestService(t, t.TempDir(), server)
+	connected := beginForTest(t, s)
+	if err := s.FinishLogin(ctx, connected); err != nil {
+		t.Fatal(err)
+	}
+	if cancelled, err := s.CancelLogin(ctx, connected.ID); err != nil || cancelled {
+		t.Fatalf("completed flow cannot be cancelled: %v, %v", cancelled, err)
+	}
+	pending := beginForTest(t, s)
+	if cancelled, err := s.CancelLogin(ctx, pending.ID); err != nil || !cancelled {
+		t.Fatalf("cancel pending flow: %v, %v", cancelled, err)
+	}
+	if err := s.FinishLogin(ctx, pending); !errors.Is(err, ErrSuperseded) {
+		t.Fatal(err)
+	}
+	if status, err := s.Status(ctx); err != nil || !status.Connected || status.Revision != connected.ID {
+		t.Fatalf("existing sign-in was altered: %+v, %v", status, err)
+	}
+}

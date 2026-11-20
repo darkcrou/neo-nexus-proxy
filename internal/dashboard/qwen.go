@@ -22,6 +22,7 @@ const qwenAPIPath = "/api/qwen/"
 type qwenSession interface {
 	BeginLogin(context.Context) (qwen.Flow, error)
 	FinishLogin(context.Context, qwen.Flow) error
+	CancelLogin(context.Context, string) (bool, error)
 	Status(context.Context) (qwen.Status, error)
 }
 
@@ -165,6 +166,15 @@ func (q *qwenSetup) cancelFlow(w http.ResponseWriter, r *http.Request) {
 	defer q.mu.Unlock()
 	if q.flow == nil || q.flow.ID != mux.Vars(r)["id"] {
 		writeJSONStatus(w, http.StatusNotFound, map[string]string{"error": "This sign-in attempt has already ended."})
+		return
+	}
+	cancelled, err := q.session.CancelLogin(r.Context(), q.flow.ID)
+	if err != nil {
+		writeJSONStatus(w, http.StatusServiceUnavailable, map[string]string{"error": "Could not cancel Qwen sign-in. Try again."})
+		return
+	}
+	if !cancelled {
+		writeJSONStatus(w, http.StatusConflict, map[string]string{"error": "This sign-in attempt has already ended."})
 		return
 	}
 	q.cancel()

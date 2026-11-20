@@ -63,6 +63,9 @@ func DoRenewableRequest(client *http.Client, baseURL string, req *http.Request) 
 		req.URL.Host != origin.Host || req.URL.User != nil {
 		return nil, errors.New("renewable bearer request has an invalid destination")
 	}
+	if req.Header.Get("User-Agent") == "" {
+		req.Header.Set("User-Agent", "NEXUS")
+	}
 	noRedirects := *client
 	noRedirects.CheckRedirect = func(*http.Request, []*http.Request) error {
 		return errors.New("provider redirected a renewable bearer request")

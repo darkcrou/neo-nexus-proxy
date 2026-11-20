@@ -302,7 +302,18 @@ func (s *Service) BeginLogin(ctx context.Context) (Flow, error) {
 func (s *Service) clearAttempt(ctx context.Context, id string) {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 13*time.Second)
 	defer cancel()
-	s.db.ExecContext(ctx, "UPDATE qwen_session SET attempt = '' WHERE id = 1 AND attempt = ?", id)
+	_, _ = s.CancelLogin(ctx, id)
+}
+
+// CancelLogin invalidates a pending attempt. An approval that already
+// committed wins the race and leaves no attempt for cancellation to clear.
+func (s *Service) CancelLogin(ctx context.Context, id string) (bool, error) {
+	result, err := s.db.ExecContext(ctx, "UPDATE qwen_session SET attempt = '' WHERE id = 1 AND attempt = ?", id)
+	if err != nil {
+		return false, err
+	}
+	changed, err := result.RowsAffected()
+	return changed != 0, err
 }
 
 // FinishLogin polls the device grant and commits it only if the attempt is still current.

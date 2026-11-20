@@ -40,6 +40,10 @@ func (f *fakeQwenSession) Status(context.Context) (qwen.Status, error) {
 	return qwen.Status{}, nil
 }
 
+func (f *fakeQwenSession) CancelLogin(context.Context, string) (bool, error) {
+	return !f.connected.Load(), nil
+}
+
 func qwenRequest(h http.Handler, method, path, origin, token string) *httptest.ResponseRecorder {
 	r := httptest.NewRequest(method, "https://nexus.example/api/qwen/"+path, nil)
 	if origin != "" {
