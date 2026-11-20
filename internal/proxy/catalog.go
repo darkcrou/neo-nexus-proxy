@@ -55,6 +55,10 @@ type modelCatalog struct {
 	// discovery attempts: a provider with no listing endpoint fails before any
 	// request, so there is nothing on the wire to observe.
 	listModels func(providers.Provider, string) ([]string, error)
+
+	// warms records whether the background loop runs, so a read surface can
+	// tell "discovery pending" apart from "discovery switched off".
+	warms bool
 }
 
 // catalogEntry is one provider's last known state in the catalog.
@@ -155,6 +159,53 @@ func (c *modelCatalog) snapshot() []string {
 		}
 	}
 	return out
+}
+
+// CatalogProvider is one provider's last known catalog state, exported for
+// read-only surfaces outside the proxy (the dashboard's Providers tab). It
+// carries the list plus how it was established, so a reader can label the
+// models honestly instead of guessing.
+type CatalogProvider struct {
+	Name        string
+	Models      []string
+	Discovered  bool   // at least one non-empty upstream listing has landed
+	Unsupported bool   // provider exposes no listing endpoint, ever
+	Err         string // retryable listing failure; Models keeps the last good list
+	Warming     bool   // the background warm loop runs for this catalog
+}
+
+// providerSnapshot is snapshot's per-provider sibling: the same pure cache
+// read in the same registration order, but each provider's list and discovery
+// state kept separate instead of deduplicated into a union. Models are copies.
+func (c *modelCatalog) providerSnapshot() []CatalogProvider {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	out := make([]CatalogProvider, 0, len(c.order))
+	for _, name := range c.order {
+		e := c.entries[name]
+		if e == nil {
+			continue
+		}
+		out = append(out, CatalogProvider{
+			Name:        name,
+			Models:      append([]string(nil), e.models...),
+			Discovered:  e.discovered,
+			Unsupported: e.unsupported,
+			Err:         e.err,
+			Warming:     c.warms,
+		})
+	}
+	return out
+}
+
+// ProviderCatalog exposes per-provider catalog state to the dashboard adapter.
+// Like QwenReadiness it reads cached state only: it never triggers discovery
+// and never blocks beyond the catalog read lock.
+func (s *Server) ProviderCatalog() []CatalogProvider {
+	if s.handler == nil || s.handler.catalog == nil {
+		return nil
+	}
+	return s.handler.catalog.providerSnapshot()
 }
 
 // missing reports absence only when every provider has a usable live listing.
@@ -418,8 +469,9 @@ func (c *modelCatalog) run(ctx context.Context, stop <-chan struct{}) {
 // stopHealth channel, which Close closes exactly once.
 func (h *Handler) startCatalog(seedFor map[string][]string, cc config.Catalog, order []string) {
 	h.catalog = newModelCatalog(h.router, h.providers, order, catalogTTL(cc))
+	h.catalog.warms = catalogWarms(cc.Enabled, len(h.providers))
 	h.catalog.seed(seedFor)
-	if !catalogWarms(cc.Enabled, len(h.providers)) {
+	if !h.catalog.warms {
 		return
 	}
 	go h.catalog.run(context.Background(), h.stopHealth)

@@ -273,6 +273,17 @@ func runStart(cmd *cobra.Command, args []string) error {
 	if !flagNoUI {
 		dash = dashboard.NewServer(flagDashboardPort, flagProxyPort, broker, db)
 		dash.ConfigureQwen(ctx, qwenSession, adminToken, config.DefaultPath(), proxySrv.QwenReadiness)
+		dash.ConfigureCatalog(func() []dashboard.ProviderCatalogEntry {
+			src := proxySrv.ProviderCatalog()
+			out := make([]dashboard.ProviderCatalogEntry, len(src))
+			for i, e := range src {
+				out[i] = dashboard.ProviderCatalogEntry{
+					Name: e.Name, Models: e.Models, Discovered: e.Discovered,
+					Unsupported: e.Unsupported, Err: e.Err, Warming: e.Warming,
+				}
+			}
+			return out
+		})
 		go func() {
 			if err := dash.Start(); err != nil && err != http.ErrServerClosed {
 				log.Error().Err(err).Msg("Dashboard server error")

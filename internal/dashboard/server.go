@@ -16,6 +16,7 @@ import (
 	"github.com/gorilla/mux"
 
 	"github.com/lynuxis2026-pixel/nexus-proxy/internal/config"
+	"github.com/lynuxis2026-pixel/nexus-proxy/internal/providers"
 	"github.com/lynuxis2026-pixel/nexus-proxy/internal/storage"
 )
 
@@ -27,6 +28,7 @@ type Server struct {
 	db        *storage.DB
 	srv       *http.Server
 	qwen      *qwenSetup
+	catalog   func() []ProviderCatalogEntry
 }
 
 // NewServer creates a new dashboard server. proxyPort is the proxy's port, used
@@ -38,6 +40,25 @@ func NewServer(port, proxyPort int, broker *SSEBroker, db *storage.DB) *Server {
 		broker:    broker,
 		db:        db,
 	}
+}
+
+// ProviderCatalogEntry is one provider's live catalog state as supplied by the
+// proxy. The type lives here, not in the proxy package, so the dashboard stays
+// decoupled from proxy internals; cmd/nexus adapts between the two — the same
+// inversion ConfigureQwen uses.
+type ProviderCatalogEntry struct {
+	Name        string
+	Models      []string
+	Discovered  bool
+	Unsupported bool
+	Err         string
+	Warming     bool
+}
+
+// ConfigureCatalog installs the read-only per-provider catalog view before
+// Start. Without it, /api/providers falls back to the static config ladder.
+func (s *Server) ConfigureCatalog(catalog func() []ProviderCatalogEntry) {
+	s.catalog = catalog
 }
 
 // Start starts the dashboard HTTP server.
@@ -164,18 +185,124 @@ func (s *Server) handleRequests(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]interface{}{"requests": out, "total": len(out)})
 }
 
+// providerView is one row of GET /api/providers: config facts plus the models
+// the provider serves, honestly labeled with where the list came from. Key
+// material never appears here — only counts and environment variable names.
+type providerView struct {
+	Name        string   `json:"name"`
+	Tier        string   `json:"tier"`
+	Healthy     bool     `json:"healthy"`
+	Family      string   `json:"family"`
+	Models      []string `json:"models"`
+	ModelSource string   `json:"model_source"`
+	Discovery   string   `json:"discovery"`
+	BaseURL     string   `json:"base_url"`
+	Keys        int      `json:"keys"`
+	KeySource   string   `json:"key_source"`
+	KeyEnv      string   `json:"key_env,omitempty"`
+}
+
 func (s *Server) handleProviders(w http.ResponseWriter, r *http.Request) {
-	provs := []map[string]interface{}{}
-	if cfg, err := config.Load(config.DefaultPath()); err == nil {
-		for _, p := range cfg.Providers {
-			provs = append(provs, map[string]interface{}{
-				"name":    p.Name,
-				"tier":    p.Tier,
-				"healthy": true, // live health checks are surfaced via `nexus status`
-			})
+	cfg := loadCfg()
+
+	var byName map[string]ProviderCatalogEntry
+	if s.catalog != nil {
+		for _, e := range s.catalog() {
+			if byName == nil {
+				byName = make(map[string]ProviderCatalogEntry)
+			}
+			byName[e.Name] = e
 		}
 	}
+
+	provs := make([]providerView, 0, len(cfg.Providers))
+	for _, p := range cfg.Providers {
+		provs = append(provs, buildProviderView(p, byName))
+	}
 	writeJSON(w, map[string]interface{}{"providers": provs})
+}
+
+func buildProviderView(p config.Provider, byName map[string]ProviderCatalogEntry) providerView {
+	family := p.Type
+	if family == "" {
+		family = p.Name
+	}
+	tier := p.Tier
+	if tier == "" {
+		tier = providers.DefaultTier(family)
+	}
+
+	v := providerView{
+		Name:    p.Name,
+		Tier:    tier,
+		Healthy: true, // live health checks are surfaced via `nexus status`
+		Family:  family,
+		BaseURL: p.BaseURL,
+		Models:  []string{},
+	}
+
+	// The catalog is keyed by registry name: the family keyword for built-ins
+	// (which can differ from the operator's instance name, e.g. groq-us → groq),
+	// the instance name for config-driven providers. Try both.
+	entry, loaded := byName[p.Name]
+	if !loaded && p.Type != "" {
+		entry, loaded = byName[p.Type]
+	}
+
+	switch {
+	case loaded && len(entry.Models) > 0:
+		v.Models = entry.Models
+		if entry.Discovered {
+			v.ModelSource = "live"
+		} else if len(p.Models) > 0 {
+			v.ModelSource = "configured"
+		} else {
+			v.ModelSource = "defaults"
+		}
+	case len(p.Models) > 0:
+		v.Models = p.Models
+		v.ModelSource = "configured"
+	default:
+		if defaults := providers.DefaultModels(family); len(defaults) > 0 {
+			v.Models = defaults
+		}
+		v.ModelSource = "defaults"
+	}
+
+	switch {
+	case !loaded:
+		v.Discovery = "not_loaded"
+	case entry.Discovered:
+		v.Discovery = "ok"
+	case entry.Unsupported:
+		v.Discovery = "unsupported"
+	case entry.Err != "":
+		v.Discovery = "failed"
+	case !entry.Warming:
+		v.Discovery = "off"
+	default:
+		v.Discovery = "pending"
+	}
+
+	// Credential presence only: how many keys and where they come from. The
+	// pool wins over the single key, mirroring resolveProviderKeys in the proxy.
+	raw := p.APIKeys
+	if len(raw) == 0 && p.APIKey != "" {
+		raw = []string{p.APIKey}
+	}
+	v.Keys = len(raw)
+	v.KeySource = "none"
+	var envVars []string
+	for _, k := range raw {
+		if strings.HasPrefix(k, "env:") {
+			v.KeySource = "env"
+			envVars = append(envVars, strings.TrimPrefix(k, "env:"))
+		} else if v.KeySource != "env" {
+			v.KeySource = "config"
+		}
+	}
+	v.KeyEnv = strings.Join(envVars, ", ")
+	return v
 }
 
 // handleRequestDetail returns a single request including the captured prompt and
