@@ -30,12 +30,12 @@ var ErrBearerRejected = errors.New("upstream rejected the renewed credential")
 
 // CallWithBearer retries one unauthorized request. send builds a fresh request
 // on each call, and onReject can account for outgoing attempts before they are closed.
-func CallWithBearer(ctx context.Context, source BearerSource, send func(string) (*http.Response, error), onReject func(*http.Response)) (*http.Response, error) {
+func CallWithBearer(ctx context.Context, source BearerSource, retried *bool, send func(string) (*http.Response, error), onReject func(*http.Response)) (*http.Response, error) {
 	token, err := source.Token(ctx, "")
 	if err != nil {
 		return nil, err
 	}
-	for attempt := 0; ; attempt++ {
+	for {
 		resp, err := send(token)
 		if err != nil || resp.StatusCode != http.StatusUnauthorized {
 			return resp, err
@@ -44,9 +44,10 @@ func CallWithBearer(ctx context.Context, source BearerSource, send func(string) 
 			onReject(resp)
 		}
 		resp.Body.Close()
-		if attempt == 1 {
+		if *retried {
 			return nil, ErrBearerRejected
 		}
+		*retried = true
 		token, err = source.Token(ctx, token)
 		if err != nil {
 			return nil, err

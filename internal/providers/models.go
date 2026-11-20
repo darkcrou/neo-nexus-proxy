@@ -270,7 +270,8 @@ func (s modelListSpec) get(ctx context.Context, client *http.Client, u string) (
 
 	var resp *http.Response
 	if s.source != nil {
-		resp, err = CallWithBearer(ctx, s.source, func(token string) (*http.Response, error) {
+		retried := false
+		resp, err = CallWithBearer(ctx, s.source, &retried, func(token string) (*http.Response, error) {
 			authorized := req.Clone(ctx)
 			authorized.Header.Set("Authorization", "Bearer "+token)
 			return DoRenewableRequest(client, s.origin, authorized)

@@ -13,6 +13,7 @@ import (
 
 	"github.com/lynuxis2026-pixel/nexus-proxy/internal/config"
 	"github.com/lynuxis2026-pixel/nexus-proxy/internal/providers"
+	"github.com/lynuxis2026-pixel/nexus-proxy/internal/qwen"
 	"github.com/lynuxis2026-pixel/nexus-proxy/internal/router"
 )
 
@@ -204,14 +205,11 @@ func (c *modelCatalog) refreshAll(ctx context.Context) {
 		if ap == nil {
 			continue
 		}
-		var revision string
 		if ap.qwenSession != nil {
-			status, err := ap.qwenSession.Status(ctx)
-			if err != nil {
+			if err := c.syncQwenRevision(ctx); err != nil {
 				log.Warn().Str("provider", name).Err(err).Msg("Could not read session for model discovery")
 				continue
 			}
-			revision = status.Revision
 		}
 
 		c.mu.Lock()
@@ -220,17 +218,12 @@ func (c *modelCatalog) refreshAll(ctx context.Context) {
 			e = &catalogEntry{}
 			c.entries[name] = e
 		}
-		if !e.inflight && ap.qwenSession != nil && revision != e.revision {
-			// A new login supplies a different catalog. Token rotation leaves
-			// the revision and last good listing intact.
-			*e = catalogEntry{revision: revision}
-			c.rt.SetProviderModels(name, nil)
-		}
 		if !c.dueLocked(e, c.now()) {
 			c.mu.Unlock()
 			continue
 		}
 		e.inflight = true
+		revision := e.revision
 		c.mu.Unlock()
 
 		// Discovery must not perturb sticky key selection (D-7): peekKey reports
@@ -240,69 +233,115 @@ func (c *modelCatalog) refreshAll(ctx context.Context) {
 		// listing fails and backs off like any other failure.
 		key := ap.discoveryKey()
 		ids, err := c.listModels(ap.impl, key)
-		if ap.qwenSession != nil {
-			status, readErr := ap.qwenSession.Status(ctx)
-			if readErr != nil || status.Revision != revision {
-				c.mu.Lock()
-				e.inflight = false
-				c.mu.Unlock()
-				continue
+		if ap.qwenSession == nil {
+			c.publishListing(name, e, ids, err)
+			continue
+		}
+		published := false
+		readErr := ap.qwenSession.WithStatus(ctx, func(status qwen.Status) {
+			if status.Revision == revision {
+				c.publishListing(name, e, ids, err)
+				published = true
+			}
+		})
+		if !published {
+			c.mu.Lock()
+			e.inflight = false
+			c.mu.Unlock()
+			if readErr == nil {
+				_ = c.syncQwenRevision(ctx)
 			}
 		}
+	}
+}
 
+// syncQwenRevision removes IDs belonging to a previous login. It only reads
+// local state, so catalog and routing requests can use it without listing upstream.
+func (c *modelCatalog) syncQwenRevision(ctx context.Context) error {
+	if c == nil {
+		return nil
+	}
+	active := c.providers[qwen.ProviderType]
+	if active == nil || active.qwenSession == nil {
+		return nil
+	}
+	return active.qwenSession.WithStatus(ctx, func(status qwen.Status) {
 		c.mu.Lock()
-		e.inflight = false
-		switch {
-		case err == nil && len(ids) == 0:
-			// A successful listing of nothing is "nothing learned", not "nothing
-			// exists". An empty list is not evidence that previously reported ids
-			// stopped existing — a local Ollama with no model pulled answers
-			// /api/tags with exactly that — and the configured seed is the documented
-			// fallback. Wiping the entry and the router index here would advertise
-			// ids nothing serves, because the endpoint re-serves the seed from the
-			// config/default ladder while the router index had been cleared. Keep both
-			// untouched, but still clear the failure state and restamp, so the TTL
-			// cadence is unchanged.
-			e.err = ""
-			e.backoff = 0
-			e.fetchedAt = c.now()
-			c.mu.Unlock()
-			log.Debug().Str("provider", name).Msg("Model listing returned no models — keeping the known models")
-		case err == nil:
-			e.models = append([]string(nil), ids...)
-			e.discovered = true
-			e.err = ""
-			e.backoff = 0
-			// Lock order: modelCatalog.mu → Router.mu, safe for the reason given in
-			// seed. The entry and the router index are published as one unit, so a
-			// snapshot never names ids the router does not serve yet.
-			c.rt.SetProviderModels(name, ids)
-			// Stamped after the push, inside the same critical section: the recorded
-			// time then marks when the list became live, so a reader that sees these
-			// ids and this timestamp can rely on the router already serving them.
-			e.fetchedAt = c.now()
-			c.mu.Unlock()
-			log.Debug().Str("provider", name).Int("models", len(ids)).Msg("Model catalog refreshed")
-		case errors.Is(err, providers.ErrNoModelList):
-			// Nothing to fetch, ever: record it once and stop scheduling this
-			// provider. Its configured/seed list stays in the snapshot. The sentinel
-			// is logged, not stored in err, which is reserved for retryable failures;
-			// any earlier failure state is cleared because no retry is pending.
-			e.unsupported = true
-			e.err = ""
-			e.fetchedAt = c.now()
-			c.mu.Unlock()
-			log.Debug().Str("provider", name).Err(providers.ErrNoModelList).
-				Msg("Provider exposes no model listing — keeping its configured models")
-		default:
-			// Keep the last good list; the failure only affects the next attempt.
-			e.err = err.Error()
-			e.fetchedAt = c.now()
-			e.backoff = nextCatalogBackoff(e.backoff)
-			backoff := e.backoff
-			c.mu.Unlock()
-			log.Warn().Str("provider", name).Err(err).Dur("retry_in", backoff).Msg("Model listing failed — keeping the last known models")
+		defer c.mu.Unlock()
+		entry := c.entries[qwen.ProviderType]
+		if entry != nil && entry.revision != status.Revision {
+			// A first sign-in can use an operator's initial seeds until discovery.
+			if entry.revision == "" && !entry.discovered {
+				entry.revision = status.Revision
+				entry.fetchedAt = time.Time{}
+				return
+			}
+			*entry = catalogEntry{revision: status.Revision, inflight: entry.inflight}
+			active.mu.Lock()
+			for idx := range active.keys {
+				active.clearCooldownLocked(idx)
+			}
+			c.rt.SetHealthy(qwen.ProviderType, true)
+			active.mu.Unlock()
+			c.rt.SetProviderModels(qwen.ProviderType, nil)
 		}
+	})
+}
+
+func (c *modelCatalog) publishListing(name string, e *catalogEntry, ids []string, err error) {
+
+	c.mu.Lock()
+	e.inflight = false
+	switch {
+	case err == nil && len(ids) == 0:
+		// A successful listing of nothing is "nothing learned", not "nothing
+		// exists". An empty list is not evidence that previously reported ids
+		// stopped existing — a local Ollama with no model pulled answers
+		// /api/tags with exactly that — and the configured seed is the documented
+		// fallback. Wiping the entry and the router index here would advertise
+		// ids nothing serves, because the endpoint re-serves the seed from the
+		// config/default ladder while the router index had been cleared. Keep both
+		// untouched, but still clear the failure state and restamp, so the TTL
+		// cadence is unchanged.
+		e.err = ""
+		e.backoff = 0
+		e.fetchedAt = c.now()
+		c.mu.Unlock()
+		log.Debug().Str("provider", name).Msg("Model listing returned no models — keeping the known models")
+	case err == nil:
+		e.models = append([]string(nil), ids...)
+		e.discovered = true
+		e.err = ""
+		e.backoff = 0
+		// Lock order: modelCatalog.mu → Router.mu, safe for the reason given in
+		// seed. The entry and the router index are published as one unit, so a
+		// snapshot never names ids the router does not serve yet.
+		c.rt.SetProviderModels(name, ids)
+		// Stamped after the push, inside the same critical section: the recorded
+		// time then marks when the list became live, so a reader that sees these
+		// ids and this timestamp can rely on the router already serving them.
+		e.fetchedAt = c.now()
+		c.mu.Unlock()
+		log.Debug().Str("provider", name).Int("models", len(ids)).Msg("Model catalog refreshed")
+	case errors.Is(err, providers.ErrNoModelList):
+		// Nothing to fetch, ever: record it once and stop scheduling this
+		// provider. Its configured/seed list stays in the snapshot. The sentinel
+		// is logged, not stored in err, which is reserved for retryable failures;
+		// any earlier failure state is cleared because no retry is pending.
+		e.unsupported = true
+		e.err = ""
+		e.fetchedAt = c.now()
+		c.mu.Unlock()
+		log.Debug().Str("provider", name).Err(providers.ErrNoModelList).
+			Msg("Provider exposes no model listing — keeping its configured models")
+	default:
+		// Keep the last good list; the failure only affects the next attempt.
+		e.err = err.Error()
+		e.fetchedAt = c.now()
+		e.backoff = nextCatalogBackoff(e.backoff)
+		backoff := e.backoff
+		c.mu.Unlock()
+		log.Warn().Str("provider", name).Err(err).Dur("retry_in", backoff).Msg("Model listing failed — keeping the last known models")
 	}
 }
 

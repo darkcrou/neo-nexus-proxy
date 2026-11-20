@@ -111,6 +111,7 @@ func (h *Handler) HandleChatCompletions(w http.ResponseWriter, r *http.Request) 
 		h.writeOpenAIError(w, http.StatusBadGateway, "no providers configured — add one with `nexus add <provider> <key>`")
 		return
 	}
+	_ = h.catalog.syncQwenRevision(r.Context())
 	if h.unknownModel(oreq.Model) {
 		h.writeOpenAIError(w, http.StatusNotFound, "unknown model: "+oreq.Model)
 		return
@@ -127,6 +128,7 @@ func (h *Handler) HandleChatCompletions(w http.ResponseWriter, r *http.Request) 
 	}
 
 	var credentialError error
+	bearerRetried := false
 	for i, cand := range chain {
 		active := h.providers[cand.Name]
 		if active == nil {
@@ -139,13 +141,13 @@ func (h *Handler) HandleChatCompletions(w http.ResponseWriter, r *http.Request) 
 		var err error
 		if openAI {
 			// High-fidelity pass-through: forward the original OpenAI body (model swapped).
-			resp, att, err = h.callWithKeys(r.Context(), active, areq, i+1, false, func(key string) (*http.Response, error) {
+			resp, att, err = h.callWithKeys(r.Context(), active, areq, i+1, false, &bearerRetried, func(key string) (*http.Response, error) {
 				return h.callOpenAIPassthrough(r.Context(), active, rawMap, areq, key)
 			})
 		} else {
 			// Anthropic-format provider: convert OpenAI → Anthropic, then back to OpenAI.
 			abody, _ := json.Marshal(areq)
-			resp, att, err = h.callUpstream(r.Context(), active, areq, abody, r.Header, i+1)
+			resp, att, err = h.callUpstream(r.Context(), active, areq, abody, r.Header, i+1, &bearerRetried)
 		}
 		if err != nil {
 			if isQwenCredentialError(err) {
@@ -154,7 +156,7 @@ func (h *Handler) HandleChatCompletions(w http.ResponseWriter, r *http.Request) 
 			log.Warn().Str("provider", cand.Name).Err(err).Msg("Provider unreachable, trying next")
 			continue
 		}
-		if i < len(chain)-1 && h.shouldFailOver(resp.StatusCode, oreq.Model) {
+		if (i < len(chain)-1 || credentialError != nil) && h.shouldFailOver(resp.StatusCode, oreq.Model) {
 			h.recordUsageEvent(active, areq, oreq.Stream, resp.StatusCode, att, rawUsage{})
 			resp.Body.Close()
 			log.Warn().Str("provider", cand.Name).Int("status", resp.StatusCode).Msg("Retryable error, failing over")
@@ -226,6 +228,7 @@ func (h *Handler) modelIDs() []string {
 // from cache and never triggers discovery — the endpoint is unauthenticated, so a
 // request must not be able to force keyed upstream calls (D-8).
 func (h *Handler) HandleModels(w http.ResponseWriter, r *http.Request) {
+	_ = h.catalog.syncQwenRevision(r.Context())
 	ids := h.modelIDs()
 	data := make([]modelListEntry, 0, len(ids))
 	for _, id := range ids {

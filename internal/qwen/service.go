@@ -129,9 +129,28 @@ type Status struct {
 }
 
 func (s *Service) Status(ctx context.Context) (Status, error) {
+	return readStatus(ctx, s.db)
+}
+
+// WithStatus holds a read transaction during publish so a login cannot commit
+// a different revision between the status check and publication.
+func (s *Service) WithStatus(ctx context.Context, publish func(Status)) error {
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	status, err := readStatus(ctx, tx)
+	if err == nil {
+		publish(status)
+	}
+	return err
+}
+
+func readStatus(ctx context.Context, db rowReader) (Status, error) {
 	var revision string
 	var connected bool
-	err := s.db.QueryRowContext(ctx, `
+	err := db.QueryRowContext(ctx, `
 		SELECT revision, refresh_token <> '' AND refresh_failure <> 'sign_in'
 		FROM qwen_session WHERE id = 1
 	`).Scan(&revision, &connected)

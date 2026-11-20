@@ -22,7 +22,7 @@ import (
 // Upstream calls are forced non-streaming so the response can be buffered and
 // verified; if the client asked to stream, the accepted response is re-streamed
 // to it from the buffer by the standard relays.
-func (h *Handler) serveCascade(w http.ResponseWriter, r *http.Request, req AnthropicRequest, body []byte, startTime time.Time, complexity router.Complexity, chain []*router.Provider) (bool, error) {
+func (h *Handler) serveCascade(w http.ResponseWriter, r *http.Request, req AnthropicRequest, body []byte, startTime time.Time, complexity router.Complexity, chain []*router.Provider, retried *bool) (bool, error) {
 	ureq := req
 	ureq.Stream = false
 	noStreamBody := setStreamFalse(body)
@@ -35,7 +35,7 @@ func (h *Handler) serveCascade(w http.ResponseWriter, r *http.Request, req Anthr
 		}
 		last := i == len(chain)-1
 
-		resp, att, err := h.callUpstream(r.Context(), active, ureq, noStreamBody, r.Header, i+1)
+		resp, att, err := h.callUpstream(r.Context(), active, ureq, noStreamBody, r.Header, i+1, retried)
 		if err != nil {
 			if isQwenCredentialError(err) {
 				credentialError = err
@@ -48,7 +48,7 @@ func (h *Handler) serveCascade(w http.ResponseWriter, r *http.Request, req Anthr
 
 		if resp.StatusCode != http.StatusOK {
 			h.router.RecordOutcome(active.impl.Name(), complexity, false)
-			if last {
+			if last && (credentialError == nil || !h.shouldFailOver(resp.StatusCode, req.Model)) {
 				h.relayBuffered(w, active, req, raw, resp, startTime, complexity, att)
 				return true, nil
 			}

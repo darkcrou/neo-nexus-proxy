@@ -12,13 +12,13 @@ import (
 	"github.com/lynuxis2026-pixel/nexus-proxy/internal/qwen"
 )
 
-func (h *Handler) sendToProvider(ctx context.Context, active *activeProvider, req AnthropicRequest, idx, chainPos int, probe bool, key string, call func(string) (*http.Response, error)) (*http.Response, error) {
+func (h *Handler) sendToProvider(ctx context.Context, active *activeProvider, req AnthropicRequest, idx, chainPos int, probe bool, key string, retried *bool, call func(string) (*http.Response, error)) (*http.Response, error) {
 	source := providers.BearerSourceFor(active.impl)
 	if source == nil {
 		return call(key)
 	}
 	start := time.Now()
-	return providers.CallWithBearer(ctx, source, call, func(resp *http.Response) {
+	return providers.CallWithBearer(ctx, source, retried, call, func(resp *http.Response) {
 		att := &attemptInfo{
 			keyIdx: idx, chainPos: chainPos, probe: probe, started: start,
 			quota: captureQuota(resp.Header), reqID: extractRequestID(resp.Header),

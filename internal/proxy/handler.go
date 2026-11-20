@@ -528,27 +528,28 @@ func (h *Handler) probeKey(active *activeProvider, name string, key dueKey) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	status, recovered := h.requestKeyProbe(ctx, active, key.idx, req)
+	bearerRetried := false
+	status, recovered := h.requestKeyProbe(ctx, active, key.idx, req, &bearerRetried)
 	if status == http.StatusBadRequest {
 		// Some models reject a one-token output budget.
 		req.MaxTokens = 32
-		status, recovered = h.requestKeyProbe(ctx, active, key.idx, req)
+		status, recovered = h.requestKeyProbe(ctx, active, key.idx, req, &bearerRetried)
 	}
 	if h.catalog != nil && (status == http.StatusBadRequest || status == http.StatusNotFound) {
 		if model := h.catalog.probeAlternative(name, req.Model, key.target.nextAlternative); model != "" {
 			key.target.nextAlternative++
 			req.Model, req.nexusImages = model, false
 			req.MaxTokens = 32
-			_, recovered = h.requestKeyProbe(ctx, active, key.idx, req)
+			_, recovered = h.requestKeyProbe(ctx, active, key.idx, req, &bearerRetried)
 		}
 	}
 	h.finishKeyProbe(active, name, key, recovered)
 }
 
-func (h *Handler) requestKeyProbe(ctx context.Context, active *activeProvider, idx int, req AnthropicRequest) (status int, recovered bool) {
+func (h *Handler) requestKeyProbe(ctx context.Context, active *activeProvider, idx int, req AnthropicRequest, retried *bool) (status int, recovered bool) {
 	body, _ := json.Marshal(req)
 	start := time.Now()
-	resp, err := h.sendToProvider(ctx, active, req, idx, 0, true, active.keys[idx], func(key string) (*http.Response, error) {
+	resp, err := h.sendToProvider(ctx, active, req, idx, 0, true, active.keys[idx], retried, func(key string) (*http.Response, error) {
 		return h.callUpstreamOnce(ctx, active, req, body, http.Header{}, key)
 	})
 	if err != nil {
@@ -773,6 +774,7 @@ func (h *Handler) HandleMessages(w http.ResponseWriter, r *http.Request) {
 		h.forwardDirectAnthropic(w, r, req, body, startTime, complexity)
 		return
 	}
+	_ = h.catalog.syncQwenRevision(r.Context())
 	chain := h.stickyChain(h.router.RouteChain(req.Model, complexity), req.Model)
 
 	// Routing rules + cost guardrail need the prompt text.
@@ -835,6 +837,7 @@ func (h *Handler) HandleMessages(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var credentialError error
+	bearerRetried := false
 	// Cheap-first cascade: try the cheapest capable provider, verify its output,
 	// and escalate to a stronger model only on failure. Falls through to the
 	// normal failover path if every cascade candidate is unreachable.
@@ -847,7 +850,7 @@ func (h *Handler) HandleMessages(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if len(cc) > 0 {
-			served, err := h.serveCascade(w, r, req, body, startTime, complexity, cc)
+			served, err := h.serveCascade(w, r, req, body, startTime, complexity, cc, &bearerRetried)
 			if served {
 				return
 			}
@@ -887,7 +890,7 @@ func (h *Handler) HandleMessages(w http.ResponseWriter, r *http.Request) {
 		var att *attemptInfo
 		var err error
 		for attempt := 1; attempt <= maxProviderAttempts; attempt++ {
-			resp, att, err = h.callUpstream(r.Context(), active, req, body, r.Header, i+1)
+			resp, att, err = h.callUpstream(r.Context(), active, req, body, r.Header, i+1, &bearerRetried)
 			if errors.Is(err, errProviderExhausted) || isQwenCredentialError(err) || (err == nil && (isKeyLimitStatus(resp.StatusCode) || !isRetryableStatus(resp.StatusCode))) {
 				break
 			}
@@ -913,7 +916,7 @@ func (h *Handler) HandleMessages(w http.ResponseWriter, r *http.Request) {
 			log.Warn().Str("provider", cand.Name).Err(err).Msg("Provider unreachable, trying next")
 			continue
 		}
-		if i < len(chain)-1 && h.shouldFailOver(resp.StatusCode, req.Model) {
+		if (i < len(chain)-1 || credentialError != nil) && h.shouldFailOver(resp.StatusCode, req.Model) {
 			h.router.RecordOutcome(cand.Name, complexity, false)
 			// the last discarded response of the retry loop — recorded before
 			// the failover drops it
@@ -997,24 +1000,24 @@ var errLocalPrep = errors.New("nexus: local request preparation failed")
 // usage events here because no caller ever sees them. chainPos is the 1-based
 // position of this provider in the caller's chain, stamped onto every event
 // (rotations and retries of the same chain entry share its position).
-func (h *Handler) callUpstream(ctx context.Context, active *activeProvider, req AnthropicRequest, body []byte, origHeaders http.Header, chainPos int) (*http.Response, *attemptInfo, error) {
+func (h *Handler) callUpstream(ctx context.Context, active *activeProvider, req AnthropicRequest, body []byte, origHeaders http.Header, chainPos int, retried *bool) (*http.Response, *attemptInfo, error) {
 	_, customAuth := active.impl.(providers.Authorizer)
 	inheritsClientKey := !customAuth && !providers.IsOpenAICompatible(active.impl.Name())
-	return h.callWithKeys(ctx, active, req, chainPos, inheritsClientKey, func(key string) (*http.Response, error) {
+	return h.callWithKeys(ctx, active, req, chainPos, inheritsClientKey, retried, func(key string) (*http.Response, error) {
 		return h.callUpstreamOnce(ctx, active, req, body, origHeaders, key)
 	})
 }
 
 // callWithKeys shares key cooldown, rotation and attempt accounting between
 // the converted request and the OpenAI gateway's raw pass-through.
-func (h *Handler) callWithKeys(ctx context.Context, active *activeProvider, req AnthropicRequest, chainPos int, inheritsClientKey bool, call func(string) (*http.Response, error)) (*http.Response, *attemptInfo, error) {
+func (h *Handler) callWithKeys(ctx context.Context, active *activeProvider, req AnthropicRequest, chainPos int, inheritsClientKey bool, retried *bool, call func(string) (*http.Response, error)) (*http.Response, *attemptInfo, error) {
 	key, idx, ok := active.pickKey()
 	if !ok {
 		return nil, nil, errProviderExhausted
 	}
 	for attempt := 1; ; attempt++ {
 		start := time.Now()
-		resp, err := h.sendToProvider(ctx, active, req, idx, chainPos, false, key, call)
+		resp, err := h.sendToProvider(ctx, active, req, idx, chainPos, false, key, retried, call)
 		if err != nil {
 			if !errors.Is(err, errLocalPrep) && !isQwenCredentialError(err) {
 				h.recordUsageEvent(active, req, req.Stream, 0, &attemptInfo{
@@ -1154,7 +1157,8 @@ func (h *Handler) authorize(active *activeProvider, req *http.Request, body []by
 // client's (or the server env's) key, exactly like Sprint 1.
 func (h *Handler) forwardDirectAnthropic(w http.ResponseWriter, r *http.Request, req AnthropicRequest, body []byte, startTime time.Time, complexity router.Complexity) {
 	active := &activeProvider{impl: providers.NewAnthropic(""), apiKey: ""}
-	resp, att, err := h.callUpstream(r.Context(), active, req, body, r.Header, 1)
+	bearerRetried := false
+	resp, att, err := h.callUpstream(r.Context(), active, req, body, r.Header, 1, &bearerRetried)
 	if err != nil {
 		log.Error().Err(err).Msg("Provider request failed")
 		h.writeError(w, http.StatusBadGateway, fmt.Sprintf("provider error: %v", err))

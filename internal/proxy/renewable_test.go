@@ -121,3 +121,38 @@ func TestSubscriptionRepeatedUnauthorizedReturnsSignInGuidance(t *testing.T) {
 		t.Fatalf("requests %d, refresh calls %d", requests, len(source.rejected))
 	}
 }
+
+func TestSubscriptionRetryBudgetSurvivesTransportRetryAndReportsRelogin(t *testing.T) {
+	const model = "qwen-model"
+	peer := openAIServer(http.StatusServiceUnavailable, "")
+	defer peer.Close()
+	h := buildTestHandler(t, []testProv{{qwen.ProviderType, "free", qwen.GatewayURL}, {"peer", "free", peer.URL}})
+	h.router.SetProviderModels(qwen.ProviderType, []string{model})
+	h.router.SetProviderModels("peer", []string{model})
+	source := &testBearer{token: "first"}
+	p, err := providers.New(providers.Spec{Type: qwen.ProviderType, QwenTokens: source})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.providers[qwen.ProviderType].impl = p
+
+	var requests int
+	h.httpClient.Transport = renewableRoundTrip(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Host != "api.qwen.ai" {
+			return http.DefaultTransport.RoundTrip(r)
+		}
+		requests++
+		code := http.StatusUnauthorized
+		if requests == 2 {
+			code = http.StatusServiceUnavailable
+		}
+		return &http.Response{StatusCode: code, Header: http.Header{}, Body: http.NoBody}, nil
+	})
+	rec := doMessages(h, `{"model":"qwen-model","max_tokens":50,"messages":[{"role":"user","content":"hi"}]}`)
+	if rec.Code != http.StatusServiceUnavailable || !strings.Contains(rec.Body.String(), "Connect Qwen") {
+		t.Fatal(rec.Code, rec.Body)
+	}
+	if requests != 3 || len(source.rejected) != 1 {
+		t.Fatalf("requests %d, refresh calls %d", requests, len(source.rejected))
+	}
+}
