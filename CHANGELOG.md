@@ -1,4 +1,4 @@
-## Unreleased
+## v0.10.0
 
 - **Providers tab:** the dashboard now has Overview / Providers tabs. The
   Providers tab lists every configured provider with its tier, a credential
