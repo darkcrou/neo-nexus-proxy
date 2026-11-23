@@ -254,6 +254,113 @@ func TestModels_EntriesAreNexusOwnedAndCarryNoCreatedTimestamp(t *testing.T) {
 	}
 }
 
+func TestModels_ReportsCommonInputModalities(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/first/models":
+			fmt.Fprint(w, `{"data":[
+				{"id":"direct","input_modalities":["text","image","audio"]},
+				{"id":"translated","architecture":{"input_modalities":["text","image"]}},
+				{"id":"shared","supported_input":["text","image"]},
+				{"id":"shared","input":["audio"]},
+				{"id":"unknown-first"},
+				{"id":"unknown-last","input":["text","image"]},
+				{"id":"disjoint","input":["image"]}
+			]}`)
+		case "/second/models":
+			fmt.Fprint(w, `{"data":[
+				{"id":"shared","input":["text"]},
+				{"id":"unknown-first","input":["text"]},
+				{"id":"unknown-last","input":null},
+				{"id":"disjoint","input":["text"]}
+			]}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(upstream.Close)
+	h := newModelsHandler(t, "auto",
+		modelsProvider{name: "first", url: upstream.URL + "/first", tier: "free"},
+		modelsProvider{name: "second", url: upstream.URL + "/second", tier: "free"},
+	)
+	discover(t, h)
+
+	ids, entries := modelsList(t, h)
+	want := map[string]string{
+		"direct":        `["text","image","audio"]`,
+		"translated":    `["text","image"]`,
+		"shared":        `["text"]`,
+		"unknown-first": "",
+		"unknown-last":  "",
+		"disjoint":      `[]`,
+	}
+	if len(ids) != len(want) {
+		t.Fatalf("model ids = %v, want one entry for each of %v", ids, want)
+	}
+	for i, id := range ids {
+		expected, ok := want[id]
+		if got := string(entries[i]["input_modalities"]); !ok || got != expected {
+			t.Errorf("%s input_modalities = %q, want %q", id, got, expected)
+		}
+		delete(want, id)
+	}
+}
+
+func TestModels_InputModalitiesFollowCatalogRefresh(t *testing.T) {
+	var listing atomic.Value
+	listing.Store(`{"data":[{"id":"example","input":["text","image"]}]}`)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/models" {
+			http.NotFound(w, r)
+			return
+		}
+		body := listing.Load().(string)
+		if body == "" {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, body)
+	}))
+	t.Cleanup(upstream.Close)
+	h := newModelsHandler(t, "auto",
+		modelsProvider{name: "example", url: upstream.URL, tier: "free", models: []string{"example"}},
+	)
+	clock := newFakeClock()
+	h.catalog.now = clock.Now
+
+	check := func(want string) {
+		t.Helper()
+		ids, entries := modelsList(t, h)
+		if len(ids) != 1 || ids[0] != "example" {
+			t.Fatalf("ids = %v, want [example]", ids)
+		}
+		if got := string(entries[0]["input_modalities"]); got != want {
+			t.Errorf("input_modalities = %q, want %q", got, want)
+		}
+	}
+
+	check("")
+	discover(t, h)
+	check(`["text","image"]`)
+
+	listing.Store("")
+	clock.advance(h.catalog.ttl)
+	discover(t, h)
+	check(`["text","image"]`)
+
+	listing.Store(`{"data":[{"id":"example","input":["text","audio"]}]}`)
+	clock.advance(catalogInitialBackoff)
+	discover(t, h)
+	check(`["text","audio"]`)
+
+	listing.Store(`{"data":[{"id":"example"}]}`)
+	clock.advance(h.catalog.ttl)
+	discover(t, h)
+	check("")
+}
+
 func TestModels_FallsBackToTheStubClaudeIDsWhenNothingIsDiscovered(t *testing.T) {
 	// A provider family with no default list and no configured models, with warming
 	// off: every rung above the stub is empty, and the client must still never see an

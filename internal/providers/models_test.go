@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -108,6 +109,36 @@ func TestListModelsOpenAICompatibleDefault(t *testing.T) {
 	}
 }
 
+func TestListModelDetailsReadsExplicitInputModalities(t *testing.T) {
+	srv, _ := modelServer(t, http.StatusOK, `{"data":[
+		{"id":" direct ","input_modalities":[" Text ","image","text"],"input":["audio"]},
+		{"id":"openrouter","architecture":{"input_modalities":["text","image","file"],"output_modalities":["audio"]}},
+		{"id":"supported","input_modalities":null,"supported_input":["audio"]},
+		{"id":"input","architecture":"text->text","input":["text"]},
+		{"id":"empty","input_modalities":[]},
+		{"id":"malformed","input_modalities":["text",null],"input":{"text":true}},
+		{"id":"unknown","max_input_tokens":1234}
+	]}`)
+	p := openAICompatibleTestProvider(t, srv.URL)
+
+	got, err := ListModelDetails(p, "secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []ListedModel{
+		{ID: "direct", InputModalities: []string{"text", "image"}},
+		{ID: "openrouter", InputModalities: []string{"text", "image", "file"}},
+		{ID: "supported", InputModalities: []string{"audio"}},
+		{ID: "input", InputModalities: []string{"text"}},
+		{ID: "empty", InputModalities: []string{}},
+		{ID: "malformed"},
+		{ID: "unknown"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("list = %#v, want %#v", got, want)
+	}
+}
+
 // TestListModelsURLPerFamily pins the listing URL each family derives, including
 // the two providers whose BaseURL is one segment short of its OpenAI /v1 root.
 func TestListModelsURLPerFamily(t *testing.T) {
@@ -151,7 +182,8 @@ func TestListModelsAnthropic(t *testing.T) {
 	}
 	spec.url = srv.URL
 
-	ids, err := spec.fetch(context.Background())
+	models, err := spec.fetch(context.Background())
+	ids := ListedModelIDs(models)
 	if err != nil {
 		t.Fatalf("fetch: %v", err)
 	}
@@ -183,7 +215,8 @@ func TestListModelsGemini(t *testing.T) {
 	}
 	spec.url = srv.URL
 
-	ids, err := spec.fetch(context.Background())
+	models, err := spec.fetch(context.Background())
+	ids := ListedModelIDs(models)
 	if err != nil {
 		t.Fatalf("fetch: %v", err)
 	}
@@ -223,9 +256,13 @@ func TestListModelsWrappedUnsupportedFamily(t *testing.T) {
 func TestListModelsAnthropicPaginates(t *testing.T) {
 	srv, requests := pagingServer(t, func(page int) string {
 		if page == 0 {
-			return `{"data":[{"id":"claude-opus-4-6"}],"has_more":true,"last_id":"claude-opus-4-6"}`
+			return `{"data":[{"id":"claude-opus-4-6","capabilities":{"image_input":{"supported":true},"pdf_input":{"supported":true}}}],"has_more":true,"last_id":"claude-opus-4-6"}`
 		}
-		return `{"data":[{"id":"claude-haiku-4-5"}],"has_more":false}`
+		return `{"data":[
+			{"id":"claude-haiku-4-5","capabilities":{"image_input":{"supported":false},"pdf_input":{"supported":false}}},
+			{"id":"unknown","capabilities":{"thinking":{"supported":true}}},
+			{"id":"invalid","capabilities":{"image_input":{"supported":"yes"}}}
+		],"has_more":false}`
 	})
 	spec, err := modelListSpecFor(NewAnthropic("sk-ant-test"), "sk-ant-test")
 	if err != nil {
@@ -233,12 +270,18 @@ func TestListModelsAnthropicPaginates(t *testing.T) {
 	}
 	spec.url = srv.URL
 
-	ids, err := spec.fetch(context.Background())
+	models, err := spec.fetch(context.Background())
 	if err != nil {
 		t.Fatalf("fetch: %v", err)
 	}
-	if want := []string{"claude-opus-4-6", "claude-haiku-4-5"}; !equalIDs(ids, want) {
-		t.Errorf("ids = %v, want %v", ids, want)
+	want := []ListedModel{
+		{ID: "claude-opus-4-6", InputModalities: []string{"text", "image", "pdf"}},
+		{ID: "claude-haiku-4-5", InputModalities: []string{"text"}},
+		{ID: "unknown"},
+		{ID: "invalid"},
+	}
+	if !reflect.DeepEqual(models, want) {
+		t.Errorf("list = %#v, want %#v", models, want)
 	}
 	reqs := requests()
 	if len(reqs) != 2 {
@@ -271,7 +314,8 @@ func TestListModelsGeminiPaginates(t *testing.T) {
 	}
 	spec.url = srv.URL + "?key=AIza-test+key"
 
-	ids, err := spec.fetch(context.Background())
+	models, err := spec.fetch(context.Background())
+	ids := ListedModelIDs(models)
 	if err != nil {
 		t.Fatalf("fetch: %v", err)
 	}
@@ -303,7 +347,8 @@ func TestListModelsPaginationStopsOnRepeatedCursor(t *testing.T) {
 	}
 	spec.url = srv.URL
 
-	ids, err := spec.fetch(context.Background())
+	models, err := spec.fetch(context.Background())
+	ids := ListedModelIDs(models)
 	if err != nil {
 		t.Fatalf("fetch: %v", err)
 	}
@@ -327,7 +372,8 @@ func TestListModelsPaginationStopsOnRepeatedIDs(t *testing.T) {
 	}
 	spec.url = srv.URL
 
-	ids, err := spec.fetch(context.Background())
+	models, err := spec.fetch(context.Background())
+	ids := ListedModelIDs(models)
 	if err != nil {
 		t.Fatalf("fetch: %v", err)
 	}
@@ -351,7 +397,8 @@ func TestListModelsPaginationCapsPages(t *testing.T) {
 	}
 	spec.url = srv.URL
 
-	ids, err := spec.fetch(context.Background())
+	models, err := spec.fetch(context.Background())
+	ids := ListedModelIDs(models)
 	if err != nil {
 		t.Fatalf("fetch: %v", err)
 	}
@@ -384,7 +431,8 @@ func TestListModelsPaginationCapsTotal(t *testing.T) {
 	}
 	spec.url = srv.URL
 
-	ids, err := spec.fetch(context.Background())
+	models, err := spec.fetch(context.Background())
+	ids := ListedModelIDs(models)
 	if err != nil {
 		t.Fatalf("fetch: %v", err)
 	}

@@ -36,6 +36,39 @@ dashboard server, and the embedded web UI, sharing a local SQLite database.
    Azure · Bedrock (SigV4) · Vertex · Ollama (local) · any OpenAI-compatible
 ```
 
+## Model list API
+
+`GET /v1/models` serves the cached model catalog in OpenAI list format. NEXUS
+adds an optional `input_modalities` array to each model entry.
+
+```json
+{
+  "object": "list",
+  "data": [
+    {
+      "id": "example-model",
+      "object": "model",
+      "owned_by": "nexus",
+      "input_modalities": ["text", "image"]
+    }
+  ]
+}
+```
+
+NEXUS reads the first valid string array from `input_modalities`,
+`architecture.input_modalities`, `supported_input`, or `input`. It normalizes
+the values to lowercase, removes duplicates, and preserves their order.
+For Anthropic listings with input capability flags, it also understands
+`capabilities.image_input.supported` and `capabilities.pdf_input.supported`.
+Those flags add `image` and `pdf` to the base `text` input when enabled.
+
+If several providers list the same model ID, the array contains the modalities
+they all report. An empty array means there are no common reported modalities.
+NEXUS omits the field when any provider listing that ID has unknown modalities,
+including when the ID comes from configured or default models before discovery.
+A failed refresh keeps the last known listing. The array describes upstream
+model capabilities. Each request endpoint defines the input formats it accepts.
+
 ## Packages
 
 | Package | Responsibility |

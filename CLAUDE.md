@@ -61,7 +61,7 @@ nexus/
 │   ├── providers/               ← ~30 files, one per provider family
 │   │   ├── provider.go          ← Provider interface, DefaultModels, health check
 │   │   ├── generic.go           ← config-driven provider + `overridden` wrapper
-│   │   ├── models.go            ← ListModels discovery (per-family recipes)
+│   │   ├── models.go            ← model discovery (per-family recipes)
 │   │   └── anthropic.go, openai.go, gemini.go, ollama.go, deepseek.go, …
 │   ├── config/
 │   │   └── config.go            ← Default/Load, DiscoverFromEnv, EnvKeyVars
@@ -427,9 +427,9 @@ model-id forwarding. Spans `internal/router/router.go`,
 Read this before touching `GET /v1/models`, the background discovery loop, or
 provider ordering in `RouteChain` / `PreferModel`. Spans
 `internal/proxy/catalog.go` (`modelCatalog`, `catalogEntry`),
-`internal/proxy/gateway.go` (`modelIDs`, `HandleModels`,
+`internal/proxy/gateway.go` (`listedModels`, `HandleModels`,
 `HandleChatCompletions`),
-`internal/providers/models.go` (`ListModels`, `ErrNoModelList`),
+`internal/providers/models.go` (`ListModelDetails`, `ErrNoModelList`),
 `internal/router/router.go` (`servingSet`, `preferModel`, `PreferModel`,
 `SetProviderModels`, `ProviderServes`, `CascadeChain`),
 `internal/proxy/handler.go` (`keyLocked`/`peekKey`, the `HandleMessages` chain
@@ -443,7 +443,9 @@ the whole design; the paragraphs below are the consequences of it.
   (`internal/proxy/server.go` registers it for `GET` only) answers
   `{"object":"list","data":[{"id":…,"object":"model","owned_by":"nexus"}]}`
   in the catalog's stable order, which is provider registration order and then
-  each provider's own list order. `modelListEntry` deliberately has **no
+  each provider's own list order. Entries may include the optional
+  [`input_modalities` extension](docs/architecture.md#model-list-api).
+  `modelListEntry` deliberately has **no
   `created` field** (D-10): NEXUS knows no honest creation time for a
   discovered id, and inventing one would be fabricated metadata. `owned_by` is
   `"nexus"` rather than the provider name because, after deduplication, an
@@ -472,11 +474,11 @@ the whole design; the paragraphs below are the consequences of it.
   project's rule is no telemetry or unsolicited outbound traffic without
   opt-in (D-11). A disabled catalog is still built and seeded, so the endpoint
   keeps a usable fallback; it simply never fetches (`catalogWarms`).
-- **The fallback ladder, as it actually landed.** `Handler.modelIDs`
+- **The fallback ladder, as it actually landed.** `Handler.listedModels`
   (`gateway.go`) is the one place the ladder lives, and it has two rungs:
   **the catalog snapshot — which already carries the seed until the first
   successful fetch replaces that list wholesale — then the three stub Claude
-  ids** (`stubModelIDs`, the pre-catalog behaviour, returned as a copy so a
+  ids** (`stubModels`, the pre-catalog behaviour, returned as a copy so a
   caller sorting it in place cannot corrupt the process-wide fallback).
   Recorded deviation from D-9: the plan words rungs two and three as a *global*
   gate — configured `models` first, and `providers.DefaultModels` only if *no*
@@ -491,7 +493,7 @@ the whole design; the paragraphs below are the consequences of it.
   catalog is empty, because an unknown family returns no `DefaultModels`; the
   routability guarantee therefore covers the discovered and seeded cases, not
   the last-resort stub.
-- **Discovery mechanics.** `providers.ListModels(p, apiKey)`
+- **Discovery mechanics.** `providers.ListModelDetails(p, apiKey)`
   (`internal/providers/models.go`) is one package-level function with a
   per-family recipe, **not** an interface method on each of the ~30 concrete
   provider types and **not** a method on the `overridden` config wrapper. That

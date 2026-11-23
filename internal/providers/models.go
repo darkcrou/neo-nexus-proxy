@@ -50,6 +50,36 @@ func ListModels(p Provider, apiKey string) ([]string, error) {
 }
 
 func ListModelsContext(ctx context.Context, p Provider, apiKey string) ([]string, error) {
+	models, err := listModelDetails(ctx, p, apiKey)
+	return ListedModelIDs(models), err
+}
+
+// ListedModel is a model from an upstream listing. Nil InputModalities means
+// unknown. An empty, non-nil slice is an explicit empty list.
+type ListedModel struct {
+	ID              string
+	InputModalities []string
+}
+
+// ListedModelIDs returns the ids in listing order for consumers that only need
+// model identity.
+func ListedModelIDs(models []ListedModel) []string {
+	if len(models) == 0 {
+		return nil
+	}
+	ids := make([]string, len(models))
+	for i, model := range models {
+		ids[i] = model.ID
+	}
+	return ids
+}
+
+// ListModelDetails fetches model ids and any reported input modalities.
+func ListModelDetails(p Provider, apiKey string) ([]ListedModel, error) {
+	return listModelDetails(context.Background(), p, apiKey)
+}
+
+func listModelDetails(ctx context.Context, p Provider, apiKey string) ([]ListedModel, error) {
 	if p == nil {
 		return nil, errors.New("list models: nil provider")
 	}
@@ -103,11 +133,11 @@ func (p pagination) pageURL(base, cursor string) (string, error) {
 	return u.String(), nil
 }
 
-// modelPage is one listing response: the ids it carries and the cursor that
+// modelPage is one listing response: the models it carries and the cursor that
 // continues the listing. The cursor is empty when the family answers in a
 // single page or the listing is exhausted.
 type modelPage struct {
-	ids    []string
+	models []ListedModel
 	cursor string
 }
 
@@ -197,10 +227,10 @@ func unwrapOverridden(p Provider) Provider {
 	return p
 }
 
-// fetch performs the listing and returns its ids. A single-page family makes
+// fetch performs the listing and returns its models. A single-page family makes
 // exactly one request; a paginated family walks its cursor under the bounds
 // documented on fetchPages.
-func (s modelListSpec) fetch(ctx context.Context) ([]string, error) {
+func (s modelListSpec) fetch(ctx context.Context) ([]ListedModel, error) {
 	client := &http.Client{Timeout: modelListTimeout}
 	if s.paging == nil {
 		body, err := s.get(ctx, client, s.url)
@@ -211,7 +241,8 @@ func (s modelListSpec) fetch(ctx context.Context) ([]string, error) {
 		if err != nil {
 			return nil, fmt.Errorf("list models: %s: %w", s.label, err)
 		}
-		return cleanModelIDs(page.ids), nil
+		models, _ := appendModels(nil, nil, page.models)
+		return models, nil
 	}
 	return s.fetchPages(ctx, client)
 }
@@ -220,9 +251,9 @@ func (s modelListSpec) fetch(ctx context.Context) ([]string, error) {
 // misbehaving endpoint cannot loop forever: at most maxModelListPages requests,
 // at most maxListedModels ids, and a stop as soon as a page contributes no id
 // it has not already returned or its cursor does not advance.
-func (s modelListSpec) fetchPages(ctx context.Context, client *http.Client) ([]string, error) {
+func (s modelListSpec) fetchPages(ctx context.Context, client *http.Client) ([]ListedModel, error) {
 	var (
-		out  []string
+		out  []ListedModel
 		seen = make(map[string]struct{})
 		cur  string
 	)
@@ -240,7 +271,7 @@ func (s modelListSpec) fetchPages(ctx context.Context, client *http.Client) ([]s
 			return nil, fmt.Errorf("list models: %s: %w", s.label, err)
 		}
 		var added int
-		out, added = appendModels(out, seen, parsed.ids)
+		out, added = appendModels(out, seen, parsed.models)
 		if len(out) == maxListedModels {
 			return out, nil
 		}
@@ -314,21 +345,76 @@ func withoutURL(err error) error {
 	return err
 }
 
+// Optional metadata is decoded independently so an invalid capability field
+// cannot make the provider's model IDs unavailable for routing.
+type modelInputFields struct {
+	InputModalities json.RawMessage `json:"input_modalities"`
+	Architecture    json.RawMessage `json:"architecture"`
+	SupportedInput  json.RawMessage `json:"supported_input"`
+	Input           json.RawMessage `json:"input"`
+}
+
+func (f modelInputFields) modalities() []string {
+	if values := decodeModalities(f.InputModalities); values != nil {
+		return values
+	}
+	var architecture struct {
+		InputModalities json.RawMessage `json:"input_modalities"`
+	}
+	if len(f.Architecture) > 0 && json.Unmarshal(f.Architecture, &architecture) == nil {
+		if values := decodeModalities(architecture.InputModalities); values != nil {
+			return values
+		}
+	}
+	if values := decodeModalities(f.SupportedInput); values != nil {
+		return values
+	}
+	return decodeModalities(f.Input)
+}
+
+func decodeModalities(raw json.RawMessage) []string {
+	var values []string
+	if len(raw) == 0 || json.Unmarshal(raw, &values) != nil || values == nil {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(values))
+	out := values[:0]
+	for _, value := range values {
+		value = strings.ToLower(strings.TrimSpace(value))
+		if value == "" {
+			return nil
+		}
+		if _, ok := seen[value]; !ok {
+			seen[value] = struct{}{}
+			out = append(out, value)
+		}
+	}
+	return out
+}
+
+type modelListItem struct {
+	ID string `json:"id"`
+	modelInputFields
+}
+
+type namedModelListItem struct {
+	Name string `json:"name"`
+	modelInputFields
+}
+
 // parseOpenAIModelList reads the OpenAI shape: {"data":[{"id":"..."}]}.
 func parseOpenAIModelList(body []byte) (modelPage, error) {
 	var payload struct {
-		Data []struct {
-			ID string `json:"id"`
-		} `json:"data"`
+		Data []modelListItem `json:"data"`
 	}
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return modelPage{}, fmt.Errorf("decode model list: %w", err)
 	}
-	ids := make([]string, 0, len(payload.Data))
+	models := make([]ListedModel, 0, len(payload.Data))
 	for _, m := range payload.Data {
-		ids = append(ids, m.ID)
+		models = append(models, ListedModel{ID: m.ID, InputModalities: m.modalities()})
 	}
-	return modelPage{ids: ids}, nil
+	return modelPage{models: models}, nil
 }
 
 // parseAnthropicModelList reads the Anthropic shape, which extends the OpenAI
@@ -337,7 +423,8 @@ func parseOpenAIModelList(body []byte) (modelPage, error) {
 func parseAnthropicModelList(body []byte) (modelPage, error) {
 	var payload struct {
 		Data []struct {
-			ID string `json:"id"`
+			modelListItem
+			Capabilities json.RawMessage `json:"capabilities"`
 		} `json:"data"`
 		HasMore bool   `json:"has_more"`
 		LastID  string `json:"last_id"`
@@ -345,9 +432,13 @@ func parseAnthropicModelList(body []byte) (modelPage, error) {
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return modelPage{}, fmt.Errorf("decode model list: %w", err)
 	}
-	page := modelPage{ids: make([]string, 0, len(payload.Data))}
+	page := modelPage{models: make([]ListedModel, 0, len(payload.Data))}
 	for _, m := range payload.Data {
-		page.ids = append(page.ids, m.ID)
+		inputs := m.modalities()
+		if inputs == nil {
+			inputs = anthropicInputModalities(m.Capabilities)
+		}
+		page.models = append(page.models, ListedModel{ID: m.ID, InputModalities: inputs})
 	}
 	if payload.HasMore {
 		page.cursor = payload.LastID
@@ -355,24 +446,49 @@ func parseAnthropicModelList(body []byte) (modelPage, error) {
 	return page, nil
 }
 
+func anthropicInputModalities(raw json.RawMessage) []string {
+	type capability struct {
+		Supported *bool `json:"supported"`
+	}
+	var flags struct {
+		Image capability `json:"image_input"`
+		PDF   capability `json:"pdf_input"`
+	}
+	if len(raw) == 0 || json.Unmarshal(raw, &flags) != nil {
+		return nil
+	}
+	if flags.Image.Supported == nil && flags.PDF.Supported == nil {
+		return nil
+	}
+	// Text is the base input for the native Messages API.
+	inputs := []string{"text"}
+	if flags.Image.Supported != nil && *flags.Image.Supported {
+		inputs = append(inputs, "image")
+	}
+	if flags.PDF.Supported != nil && *flags.PDF.Supported {
+		inputs = append(inputs, "pdf")
+	}
+	return inputs
+}
+
 // parseGeminiModelList reads the Gemini shape, which paginates by token:
 // {"models":[{"name":"models/<id>"}],"nextPageToken":"..."}.
 func parseGeminiModelList(body []byte) (modelPage, error) {
 	var payload struct {
-		Models []struct {
-			Name string `json:"name"`
-		} `json:"models"`
-		NextPageToken string `json:"nextPageToken"`
+		Models        []namedModelListItem `json:"models"`
+		NextPageToken string               `json:"nextPageToken"`
 	}
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return modelPage{}, fmt.Errorf("decode model list: %w", err)
 	}
 	page := modelPage{
-		ids:    make([]string, 0, len(payload.Models)),
+		models: make([]ListedModel, 0, len(payload.Models)),
 		cursor: payload.NextPageToken,
 	}
 	for _, m := range payload.Models {
-		page.ids = append(page.ids, strings.TrimPrefix(m.Name, "models/"))
+		page.models = append(page.models, ListedModel{
+			ID: strings.TrimPrefix(m.Name, "models/"), InputModalities: m.modalities(),
+		})
 	}
 	return page, nil
 }
@@ -380,45 +496,36 @@ func parseGeminiModelList(body []byte) (modelPage, error) {
 // parseOllamaModelList reads the Ollama shape: {"models":[{"name":"..."}]}.
 func parseOllamaModelList(body []byte) (modelPage, error) {
 	var payload struct {
-		Models []struct {
-			Name string `json:"name"`
-		} `json:"models"`
+		Models []namedModelListItem `json:"models"`
 	}
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return modelPage{}, fmt.Errorf("decode model list: %w", err)
 	}
-	ids := make([]string, 0, len(payload.Models))
+	models := make([]ListedModel, 0, len(payload.Models))
 	for _, m := range payload.Models {
-		ids = append(ids, m.Name)
+		models = append(models, ListedModel{ID: m.Name, InputModalities: m.modalities()})
 	}
-	return modelPage{ids: ids}, nil
-}
-
-// cleanModelIDs trims each id, drops blanks, and caps the result, preserving the
-// provider's order.
-func cleanModelIDs(ids []string) []string {
-	out, _ := appendModels(nil, nil, ids)
-	return out
+	return modelPage{models: models}, nil
 }
 
 // appendModels trims each id, drops blanks, appends the rest, and caps the
 // result at maxListedModels. A non-nil seen set additionally drops ids already
 // collected; it reports how many ids were appended, which the pagination loop
 // uses to detect a page that repeats what it already returned.
-func appendModels(out []string, seen map[string]struct{}, ids []string) ([]string, int) {
+func appendModels(out []ListedModel, seen map[string]struct{}, models []ListedModel) ([]ListedModel, int) {
 	added := 0
-	for _, id := range ids {
-		id = strings.TrimSpace(id)
-		if id == "" {
+	for _, model := range models {
+		model.ID = strings.TrimSpace(model.ID)
+		if model.ID == "" {
 			continue
 		}
 		if seen != nil {
-			if _, dup := seen[id]; dup {
+			if _, dup := seen[model.ID]; dup {
 				continue
 			}
-			seen[id] = struct{}{}
+			seen[model.ID] = struct{}{}
 		}
-		out = append(out, id)
+		out = append(out, model)
 		added++
 		if len(out) == maxListedModels {
 			break

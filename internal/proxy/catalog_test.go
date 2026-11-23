@@ -204,6 +204,10 @@ func buildCatalog(t *testing.T, ttl time.Duration, aps ...*activeProvider) (*mod
 	return cat, clock
 }
 
+func catalogIDs(cat *modelCatalog) []string {
+	return providers.ListedModelIDs(cat.snapshot())
+}
+
 // entryState reads one provider's catalog state under the catalog lock. Tests
 // assert on the recorded error and backoff here because the read surface
 // (snapshot) deliberately hides them.
@@ -261,14 +265,14 @@ func TestCatalogRefreshPopulatesSnapshot(t *testing.T) {
 	f := newFakeUpstream(t, "alpha-model", "beta-model")
 	cat, _ := buildCatalog(t, 300*time.Second, newUpstreamProvider(t, "acme", f))
 
-	if got := cat.snapshot(); len(got) != 0 {
+	if got := catalogIDs(cat); len(got) != 0 {
 		t.Fatalf("an unseeded catalog must start empty, got %v", got)
 	}
 
 	cat.refreshAll(context.Background())
 
 	want := []string{"alpha-model", "beta-model"}
-	if got := cat.snapshot(); !reflect.DeepEqual(got, want) {
+	if got := catalogIDs(cat); !reflect.DeepEqual(got, want) {
 		t.Errorf("snapshot = %v, want %v", got, want)
 	}
 	if f.requests() != 1 {
@@ -287,7 +291,7 @@ func TestCatalogSkipsFetchWithinTTL(t *testing.T) {
 	if f.requests() != 1 {
 		t.Errorf("upstream requests = %d, want 1 — a refresh inside the TTL must not reach the provider", f.requests())
 	}
-	if got := cat.snapshot(); !reflect.DeepEqual(got, []string{"alpha-model"}) {
+	if got := catalogIDs(cat); !reflect.DeepEqual(got, []string{"alpha-model"}) {
 		t.Errorf("snapshot = %v, want [alpha-model]", got)
 	}
 }
@@ -305,7 +309,7 @@ func TestCatalogRefetchesAfterTTL(t *testing.T) {
 		t.Errorf("upstream requests = %d, want 2 — a refresh past the TTL must refetch", f.requests())
 	}
 	want := []string{"alpha-model", "gamma-model"}
-	if got := cat.snapshot(); !reflect.DeepEqual(got, want) {
+	if got := catalogIDs(cat); !reflect.DeepEqual(got, want) {
 		t.Errorf("snapshot = %v, want %v (the refetched list replaces the old one)", got, want)
 	}
 }
@@ -322,7 +326,7 @@ func TestCatalogFailureKeepsLastGoodListAndBacksOff(t *testing.T) {
 	if f.requests() != 2 {
 		t.Fatalf("upstream requests = %d, want 2", f.requests())
 	}
-	if got := cat.snapshot(); !reflect.DeepEqual(got, []string{"alpha-model"}) {
+	if got := catalogIDs(cat); !reflect.DeepEqual(got, []string{"alpha-model"}) {
 		t.Errorf("snapshot = %v, want [alpha-model] — a failed listing keeps the last good list", got)
 	}
 	errText, backoff, unsupported := entryState(t, cat, "acme")
@@ -367,7 +371,7 @@ func TestCatalogRecoveryClearsErrorAndResetsBackoff(t *testing.T) {
 	if errText != "" || backoff != 0 {
 		t.Errorf("after recovery: err = %q, backoff = %s; want both cleared", errText, backoff)
 	}
-	if got := cat.snapshot(); !reflect.DeepEqual(got, []string{"alpha-model"}) {
+	if got := catalogIDs(cat); !reflect.DeepEqual(got, []string{"alpha-model"}) {
 		t.Errorf("snapshot = %v, want [alpha-model]", got)
 	}
 
@@ -424,7 +428,7 @@ func TestCatalogDeduplicatesSharedModelID(t *testing.T) {
 	cat.refreshAll(context.Background())
 
 	want := []string{"shared-model", "first-only", "second-only"}
-	if got := cat.snapshot(); !reflect.DeepEqual(got, want) {
+	if got := catalogIDs(cat); !reflect.DeepEqual(got, want) {
 		t.Errorf("snapshot = %v, want %v — an id offered by two providers appears once", got, want)
 	}
 }
@@ -443,12 +447,12 @@ func TestCatalogSnapshotOrderIsStable(t *testing.T) {
 	cat.refreshAll(context.Background())
 
 	want := []string{"zebra", "yak", "mango", "apple"}
-	got := cat.snapshot()
+	got := catalogIDs(cat)
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("snapshot = %v, want %v (registration order, then each provider's own list order)", got, want)
 	}
 	for i := 0; i < 5; i++ {
-		if again := cat.snapshot(); !reflect.DeepEqual(again, want) {
+		if again := catalogIDs(cat); !reflect.DeepEqual(again, want) {
 			t.Fatalf("snapshot %d = %v, want %v — the order must be stable across calls", i+2, again, want)
 		}
 	}
@@ -474,9 +478,9 @@ func TestCatalogUnsupportedProviderIsAttemptedOnce(t *testing.T) {
 	)
 
 	var attempts atomic.Int64
-	cat.listModels = func(p providers.Provider, apiKey string) ([]string, error) {
+	cat.listModels = func(p providers.Provider, apiKey string) ([]providers.ListedModel, error) {
 		attempts.Add(1)
-		return providers.ListModels(p, apiKey)
+		return providers.ListModelDetails(p, apiKey)
 	}
 	cat.seed(map[string][]string{"perplexity": {"sonar", "sonar-pro"}, "azure-east": {"gpt-4o"}})
 
@@ -495,7 +499,7 @@ func TestCatalogUnsupportedProviderIsAttemptedOnce(t *testing.T) {
 			t.Errorf("%s: entry is not marked unsupported", name)
 		}
 	}
-	if got := cat.snapshot(); !reflect.DeepEqual(got, []string{"sonar", "sonar-pro", "gpt-4o"}) {
+	if got := catalogIDs(cat); !reflect.DeepEqual(got, []string{"sonar", "sonar-pro", "gpt-4o"}) {
 		t.Errorf("snapshot = %v, want the seeded lists of both unsupported providers", got)
 	}
 }
@@ -515,7 +519,7 @@ func TestCatalogEmptyListingKeepsSeed(t *testing.T) {
 	if f.requests() != 1 {
 		t.Fatalf("upstream requests = %d, want 1 — the empty listing must still be attempted", f.requests())
 	}
-	if got := cat.snapshot(); !reflect.DeepEqual(got, []string{"configured-model"}) {
+	if got := catalogIDs(cat); !reflect.DeepEqual(got, []string{"configured-model"}) {
 		t.Errorf("snapshot = %v, want [configured-model] — an empty listing is not evidence the seeded ids stopped existing", got)
 	}
 	if !cat.rt.ProviderServes("acme", "configured-model") {
@@ -567,7 +571,7 @@ models = ["second-model"]
 	if got := len(h.providers); got != 1 {
 		t.Errorf("registered providers = %d, want 1", got)
 	}
-	if got := h.catalog.snapshot(); !reflect.DeepEqual(got, []string{"first-model"}) {
+	if got := catalogIDs(h.catalog); !reflect.DeepEqual(got, []string{"first-model"}) {
 		t.Errorf("snapshot = %v, want [first-model] — one seed, from the first entry", got)
 	}
 
@@ -610,7 +614,7 @@ func TestCatalogExhaustedKeyPoolListsOnPrimaryKey(t *testing.T) {
 	if got, want := f.lastAuth(), "Bearer "+ap.apiKey; got != want {
 		t.Errorf("listing authenticated as %q, want %q — an exhausted pool lists on the primary key", got, want)
 	}
-	if got := cat.snapshot(); !reflect.DeepEqual(got, []string{"alpha-model"}) {
+	if got := catalogIDs(cat); !reflect.DeepEqual(got, []string{"alpha-model"}) {
 		t.Errorf("snapshot = %v, want [alpha-model]", got)
 	}
 }
@@ -665,7 +669,7 @@ func TestCatalogConcurrentSnapshotsDuringRefresh(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for j := 0; j < 500; j++ {
-				cat.snapshot()
+				catalogIDs(cat)
 			}
 		}()
 	}
@@ -676,7 +680,7 @@ func TestCatalogConcurrentSnapshotsDuringRefresh(t *testing.T) {
 	}()
 	wg.Wait()
 
-	if got := cat.snapshot(); !reflect.DeepEqual(got, []string{"alpha", "beta", "gamma"}) {
+	if got := catalogIDs(cat); !reflect.DeepEqual(got, []string{"alpha", "beta", "gamma"}) {
 		t.Errorf("snapshot = %v after concurrent refreshes", got)
 	}
 }
@@ -726,7 +730,7 @@ func TestCatalogSingleFlightSkipsOverlappingRefresh(t *testing.T) {
 	if got := up.hits.Load(); got != 1 {
 		t.Errorf("upstream requests = %d after both refreshes, want 1 — the skipped refresh must not retry", got)
 	}
-	if got := cat.snapshot(); !reflect.DeepEqual(got, []string{"alpha-model"}) {
+	if got := catalogIDs(cat); !reflect.DeepEqual(got, []string{"alpha-model"}) {
 		t.Errorf("snapshot = %v, want [alpha-model] — the single fetch must still populate the catalog", got)
 	}
 }
@@ -736,7 +740,7 @@ func TestCatalogSeedIsVisibleBeforeFirstFetch(t *testing.T) {
 	cat, _ := buildCatalog(t, 300*time.Second, newUpstreamProvider(t, "acme", f))
 	cat.seed(map[string][]string{"acme": {"configured-model"}})
 
-	if got := cat.snapshot(); !reflect.DeepEqual(got, []string{"configured-model"}) {
+	if got := catalogIDs(cat); !reflect.DeepEqual(got, []string{"configured-model"}) {
 		t.Errorf("snapshot = %v, want [configured-model] before any fetch", got)
 	}
 	if f.requests() != 0 {
@@ -748,7 +752,7 @@ func TestCatalogSeedIsVisibleBeforeFirstFetch(t *testing.T) {
 	if f.requests() != 1 {
 		t.Errorf("upstream requests = %d, want 1 — a seeded catalog still fetches on its first tick", f.requests())
 	}
-	if got := cat.snapshot(); !reflect.DeepEqual(got, []string{"live-model"}) {
+	if got := catalogIDs(cat); !reflect.DeepEqual(got, []string{"live-model"}) {
 		t.Errorf("snapshot = %v, want the discovered [live-model]", got)
 	}
 }
@@ -789,7 +793,7 @@ api_key = "sk-test"
 `)
 
 	want := append([]string{"configured-model"}, providers.DefaultModels("deepseek")...)
-	if got := h.catalog.snapshot(); !reflect.DeepEqual(got, want) {
+	if got := catalogIDs(h.catalog); !reflect.DeepEqual(got, want) {
 		t.Errorf("snapshot = %v, want %v — a provider without configured models seeds from its family defaults", got, want)
 	}
 }
@@ -811,7 +815,7 @@ api_key = "gsk-test"
 models = ["custom-model"]
 `)
 
-	if got := h.catalog.snapshot(); !reflect.DeepEqual(got, []string{"custom-model"}) {
+	if got := catalogIDs(h.catalog); !reflect.DeepEqual(got, []string{"custom-model"}) {
 		t.Errorf("snapshot = %v, want [custom-model] — the configured ids must survive the name difference", got)
 	}
 	if !h.router.ProviderServes("groq", "custom-model") {
@@ -865,7 +869,7 @@ models = ["configured-model"]
 	if f.requests() != 2 {
 		t.Errorf("upstream requests = %d, want 2 — a refresh past the configured TTL must refetch", f.requests())
 	}
-	if got := h.catalog.snapshot(); !reflect.DeepEqual(got, []string{"alpha-model"}) {
+	if got := catalogIDs(h.catalog); !reflect.DeepEqual(got, []string{"alpha-model"}) {
 		t.Errorf("snapshot = %v, want the discovered [alpha-model]", got)
 	}
 }
@@ -980,7 +984,7 @@ func TestCatalogPublishesSnapshotAndRouterTogether(t *testing.T) {
 					return
 				default:
 				}
-				for _, id := range cat.snapshot() {
+				for _, id := range catalogIDs(cat) {
 					owner, _, ok := strings.Cut(id, "-m")
 					if !ok {
 						t.Errorf("snapshot returned a malformed id %q", id)
@@ -1012,7 +1016,7 @@ func TestCatalogPublishesSnapshotAndRouterTogether(t *testing.T) {
 	for i := 0; i < providerCount; i++ {
 		want = append(want, roundIDs(names[i], rounds)...)
 	}
-	if got := cat.snapshot(); !reflect.DeepEqual(got, want) {
+	if got := catalogIDs(cat); !reflect.DeepEqual(got, want) {
 		t.Errorf("snapshot = %v, want every id of the last round (%d ids)", got, len(want))
 	}
 }
@@ -1051,7 +1055,7 @@ func TestCatalogDisabledStartsNoWarmLoop(t *testing.T) {
 	if h.catalog == nil {
 		t.Fatal("a disabled catalog must still be constructed")
 	}
-	if got := h.catalog.snapshot(); !reflect.DeepEqual(got, []string{"configured-model"}) {
+	if got := catalogIDs(h.catalog); !reflect.DeepEqual(got, []string{"configured-model"}) {
 		t.Errorf("snapshot = %v, want the seeded [configured-model]", got)
 	}
 	if f.requests() != 0 {
@@ -1116,7 +1120,7 @@ func TestCatalogWarmLoopFetchesImmediatelyAndStops(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("the warm loop did not stop on context cancellation")
 	}
-	if got := cat.snapshot(); !reflect.DeepEqual(got, []string{"alpha-model"}) {
+	if got := catalogIDs(cat); !reflect.DeepEqual(got, []string{"alpha-model"}) {
 		t.Errorf("snapshot = %v, want [alpha-model]", got)
 	}
 }

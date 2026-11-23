@@ -83,7 +83,7 @@ func TestProviderCatalogNeverFetches(t *testing.T) {
 	f := newFakeUpstream(t, "live-model")
 	cat, _ := buildCatalog(t, 300*time.Second, newUpstreamProvider(t, "acme", f))
 	calls := 0
-	cat.listModels = func(providers.Provider, string) ([]string, error) {
+	cat.listModels = func(providers.Provider, string) ([]providers.ListedModel, error) {
 		calls++
 		return nil, providers.ErrNoModelList
 	}
@@ -102,7 +102,7 @@ func TestProviderCatalogNeverFetches(t *testing.T) {
 func TestProviderCatalogReportsUnsupportedListing(t *testing.T) {
 	f := newFakeUpstream(t)
 	cat, _ := buildCatalog(t, 300*time.Second, newUpstreamProvider(t, "acme", f))
-	cat.listModels = func(providers.Provider, string) ([]string, error) {
+	cat.listModels = func(providers.Provider, string) ([]providers.ListedModel, error) {
 		return nil, providers.ErrNoModelList
 	}
 
@@ -121,7 +121,7 @@ func TestProviderCatalogReportsRetryableFailureAndKeepsLastList(t *testing.T) {
 	f := newFakeUpstream(t)
 	cat, _ := buildCatalog(t, 300*time.Second, newUpstreamProvider(t, "acme", f))
 	cat.seed(map[string][]string{"acme": {"seed-model"}})
-	cat.listModels = func(providers.Provider, string) ([]string, error) {
+	cat.listModels = func(providers.Provider, string) ([]providers.ListedModel, error) {
 		return nil, errors.New("listing exploded")
 	}
 

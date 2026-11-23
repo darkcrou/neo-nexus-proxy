@@ -6,6 +6,7 @@ package proxy
 import (
 	"context"
 	"errors"
+	"slices"
 	"sync"
 	"time"
 
@@ -35,8 +36,8 @@ const (
 	defaultCatalogTTL = 300 * time.Second
 )
 
-// modelCatalog is the cached, background-refreshed index of the model ids each
-// registered provider currently offers.
+// modelCatalog caches each registered provider's model ids and reported input
+// modalities. Listings are refreshed in the background.
 //
 // It is a cache, never a request-path dependency: reads are a map scan under a
 // read lock and never touch the network, while the warm loop fetches in the
@@ -51,10 +52,10 @@ type modelCatalog struct {
 	ttl       time.Duration
 	now       func() time.Time // injected for tests
 
-	// listModels is providers.ListModels. It is a field so tests can count
+	// listModels is providers.ListModelDetails. It is a field so tests can count
 	// discovery attempts: a provider with no listing endpoint fails before any
 	// request, so there is nothing on the wire to observe.
-	listModels func(providers.Provider, string) ([]string, error)
+	listModels func(providers.Provider, string) ([]providers.ListedModel, error)
 
 	// warms records whether the background loop runs, so a read surface can
 	// tell "discovery pending" apart from "discovery switched off".
@@ -63,7 +64,7 @@ type modelCatalog struct {
 
 // catalogEntry is one provider's last known state in the catalog.
 type catalogEntry struct {
-	models     []string
+	models     []providers.ListedModel
 	revision   string    // login that supplied this subscription catalog
 	fetchedAt  time.Time // when models/err were last established — by a success or a failure
 	discovered bool      // at least one non-empty upstream listing has been received
@@ -91,7 +92,7 @@ func newModelCatalog(rt *router.Router, active map[string]*activeProvider, order
 		providers:  active,
 		ttl:        ttl,
 		now:        time.Now,
-		listModels: providers.ListModels,
+		listModels: providers.ListModelDetails,
 	}
 	for _, name := range c.order {
 		c.entries[name] = &catalogEntry{}
@@ -123,8 +124,12 @@ func (c *modelCatalog) seed(models map[string][]string) {
 			e = &catalogEntry{}
 			c.entries[name] = e
 		}
-		e.models = append([]string(nil), models[name]...)
-		if len(e.models) == 0 {
+		ids := models[name]
+		e.models = make([]providers.ListedModel, len(ids))
+		for i, id := range ids {
+			e.models[i].ID = id
+		}
+		if len(ids) == 0 {
 			continue
 		}
 		// Lock order: modelCatalog.mu → Router.mu. Nesting is safe because no path
@@ -132,30 +137,59 @@ func (c *modelCatalog) seed(models map[string][]string) {
 		// into the catalog, and request paths take the two locks sequentially.
 		// Both writes under c.mu keep a snapshot from naming ids the router does
 		// not serve yet.
-		c.rt.SetProviderModels(name, e.models)
+		c.rt.SetProviderModels(name, ids)
 	}
 }
 
-// snapshot returns the deduplicated union of the last known model lists, ordered
-// by provider registration order and then by each provider's own list order, so
-// repeated calls are byte-identical. It never fetches and never blocks beyond the
-// read lock.
-func (c *modelCatalog) snapshot() []string {
+// snapshot lists each model once, in first-seen provider and listing order.
+// A shared model carries only the input modalities reported by every provider
+// that lists it. The snapshot owns its slices and reads only cached data.
+func (c *modelCatalog) snapshot() []providers.ListedModel {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	seen := make(map[string]struct{})
-	var out []string
+	positions := make(map[string]int)
+	seenInProvider := make(map[string]struct{})
+	var out []providers.ListedModel
 	for _, name := range c.order {
 		e := c.entries[name]
 		if e == nil {
 			continue
 		}
-		for _, id := range e.models {
-			if _, dup := seen[id]; dup {
+		clear(seenInProvider)
+		for _, model := range e.models {
+			if _, dup := seenInProvider[model.ID]; dup {
 				continue
 			}
-			seen[id] = struct{}{}
-			out = append(out, id)
+			seenInProvider[model.ID] = struct{}{}
+			if i, exists := positions[model.ID]; exists {
+				out[i].InputModalities = commonInputModalities(out[i].InputModalities, model.InputModalities)
+				continue
+			}
+			positions[model.ID] = len(out)
+			model.InputModalities = slices.Clone(model.InputModalities)
+			out = append(out, model)
+		}
+	}
+	return out
+}
+
+// commonInputModalities intersects two known lists in the first list's order.
+// The caller owns common, so it can be filtered in place.
+func commonInputModalities(common, reported []string) []string {
+	if common == nil || reported == nil {
+		return nil
+	}
+	if len(common) == 0 || len(reported) == 0 {
+		return common[:0]
+	}
+	set := make(map[string]struct{}, len(reported))
+	for _, modality := range reported {
+		set[modality] = struct{}{}
+	}
+	out := common[:0]
+	for _, modality := range common {
+		if _, ok := set[modality]; ok {
+			out = append(out, modality)
 		}
 	}
 	return out
@@ -188,7 +222,7 @@ func (c *modelCatalog) providerSnapshot() []CatalogProvider {
 		}
 		out = append(out, CatalogProvider{
 			Name:        name,
-			Models:      append([]string(nil), e.models...),
+			Models:      providers.ListedModelIDs(e.models),
 			Discovered:  e.discovered,
 			Unsupported: e.unsupported,
 			Err:         e.err,
@@ -235,7 +269,7 @@ func (c *modelCatalog) probeAlternative(provider, exclude string, next int) stri
 		return ""
 	}
 	for offset := range entry.models {
-		id := entry.models[(next+offset)%len(entry.models)]
+		id := entry.models[(next+offset)%len(entry.models)].ID
 		if id != exclude {
 			return id
 		}
@@ -283,15 +317,15 @@ func (c *modelCatalog) refreshAll(ctx context.Context) {
 		// cheap GET that consumes no chat quota, and if the key is rejected the
 		// listing fails and backs off like any other failure.
 		key := ap.discoveryKey()
-		ids, err := c.listModels(ap.impl, key)
+		models, err := c.listModels(ap.impl, key)
 		if ap.qwenSession == nil {
-			c.publishListing(name, e, ids, err)
+			c.publishListing(name, e, models, err)
 			continue
 		}
 		published := false
 		readErr := ap.qwenSession.WithStatus(ctx, func(status qwen.Status) {
 			if status.Revision == revision {
-				c.publishListing(name, e, ids, err)
+				c.publishListing(name, e, models, err)
 				published = true
 			}
 		})
@@ -339,12 +373,12 @@ func (c *modelCatalog) syncQwenRevision(ctx context.Context) error {
 	})
 }
 
-func (c *modelCatalog) publishListing(name string, e *catalogEntry, ids []string, err error) {
+func (c *modelCatalog) publishListing(name string, e *catalogEntry, models []providers.ListedModel, err error) {
 
 	c.mu.Lock()
 	e.inflight = false
 	switch {
-	case err == nil && len(ids) == 0:
+	case err == nil && len(models) == 0:
 		// A successful listing of nothing is "nothing learned", not "nothing
 		// exists". An empty list is not evidence that previously reported ids
 		// stopped existing — a local Ollama with no model pulled answers
@@ -360,20 +394,20 @@ func (c *modelCatalog) publishListing(name string, e *catalogEntry, ids []string
 		c.mu.Unlock()
 		log.Debug().Str("provider", name).Msg("Model listing returned no models — keeping the known models")
 	case err == nil:
-		e.models = append([]string(nil), ids...)
+		e.models = models
 		e.discovered = true
 		e.err = ""
 		e.backoff = 0
 		// Lock order: modelCatalog.mu → Router.mu, safe for the reason given in
 		// seed. The entry and the router index are published as one unit, so a
 		// snapshot never names ids the router does not serve yet.
-		c.rt.SetProviderModels(name, ids)
+		c.rt.SetProviderModels(name, providers.ListedModelIDs(models))
 		// Stamped after the push, inside the same critical section: the recorded
 		// time then marks when the list became live, so a reader that sees these
 		// ids and this timestamp can rely on the router already serving them.
 		e.fetchedAt = c.now()
 		c.mu.Unlock()
-		log.Debug().Str("provider", name).Int("models", len(ids)).Msg("Model catalog refreshed")
+		log.Debug().Str("provider", name).Int("models", len(models)).Msg("Model catalog refreshed")
 	case errors.Is(err, providers.ErrNoModelList):
 		// Nothing to fetch, ever: record it once and stop scheduling this
 		// provider. Its configured/seed list stays in the snapshot. The sentinel
